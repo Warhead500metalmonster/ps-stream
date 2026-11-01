@@ -4,11 +4,13 @@
 #include <objidl.h>
 #include <gdiplus.h>
 #include <dwmapi.h>
+#include <math.h>
+#include <shellapi.h>
 
 #include "i18n.c"
 
 #define UI_W 920
-#define UI_H 590
+#define UI_H 662
 
 #define COLOR(a, r, g, b) ((ARGB)(((a) << 24) | ((r) << 16) | ((g) << 8) | (b)))
 #define WHITE(a) COLOR(a, 255, 255, 255)
@@ -24,11 +26,15 @@
 #define ICON_VIDEO L""
 #define ICON_GEAR L""
 #define ICON_BULB L""
+#define ICON_CHECK L"\uE73E"
+#define ICON_SYNC L"\uE895"
+#define ICON_INFO L"\uE946"
+#define ICON_VOLUME L"\uE995"
 #define ICON_PLAY L""
 
-enum { UI_NONE, UI_NAV0, UI_NAV1, UI_NAV2, UI_AUDIO, UI_VIDEO, UI_GEAR_A, UI_GEAR_V, UI_APPLY, UI_FIND, UI_LOGIN, UI_ACCOUNT_CLEAR, UI_PAIR, UI_REPAIR,
-	UI_DEVICE, UI_HK_AUDIO, UI_HK_VIDEO, UI_HW, UI_RECONNECT, UI_CONTROLLER, UI_WIFI, UI_AUTOSTART, UI_BITRATE, UI_AO_BITRATE, UI_VOLUME, UI_BUFFER, UI_LOSS,
-	UI_PRESET0 = 40, UI_RES0 = 50, UI_FPS0 = 60, UI_CODEC0 = 65, UI_AORES0 = 70, UI_LANG0 = 80, UI_MAX = 96 };
+enum { UI_NONE, UI_NAV0, UI_NAV1, UI_NAV2, UI_AUDIO, UI_VIDEO, UI_DETAILS, UI_ADVANCED, UI_SIMPLE, UI_APPLY, UI_FIND, UI_LOGIN, UI_ACCOUNT_CLEAR, UI_PAIR, UI_REPAIR,
+	UI_DEVICE, UI_HK_AUDIO, UI_HK_VIDEO, UI_HW, UI_RECONNECT, UI_CONTROLLER, UI_WIFI, UI_AUTOSTART, UI_WINSTART, UI_TRAY, UI_UPDATES, UI_QUICK_VOLUME, UI_WAKE, UI_UPDATE_NOW, UI_OPEN_LOGS, UI_OPEN_REPO, UI_BITRATE, UI_AO_BITRATE, UI_VOLUME, UI_BUFFER, UI_LOSS,
+	UI_PRESET0 = 46, UI_RES0 = 52, UI_FPS0 = 60, UI_CODEC0 = 65, UI_AORES0 = 70, UI_LANG0 = 80, UI_MAX = 96 };
 
 static struct {
 	GpGraphics *gx;
@@ -37,6 +43,14 @@ static struct {
 	HDC back_dc, bg_dc;
 	HBITMAP back_bmp;
 	HWND edits[3];
+	float anim_values[UI_MAX * 2], anim_step;
+	bool anim_set[UI_MAX * 2], animating;
+	double anim_last;
+	int timer_ticks;
+	bool details, advanced;
+	HICON logo;
+	UINT taskbar_created;
+	bool in_tray;
 	HBRUSH field_brush;
 
 	int page;
@@ -125,22 +139,69 @@ static void wave(GpGraphics *gx, float x, float y, float w, float h, float start
 	GdipDeletePath(p);
 }
 
+static void glow(GpGraphics *gx, float cx, float cy, float radius, ARGB color)
+{
+	GpPath *p;
+	GdipCreatePath(FillModeAlternate, &p);
+	GdipAddPathEllipse(p, cx - radius, cy - radius, radius * 2, radius * 2);
+	GpPathGradient *b;
+	GdipCreatePathGradientFromPath(p, &b);
+	GdipSetPathGradientCenterColor(b, color);
+	ARGB edge = color & 0x00ffffff;
+	INT count = 1;
+	GdipSetPathGradientSurroundColorsWithCount(b, &edge, &count);
+	GdipFillPath(gx, (GpBrush *)b, p);
+	GdipDeleteBrush((GpBrush *)b);
+	GdipDeletePath(p);
+}
+
 static void background_paint(GpGraphics *gx)
 {
 	float w = F(UI_W), h = F(UI_H);
 	GpPointF a = { 0, 0 }, b = { 0, h };
 	GpLineGradient *grad;
-	GdipCreateLineBrush(&a, &b, COLOR(255, 46, 47, 52), COLOR(255, 22, 23, 27), WrapModeTile, &grad);
+	GdipCreateLineBrush(&a, &b, COLOR(255, 30, 32, 39), COLOR(255, 16, 17, 22), WrapModeTile, &grad);
 	GdipFillRectangle(gx, (GpBrush *)grad, 0, 0, w, h);
 	GdipDeleteBrush((GpBrush *)grad);
-	wave(gx, 0, 0, w, h, 0.42f, 0.18f, 0.72f, 0.38f, WHITE(9));
-	wave(gx, 0, 0, w, h, 0.62f, 0.86f, 0.30f, 0.58f, WHITE(10));
-	wave(gx, 0, 0, w, h, 0.84f, 0.62f, 0.98f, 0.70f, WHITE(12));
+	glow(gx, w * 0.05f, h * 0.02f, w * 0.48f, COLOR(46, 240, 150, 50));
+	glow(gx, w * 0.98f, h * 0.10f, w * 0.52f, COLOR(58, 40, 100, 240));
+	wave(gx, 0, 0, w, h, 0.62f, 0.86f, 0.30f, 0.58f, WHITE(6));
+	wave(gx, 0, 0, w, h, 0.84f, 0.62f, 0.98f, 0.70f, WHITE(8));
 }
 
 // ---------- widgets ----------
 
 typedef struct { bool hot, click, held; } Hit;
+
+// Eases a value toward its target; frames keep coming until it gets there. A widget's second
+// value (its on/off state, beside its hover) lives at id + UI_MAX.
+static float anim(int slot, float target)
+{
+	float *v = &ui.anim_values[slot];
+	if(!ui.anim_set[slot])
+	{
+		ui.anim_set[slot] = true;
+		*v = target;
+		return target;
+	}
+	*v += (target - *v) * ui.anim_step;
+	if(fabsf(target - *v) < 0.004f)
+		*v = target;
+	else
+		ui.animating = true;
+	return *v;
+}
+
+static ARGB mix(ARGB a, ARGB b, float t)
+{
+	ARGB out = 0;
+	for(int shift = 0; shift < 32; shift += 8)
+	{
+		float ca = (float)((a >> shift) & 255), cb = (float)((b >> shift) & 255);
+		out |= (ARGB)(ca + (cb - ca) * t + 0.5f) << shift;
+	}
+	return out;
+}
 
 static bool mouse_in(float x, float y, float w, float h)
 {
@@ -175,12 +236,12 @@ static bool pill_button(int id, const wchar_t *label, float x, float y, float w,
 	}
 	else if(primary)
 	{
-		bg = b.hot ? WHITE(225) : WHITE(255);
+		bg = mix(WHITE(255), WHITE(200), anim(id, b.held ? 1.0f : b.hot ? 0.5f : 0));
 		fg = C_DARK;
 	}
 	else
 	{
-		bg = b.hot ? WHITE(55) : WHITE(32);
+		bg = mix(WHITE(32), WHITE(72), anim(id, b.held ? 1.0f : b.hot ? 0.55f : 0));
 		fg = C_TEXT;
 	}
 	fill_round(x, y, w, h, h / 2, bg);
@@ -191,16 +252,18 @@ static bool pill_button(int id, const wchar_t *label, float x, float y, float w,
 static bool chip(int id, const wchar_t *label, float x, float y, float w, float h, bool selected)
 {
 	Hit b = hit(id, x, y, w, h);
-	fill_round(x, y, w, h, 10, selected ? C_ACCENT : b.hot ? WHITE(48) : WHITE(24));
-	text(label, ui.semi, x, y, w, h, selected ? C_TEXT : WHITE(215), 1, 1);
+	float on = anim(id + UI_MAX, selected ? 1.0f : 0);
+	fill_round(x, y, w, h, 10, mix(mix(WHITE(24), WHITE(48), anim(id, b.hot ? 1.0f : 0)), C_ACCENT, on));
+	text(label, ui.semi, x, y, w, h, mix(WHITE(215), C_TEXT, on), 1, 1);
 	return b.click;
 }
 
 static bool switch_toggle(int id, float x, float y, bool on)
 {
 	Hit b = hit(id, x, y, 46, 26);
-	fill_round(x, y, 46, 26, 13, on ? C_ACCENT : b.hot ? WHITE(70) : WHITE(45));
-	dot(on ? x + 23 : x + 3, y + 3, 20, WHITE(255));
+	float t = anim(id + UI_MAX, on ? 1.0f : 0);
+	fill_round(x, y, 46, 26, 13, mix(mix(WHITE(45), WHITE(70), anim(id, b.hot ? 1.0f : 0)), C_ACCENT, t));
+	dot(x + 3 + 20 * t, y + 3, 20, WHITE(255));
 	return b.click;
 }
 
@@ -217,19 +280,28 @@ static bool slider(int id, float x, float y, float w, int *value, int min, int m
 	float t = (float)(*value - min) / (max - min);
 	fill_round(x, y + 12, w, 4, 2, WHITE(45));
 	fill_round(x, y + 12, w * t, 4, 2, C_ACCENT);
-	dot(x + w * t - 8, y + 6, 16, b.held || b.hot ? WHITE(255) : WHITE(230));
+	float grow = anim(id, b.held || b.hot ? 1.0f : 0) * 2;
+	dot(x + w * t - 8 - grow / 2, y + 6 - grow / 2, 16 + grow, mix(WHITE(230), WHITE(255), grow / 2));
 	return *value != old;
+}
+
+static void shadow(float x, float y, float w, float h, float r)
+{
+	for(int i = 7; i >= 1; i -= 2)
+		fill_round(x - i, y - i + 5, w + i * 2, h + i * 2, r + i, COLOR(13, 0, 0, 0));
 }
 
 static void panel(float x, float y, float w, float h)
 {
-	fill_round(x, y, w, h, 22, WHITE(16));
-	stroke_round(x, y, w, h, 22, 1, WHITE(18));
+	shadow(x, y, w, h, 22);
+	fill_round(x, y, w, h, 22, WHITE(13));
+	stroke_round(x, y, w, h, 22, 1, WHITE(20));
 }
 
 static void heading(const wchar_t *s, float x, float y)
 {
-	text(s, ui.semi, x, y, 300, 22, C_MUTED, 0, 1);
+	fill_round(x, y + 6, 3, 11, 1.5f, C_ACCENT);
+	text(s, ui.semi, x + 10, y, 300, 22, C_MUTED, 0, 1);
 }
 
 static void row_label(const wchar_t *s, const wchar_t *tip, float x, float y, float w)
@@ -250,6 +322,12 @@ static void settings_commit(const Settings *s)
 	ui.draft = *s;
 	if(device_changed)
 		g.audio_reopen = 1;
+#ifndef PSSTREAM_TEST
+	win_start_set(s->win_start != 0);
+#else
+	if(!g.test_hidden || GetEnvironmentVariableW(L"PSSTREAM_TEST_WINSTART", NULL, 0))
+		win_start_set(s->win_start != 0);
+#endif
 	config_save_settings(s);
 	SetEvent(g.wake);
 }
@@ -301,6 +379,15 @@ static void show_page(int page)
 	SetFocus(g.hwnd);
 }
 
+static void volume_set(int volume)
+{
+	EnterCriticalSection(&g.lock);
+	g.settings.volume = volume;
+	LeaveCriticalSection(&g.lock);
+	ui.draft.volume = volume;
+	config_set_int("volume", volume);
+}
+
 static void toggle(int which)
 {
 	if(!g.paired)
@@ -309,8 +396,10 @@ static void toggle(int which)
 		set_status(L"Önce PS5'i eşleştir");
 		return;
 	}
-	get_text(ID_HOST, g.host, sizeof(g.host));
-	if(!g.host[0])
+	char host[256];
+	get_text(ID_HOST, host, sizeof(host));
+	host_set(host);
+	if(!host[0])
 	{
 		show_page(PAGE_PAIR);
 		set_status(L"PS5 IP adresini gir veya Otomatik bul'a bas");
@@ -321,6 +410,18 @@ static void toggle(int which)
 	else
 		g.want_video = !g.want_video;
 	SetEvent(g.wake);
+}
+
+static void edit_cues(void)
+{
+	SendMessageW(ui.edits[0], EM_SETCUEBANNER, TRUE, (LPARAM)tr(L"Örnek: 192.168.1.20"));
+	SendMessageW(ui.edits[1], EM_SETCUEBANNER, TRUE, (LPARAM)tr(L"Giriş yapınca kendiliğinden gelir"));
+	SendMessageW(ui.edits[2], EM_SETCUEBANNER, TRUE, (LPARAM)tr(L"8 haneli kod"));
+}
+
+static void data_folder_open(void)
+{
+	ShellExecuteW(NULL, L"open", g.data_dir, NULL, NULL, SW_SHOWNORMAL);
 }
 
 static int preset_match(const Settings *s)
@@ -338,11 +439,12 @@ static void bitrate_text(wchar_t *out, size_t n, int kbps)
 
 // ---------- pages ----------
 
-static void card(int id, int gear_id, float x, float y, float w, float h, ARGB c1, ARGB c2, const wchar_t *icon,
-		const wchar_t *title, const wchar_t *subtitle, const wchar_t *mode, const wchar_t *detail, bool on)
+static void card(int id, float x, float y, float w, float h, ARGB c1, ARGB c2, const wchar_t *icon,
+		const wchar_t *title, const wchar_t *subtitle, bool on)
 {
+	shadow(x, y, w, h, 26);
 	float dx = F(x), dy = F(y), dw = F(w), dh = F(h);
-	GpPath *p = path_round(dx, dy, dw, dh, F(30));
+	GpPath *p = path_round(dx, dy, dw, dh, F(26));
 	GpPointF a = { dx, dy }, b = { dx + dw, dy + dh };
 	GpLineGradient *grad;
 	GdipCreateLineBrush(&a, &b, c1, c2, WrapModeTile, &grad);
@@ -350,88 +452,148 @@ static void card(int id, int gear_id, float x, float y, float w, float h, ARGB c
 	GdipDeleteBrush((GpBrush *)grad);
 
 	GdipSetClipPath(ui.gx, p, CombineModeReplace);
-	wave(ui.gx, dx, dy, dw, dh, 0.38f, 0.12f, 0.70f, 0.30f, WHITE(20));
-	wave(ui.gx, dx, dy, dw, dh, 0.60f, 0.84f, 0.32f, 0.52f, WHITE(22));
-	if(!on)
+	wave(ui.gx, dx, dy, dw, dh, 0.38f, 0.12f, 0.70f, 0.30f, WHITE(18));
+	wave(ui.gx, dx, dy, dw, dh, 0.60f, 0.84f, 0.32f, 0.52f, WHITE(20));
+	float lit = anim(id + UI_MAX, on ? 1.0f : 0);
+	if(lit < 1)
 	{
 		GpSolidFill *dim;
-		GdipCreateSolidFill(COLOR(120, 18, 19, 23), &dim);
+		GdipCreateSolidFill(COLOR((int)(135 * (1 - lit)), 16, 17, 22), &dim);
 		GdipFillPath(ui.gx, (GpBrush *)dim, p);
 		GdipDeleteBrush((GpBrush *)dim);
 	}
 	GdipResetClip(ui.gx);
 	GdipDeletePath(p);
-	if(on)
-		stroke_round(x + 1, y + 1, w - 2, h - 2, 29, 2, C_GREEN);
+	stroke_round(x + 1, y + 1, w - 2, h - 2, 25, 1 + lit, mix(WHITE(26), C_GREEN, lit));
 
-	text(title, ui.big, x + 26, y + 20, w - 90, 40, C_TEXT, 0, 1);
-	text(subtitle, ui.body, x + 26, y + 60, w - 90, 44, WHITE(215), 0, 0);
-
-	Hit gear = hit(gear_id, x + w - 58, y + 18, 40, 40);
-	dot(x + w - 58, y + 18, 40, gear.hot ? WHITE(70) : WHITE(38));
-	text(ICON_GEAR, ui.icon, x + w - 58, y + 18, 40, 40, C_TEXT, 1, 1);
-	if(gear.click)
-		show_page(PAGE_SETTINGS);
-
-	float py = y + h - 112, ph = 98;
-	fill_round(x + 14, py, w - 28, ph, 22, COLOR(120, 30, 32, 38));
-	stroke_round(x + 14, py, w - 28, ph, 22, 1, WHITE(30));
-	text(icon, ui.icon_big, x + 26, py, 48, ph, C_TEXT, 1, 1);
-	text(mode, ui.title, x + 82, py + 10, w - 220, 28, C_TEXT, 0, 1);
+	dot(x + 26, y + 22, 56, on ? WHITE(38) : WHITE(18));
+	text(icon, ui.icon_big, x + 26, y + 22, 56, 56, C_TEXT, 1, 1);
+	text(title, ui.big, x + 96, y + 28, w - 120, 42, C_TEXT, 0, 1);
+	text(subtitle, ui.body, x + 26, y + 92, w - 52, 48, on ? WHITE(235) : WHITE(195), 0, 0);
 
 	bool connecting = on && !g.connected;
-	dot(x + 83, py + 45, 9, !on ? WHITE(120) : connecting ? C_AMBER : C_GREEN);
-	text(!on ? L"Kapalı" : connecting ? L"Bağlanıyor" : L"Açık", ui.body, x + 98, py + 38, 120, 22, !on ? C_MUTED : connecting ? C_AMBER : C_GREEN, 0, 1);
-	text(detail, ui.small, x + 82, py + 62, w - 210, 22, WHITE(190), 0, 1);
-
-	if(pill_button(id, on ? L"Kapat" : L"Aç", x + w - 122, py + 28, 92, 42, true, true))
+	bool blink = connecting && (GetTickCount() / 500) % 2;
+	float py = y + h - 76;
+	dot(x + 28, py + 20, 12, !on ? WHITE(110) : connecting ? (blink ? COLOR(110, 251, 191, 36) : C_AMBER) : C_GREEN);
+	text(!on ? L"Kapalı" : connecting ? L"Bağlanıyor" : L"Açık", ui.title, x + 48, py, w - 200, 52, !on ? WHITE(190) : connecting ? C_AMBER : C_GREEN, 0, 1);
+	if(pill_button(id, on ? L"Kapat" : L"Aç", x + w - 146, py, 124, 52, true, true))
 		toggle(id);
+}
+
+static void stat_tile(float x, float y, float w, float h, const wchar_t *label, const wchar_t *value, ARGB color)
+{
+	fill_round(x, y, w, h, 14, WHITE(13));
+	stroke_round(x, y, w, h, 14, 1, WHITE(16));
+	text(label, ui.small, x + 14, y + 8, w - 20, 20, C_MUTED, 0, 1);
+	text(value, ui.semi, x + 14, y + 28, w - 20, 24, color, 0, 1);
 }
 
 static void page_play(void)
 {
 	Settings s = settings_get();
-	wchar_t detail[128], rate[32];
 
-	float cw = (UI_W - 48 - 16) / 2.0f, cy = 78, ch = 330;
-	bitrate_text(rate, 32, s.ao_kbps);
-	swprintf(detail, 128, tr(L"PS5'ten istenen: %dp, %ls"), resolutions[s.ao_res].height, rate);
-	card(UI_AUDIO, UI_GEAR_A, 24, cy, cw, ch, COLOR(255, 196, 124, 44), COLOR(255, 92, 52, 28), ICON_AUDIO,
-			L"Ses", L"Oyun sesini duy, görüntü için\nişlemci ve veri harcama.", L"Oyun sesi", detail, g.want_audio != 0);
+	// Without the details row, the cards take its room
+	float extra = anim(UI_NONE + UI_MAX, ui.details ? 0 : 70);
+	float cw = (UI_W - 48 - 16) / 2.0f, cy = 78, ch = 330 + extra;
+	card(UI_AUDIO, 24, cy, cw, ch, COLOR(255, 214, 134, 46), COLOR(255, 110, 58, 24), ICON_AUDIO,
+			L"Ses", L"Oyunun sesini bilgisayardan duy.", g.want_audio != 0);
 
-	bitrate_text(rate, 32, s.kbps);
-	swprintf(detail, 128, L"%dp, %d FPS, %ls, %ls", resolutions[s.res].height, s.fps, rate, s.h265 ? L"H.265" : L"H.264");
-	card(UI_VIDEO, UI_GEAR_V, 24 + cw + 16, cy, cw, ch, COLOR(255, 40, 92, 214), COLOR(255, 18, 38, 120), ICON_VIDEO,
-			L"Görüntü", L"Discord'da yayın açmak için.\n\"PS Stream - Goruntu\" penceresini seç.", L"Oyun görüntüsü", detail, g.want_video != 0);
+	// Volume right on the card, since it's the control people reach for most
+	float vy = cy + ch - 124;
+	text(ICON_VOLUME, ui.icon, 42, vy, 28, 28, WHITE(220), 1, 1);
+	int volume = s.volume;
+	if(slider(UI_QUICK_VOLUME, 80, vy, cw - 150, &volume, 0, 200))
+		volume_set(volume);
+	wchar_t pct[16];
+	swprintf(pct, 16, tr(L"%%%d"), volume);
+	text(pct, ui.semi, cw - 50, vy, 58, 28, C_TEXT, 2, 1);
+	if(mouse_in(42, vy, cw - 30, 28))
+		ui.tip = L"Oyun sesinin seviyesi. %100 üstü sesi yükseltir.";
 
-	static const wchar_t *const names[] = { L"En düşük", L"Düşük", L"Dengeli", L"Yüksek", L"En yüksek" };
-	static const wchar_t *const subs[] = { L"360p, 0,5 Mbps", L"360p, 2 Mbps", L"720p, 6 Mbps", L"1080p 60, 20 Mbps", L"1080p 60, 50 Mbps" };
+	float vx = 24 + cw + 16;
+	card(UI_VIDEO, vx, cy, cw, ch, COLOR(255, 44, 104, 232), COLOR(255, 18, 34, 118), ICON_VIDEO,
+			L"Görüntü", L"Oyunu bilgisayarda gör.\nDiscord'da \"PS Stream - Görüntü\" penceresini seç.", g.want_video != 0);
+	if(mouse_in(vx, cy, cw, ch - 80))
+		ui.tip = L"Görüntü penceresinde F11 tam ekran yapar.";
+
+	static const wchar_t *const names[] = { L"Düşük", L"Orta", L"Yüksek", L"Özel" };
+	static const wchar_t *const subs[] = { L"İnternet kötüyse", L"Çoğu zaman için", L"İnternet iyiyse", L"Kendin ayarla" };
+	static const int tile_preset[] = { 0, 2, 3 };
+	static const int tile_bars[] = { 1, 3, 5 };
 	int current = preset_match(&s);
-	float gap = 10, w = (UI_W - 48 - gap * 5) / 6, y = 424, h = 66;
-	for(int i = 0; i <= PRESET_COUNT; i++)
+	float gap = 10, w = (UI_W - 48 - gap * 3) / 4, y = 420 + extra, h = 74;
+	for(int i = 0; i < 4; i++)
 	{
 		float x = 24 + i * (w + gap);
-		bool selected = i == current;
+		bool selected = i < 3 ? tile_preset[i] == current : current != 0 && current != 2 && current != 3;
 		Hit b = hit(UI_PRESET0 + i, x, y, w, h);
-		fill_round(x, y, w, h, 16, selected ? C_ACCENT : b.hot ? WHITE(44) : WHITE(22));
-		text(i < PRESET_COUNT ? names[i] : L"Özel", ui.semi, x, y + 10, w, 24, C_TEXT, 1, 1);
-		text(i < PRESET_COUNT ? subs[i] : L"Ayarlardan seç", ui.small, x, y + 34, w, 22, selected ? WHITE(225) : C_MUTED, 1, 1);
+		float on = anim(UI_PRESET0 + i + UI_MAX, selected ? 1.0f : 0);
+		fill_round(x, y, w, h, 16, mix(mix(WHITE(18), WHITE(40), anim(UI_PRESET0 + i, b.hot ? 1.0f : 0)), C_ACCENT, on));
+		if(on < 1)
+			stroke_round(x, y, w, h, 16, 1, mix(WHITE(16), C_ACCENT, on));
+		// Rising bars show the level at a glance
+		float bars_x = x + 16;
+		for(int bar = 0; bar < 5 && i < 3; bar++)
+		{
+			float bh = 8 + bar * 5.0f;
+			fill_round(bars_x + bar * 9, y + 54 - bh, 6, bh, 2, bar < tile_bars[i] ? (selected ? WHITE(255) : WHITE(190)) : WHITE(selected ? 70 : 34));
+		}
+		if(i == 3)
+			text(ICON_GEAR, ui.icon_big, x + 10, y + 13, 50, 50, selected ? C_TEXT : C_MUTED, 1, 1);
+		text(names[i], ui.title, x + 72, y + 10, w - 76, 30, C_TEXT, 0, 1);
+		text(subs[i], ui.small, x + 72, y + 40, w - 76, 22, selected ? WHITE(225) : C_MUTED, 0, 1);
 		if(mouse_in(x, y, w, h))
 			ui.tip = L"Görüntü kalitesi. Sadece ses modunu etkilemez.";
 		if(b.click)
 		{
-			if(i == PRESET_COUNT)
+			if(i == 3)
+			{
+				ui.advanced = true;
 				show_page(PAGE_SETTINGS);
+			}
 			else
 			{
-				s.res = presets[i].res;
-				s.fps = presets[i].fps;
-				s.kbps = presets[i].kbps;
-				s.h265 = presets[i].h265;
+				const int p = tile_preset[i];
+				s.res = presets[p].res;
+				s.fps = presets[p].fps;
+				s.kbps = presets[p].kbps;
+				s.h265 = presets[p].h265;
 				settings_commit(&s);
 			}
 		}
 	}
+	if(extra > 1)
+		return;
+
+	// Live connection numbers, for anyone who wants to see what the Wi-Fi is doing
+	bool live = (g.want_audio || g.want_video) && g.connected;
+	wchar_t uptime[32] = L"-", ping[32] = L"-", audio[64] = L"-", video[64] = L"-";
+	int ping_ms = -1;
+	if(live)
+	{
+		DWORD seconds = (GetTickCount() - g.connected_at) / 1000;
+		swprintf(uptime, 32, L"%02lu:%02lu:%02lu", seconds / 3600, seconds / 60 % 60, seconds % 60);
+		// Measured once when connecting; 1 ms exactly is the library's "couldn't measure" value
+		ping_ms = (int)(g.session.rtt_us / 1000);
+		if(g.session.rtt_us != 1000)
+			swprintf(ping, 32, L"%d ms", ping_ms);
+		else
+			ping_ms = -1;
+		if(g.want_audio)
+			swprintf(audio, 64, tr(L"%d ms tampon, %ld kesinti"), g.audio_target_ms, (long)g.audio_dropouts);
+		if(g.want_video && g.video_fps10)
+			swprintf(video, 64, tr(L"%ld FPS, %ld kayıp"), (long)((g.video_fps10 + 5) / 10), (long)g.video_lost_total);
+	}
+	float ty = 504, th = 60, tw[] = { 170, 130, 300 };
+	float tx = 24;
+	ARGB idle = WHITE(120);
+	stat_tile(tx, ty, tw[0], th, L"BAĞLANTI SÜRESİ", uptime, live ? C_TEXT : idle);
+	tx += tw[0] + 10;
+	stat_tile(tx, ty, tw[1], th, L"PING", ping, ping_ms < 0 ? idle : ping_ms < 30 ? C_GREEN : ping_ms < 80 ? C_TEXT : C_AMBER);
+	tx += tw[1] + 10;
+	stat_tile(tx, ty, tw[2], th, L"SES", audio, live && g.want_audio ? (g.audio_dropouts ? C_AMBER : C_TEXT) : idle);
+	tx += tw[2] + 10;
+	stat_tile(tx, ty, UI_W - 24 - tx, th, L"GÖRÜNTÜ", video, live && g.want_video && g.video_fps10 ? (g.video_lost_total ? C_AMBER : C_TEXT) : idle);
 }
 
 static void chips_row(int id0, const wchar_t *const *labels, int count, int *value, float x, float y, float w)
@@ -442,11 +604,107 @@ static void chips_row(int id0, const wchar_t *const *labels, int count, int *val
 			*value = i;
 }
 
-static void page_settings(void)
+static void switch_row(int id, const wchar_t *label, const wchar_t *tip, float x, float y, float w, int *value)
+{
+	text(label, ui.body, x, y, w - 50, 30, C_TEXT, 0, 1);
+	if(mouse_in(x, y, w, 34))
+		ui.tip = tip;
+	if(switch_toggle(id, x + w - 46, y + 2, *value != 0))
+		*value = !*value;
+}
+
+static bool settings_dirty(const Settings *a, const Settings *b)
+{
+	return a->res != b->res || a->fps != b->fps || a->kbps != b->kbps || a->h265 != b->h265 || a->hw != b->hw
+		|| a->ao_res != b->ao_res || a->ao_kbps != b->ao_kbps || a->loss_pct != b->loss_pct
+		|| a->no_controller != b->no_controller || a->wifi_opt != b->wifi_opt || a->autostart_audio != b->autostart_audio
+		|| a->win_start != b->win_start || a->tray != b->tray || a->update_check != b->update_check
+		|| a->reconnect != b->reconnect || a->hotkey_audio != b->hotkey_audio || a->hotkey_video != b->hotkey_video
+		|| strcmp(a->device, b->device) != 0;
+}
+
+static void plain_switch(int id, const wchar_t *label, const wchar_t *hint, float x, float y, float w, int *value)
+{
+	text(label, ui.semi, x, y, w - 60, 26, C_TEXT, 0, 1);
+	text(hint, ui.small, x, y + 26, w - 60, 22, C_MUTED, 0, 1);
+	if(switch_toggle(id, x + w - 46, y + 10, *value != 0))
+		*value = !*value;
+}
+
+static void device_picker(float x, float y, float w)
+{
+	wchar_t device_w[64];
+	wcscpy(device_w, tr(L"Windows varsayılanı"));
+	if(ui.draft.device[0])
+		MultiByteToWideChar(CP_UTF8, 0, ui.draft.device, -1, device_w, 63);
+	device_w[63] = 0;
+	Hit dev = hit(UI_DEVICE, x, y, w, 40);
+	fill_round(x, y, w, 40, 12, mix(WHITE(24), WHITE(48), anim(UI_DEVICE, dev.hot ? 1.0f : 0)));
+	text(device_w, ui.body, x + 14, y, w - 28, 40, C_TEXT, 0, 1);
+	if(dev.click)
+		ui.open_device_menu = true;
+}
+
+static void page_settings_simple(void)
 {
 	Settings *d = &ui.draft;
 	wchar_t t[64];
-	float lx = 24, rx = 468, pw = 428, py = 78, ph = 434;
+	float lx = 24, rx = 468, pw = 428, py = 78, ph = 506;
+	panel(lx, py, pw, ph);
+	panel(rx, py, pw, ph);
+
+	float x = lx + 24, w = pw - 48, y = py + 20;
+	heading(L"SES", x, y);
+	y += 36;
+	text(L"Ses nereden çıksın?", ui.semi, x, y, w, 26, C_TEXT, 0, 1);
+	device_picker(x, y + 30, w);
+	y += 92;
+	text(L"Ses seviyesi", ui.semi, x, y, w, 26, C_TEXT, 0, 1);
+	if(slider(UI_VOLUME, x + 8, y + 32, w - 80, &d->volume, 0, 200))
+		volume_set(d->volume);
+	swprintf(t, 64, tr(L"%%%d"), d->volume);
+	text(t, ui.semi, x + w - 64, y + 32, 64, 28, C_TEXT, 2, 1);
+	y += 86;
+	plain_switch(UI_AUTOSTART, L"Açılışta ses", L"Uygulama açılınca ses başlasın", x, y, w, &d->autostart_audio);
+
+	x = rx + 24;
+	y = py + 20;
+	heading(L"UYGULAMA", x, y);
+	y += 40;
+	plain_switch(UI_WINSTART, L"Windows ile başlat", L"Bilgisayar açılınca uygulama da açılsın", x, y, w, &d->win_start);
+	y += 66;
+	plain_switch(UI_TRAY, L"Tepsiye küçült", L"Küçültünce saatin yanında dursun", x, y, w, &d->tray);
+	y += 66;
+	plain_switch(UI_UPDATES, L"Güncelleme denetle", L"Yeni sürüm çıkınca haber versin", x, y, w, &d->update_check);
+
+	y = py + ph - 124;
+	if(pill_button(UI_ADVANCED, L"Gelişmiş ayarlar", x, y, w, 46, false, true))
+	{
+		ui.advanced = true;
+		ui.again = true;
+	}
+	y += 58;
+	swprintf(t, 64, L"PS Stream v%hs", APP_VERSION);
+	text(t, ui.semi, x, y, 150, 34, C_MUTED, 0, 1);
+	if(pill_button(UI_OPEN_REPO, L"GitHub", x + w - 114, y, 114, 34, false, true))
+		ShellExecuteW(NULL, L"open", REPO_URL, NULL, NULL, SW_SHOWNORMAL);
+
+	// Nothing here reconnects the stream, so there's no reason to ask for an Apply press
+	Settings current = settings_get();
+	if(settings_dirty(d, &current))
+		settings_commit(d);
+}
+
+static void page_settings(void)
+{
+	if(!ui.advanced)
+	{
+		page_settings_simple();
+		return;
+	}
+	Settings *d = &ui.draft;
+	wchar_t t[64];
+	float lx = 24, rx = 468, pw = 428, py = 78, ph = 506;
 	panel(lx, py, pw, ph);
 	panel(rx, py, pw, ph);
 
@@ -489,17 +747,17 @@ static void page_settings(void)
 	d->ao_kbps = steps * 100;
 	bitrate_text(t, 64, d->ao_kbps);
 	text(t, ui.body, cx + cw - 80, y, 80, 30, C_TEXT, 2, 1);
-	y += 38;
+	y += 46;
 	heading(L"GENEL", x, y);
-	y += 24;
-	row_label(L"Düşük gecikme", L"Bağlıyken Windows'un Wi-Fi taramalarını durdurur, bilgisayarı uyanık tutar. Bağlantı kapanınca eski hâline döner.", x, y, pw - 40);
-	if(switch_toggle(UI_WIFI, cx, y + 2, d->wifi_opt != 0))
-		d->wifi_opt = !d->wifi_opt;
-	text(L"Açılışta ses", ui.body, cx + 60, y, 140, 30, C_TEXT, 0, 1);
-	if(mouse_in(cx + 60, y, cw - 60, 34))
-		ui.tip = L"Uygulama açılınca ses kendiliğinden başlar. PS5 kapalıysa açılana kadar dener.";
-	if(switch_toggle(UI_AUTOSTART, cx + cw - 46, y + 2, d->autostart_audio != 0))
-		d->autostart_audio = !d->autostart_audio;
+	y += 28;
+	float col = (pw - 40 - 20) / 2, x2 = x + col + 20;
+	switch_row(UI_WIFI, L"Düşük gecikme", L"Bağlıyken Windows'un Wi-Fi taramalarını durdurur, bilgisayarı uyanık tutar. Bağlantı kapanınca eski hâline döner.", x, y, col, &d->wifi_opt);
+	switch_row(UI_AUTOSTART, L"Açılışta ses", L"Uygulama açılınca ses kendiliğinden başlar. PS5 kapalıysa açılana kadar dener.", x2, y, col, &d->autostart_audio);
+	y += 40;
+	switch_row(UI_WINSTART, L"Windows ile başlat", L"Bilgisayar açılınca uygulama saatin yanında küçük olarak başlar.", x, y, col, &d->win_start);
+	switch_row(UI_TRAY, L"Tepsiye küçült", L"Küçültünce görev çubuğunda yer kaplamaz, saatin yanındaki simgede durur.", x2, y, col, &d->tray);
+	y += 40;
+	switch_row(UI_UPDATES, L"Güncelleme denetle", L"Açılışta GitHub'dan son sürüm numarasını sorar. Hakkında bilgi göndermez, kendisi indirmez.", x, y, col, &d->update_check);
 
 	x = rx + 20;
 	cx = rx + 150;
@@ -511,6 +769,7 @@ static void page_settings(void)
 	wcscpy(device_w, tr(L"Windows varsayılanı"));
 	if(d->device[0])
 		MultiByteToWideChar(CP_UTF8, 0, d->device, -1, device_w, 63);
+	device_w[63] = 0;
 	Hit dev = hit(UI_DEVICE, cx, y, cw, 30);
 	fill_round(cx, y, cw, 30, 10, dev.hot ? WHITE(48) : WHITE(24));
 	text(device_w, ui.body, cx + 12, y, cw - 24, 30, C_TEXT, 0, 1);
@@ -519,12 +778,7 @@ static void page_settings(void)
 	y += 42;
 	row_label(L"Ses seviyesi", L"Hemen uygulanır. %100 üstü sesi yükseltir.", x, y, pw - 40);
 	if(slider(UI_VOLUME, cx + 8, y, cw - 94, &d->volume, 0, 200))
-	{
-		EnterCriticalSection(&g.lock);
-		g.settings.volume = d->volume;
-		LeaveCriticalSection(&g.lock);
-		config_set_int("volume", d->volume);
-	}
+		volume_set(d->volume);
 	swprintf(t, 64, tr(L"%%%d"), d->volume);
 	text(t, ui.body, cx + cw - 80, y, 80, 30, C_TEXT, 2, 1);
 	y += 42;
@@ -546,14 +800,9 @@ static void page_settings(void)
 	swprintf(t, 64, tr(L"%%%d"), d->loss_pct);
 	text(t, ui.body, cx + cw - 80, y, 80, 30, C_TEXT, 2, 1);
 	y += 40;
-	row_label(L"Yeniden bağlan", L"Bağlantı koparsa 5 saniyede bir tekrar dener.", x, y, pw - 40);
-	if(switch_toggle(UI_RECONNECT, cx, y + 2, d->reconnect != 0))
-		d->reconnect = !d->reconnect;
-	y += 36;
-	row_label(L"DualSense PS5'te", L"Açıkken PS5'e sanal kumanda bildirilmez, DualSense'in PS5'e bağlı kalması için. Bağlantı sorun çıkarırsa kapat.", x, y, pw - 40);
-	if(switch_toggle(UI_CONTROLLER, cx, y + 2, d->no_controller != 0))
-		d->no_controller = !d->no_controller;
-	y += 40;
+	switch_row(UI_RECONNECT, L"Yeniden bağlan", L"Bağlantı koparsa veya PS5 kapanırsa, PS5 dönene kadar tekrar dener.", x, y, col, &d->reconnect);
+	switch_row(UI_CONTROLLER, L"DualSense PS5'te", L"Açıkken PS5'e sanal kumanda bildirilmez, DualSense'in PS5'e bağlı kalması için. Bağlantı sorun çıkarırsa kapat.", x + col + 20, y, col, &d->no_controller);
+	y += 46;
 	heading(L"KISAYOLLAR", x, y);
 	y += 28;
 	for(int i = 0; i < 2; i++)
@@ -568,35 +817,57 @@ static void page_settings(void)
 		}
 		y += 36;
 	}
+	y += 8;
+	swprintf(t, 64, L"PS Stream v%hs", APP_VERSION);
+	text(t, ui.semi, x, y, 150, 34, C_MUTED, 0, 1);
+	if(pill_button(UI_OPEN_LOGS, L"Kayıtları aç", cx + 12, y, 114, 34, false, true))
+		data_folder_open();
+	if(pill_button(UI_SIMPLE, L"Basit görünüm", cx + 134, y, 114, 34, false, true))
+	{
+		ui.advanced = false;
+		ui.again = true;
+	}
 }
 
 static void page_pair(void)
 {
-	float w = (UI_W - 48 - 32) / 3.0f, y = 78, h = 434;
+	float w = (UI_W - 48 - 32) / 3.0f, y = 78, h = 506;
 	static const wchar_t *const titles[] = { L"PS5'i bul", L"Hesabını bağla", L"Kodu gir" };
 	static const wchar_t *const bodies[] = {
-		L"PS5 açık ve bu bilgisayarla aynı ağda olmalı. Uygulama kendisi arar. Bulamazsa Otomatik bul'a bas veya PS5'teki IP adresini yaz.\n\nPS5'te: Ayarlar > Sistem > Sistem Yazılımı > Konsol Bilgisi",
-		L"PSN ile giriş yap'a bas. Sony'nin sayfası tarayıcında açılır. Giriş yapınca hesabın kendiliğinden bağlanır, sonra sekmeyi kapatabilirsin.\n\nŞifren sadece Sony'ye gider. Olmazsa adres çubuğundaki adresi kopyala.\n\nBaşka hesap için Sil'e bas, yeniden giriş yap ve eşleştir.",
-		L"PS5'te: Ayarlar > Sistem > Uzaktan Oynatma > Cihazı Bağla\n\nEkranda çıkan 8 haneli kodu yaz. Eşleştirme kendiliğinden başlar. Bunu bir kere yapman yeterli."
+		L"PS5'ini aç.\n\nOtomatik bul'a bas, uygulama PS5'i bulur.\n\nBulamazsa IP adresini kutuya yaz.\nPS5'te: Ayarlar > Sistem > Sistem Yazılımı > Konsol Bilgisi",
+		L"PSN ile giriş yap'a bas.\n\nAçılan sayfada giriş yap. Gerisi kendiliğinden olur.\n\nOlmazsa adres çubuğundaki adresi kopyala.\nŞifren sadece Sony'ye gider.",
+		L"PS5'te şuraya git:\nAyarlar > Sistem > Uzaktan Oynatma > Cihazı Bağla\n\nEkranda çıkan 8 haneli kodu kutuya yaz. Hepsi bu, bir kere yapman yeterli."
 	};
 	static const wchar_t *const nums[] = { L"1", L"2", L"3" };
+	bool paired_view = g.paired && !ui.repairing;
+	bool steps_done[3] = { GetWindowTextLengthW(ui.edits[0]) > 0, GetWindowTextLengthW(ui.edits[1]) > 0, paired_view };
+	float field_y = y + 372;
+	int next_step = !steps_done[0] ? 0 : !steps_done[1] ? 1 : !steps_done[2] ? 2 : 3;
 	for(int i = 0; i < 3; i++)
 	{
 		float x = 24 + i * (w + 16);
 		panel(x, y, w, h);
-		dot(x + 20, y + 20, 36, C_ACCENT);
-		text(nums[i], ui.title, x + 20, y + 20, 36, 36, C_TEXT, 1, 1);
+		stroke_round(x, y, w, h, 22, 2, COLOR((int)(255 * anim(UI_MAX + UI_FIND + i, next_step == i ? 1.0f : 0)), 10, 112, 230));
+		dot(x + 20, y + 20, 36, steps_done[i] ? COLOR(255, 34, 160, 90) : C_ACCENT);
+		if(steps_done[i])
+			text(ICON_CHECK, ui.icon, x + 20, y + 20, 36, 36, C_TEXT, 1, 1);
+		else
+			text(nums[i], ui.title, x + 20, y + 20, 36, 36, C_TEXT, 1, 1);
 		text(titles[i], ui.title, x + 66, y + 20, w - 80, 36, C_TEXT, 0, 1);
-		bool done = i == 2 && g.paired && !ui.repairing;
-		text(done ? L"PS5 eşleşti. Bir daha kod girmen gerekmez.\n\nOynat sayfasından Ses veya Görüntü'yü aç, yeterli.\n\nKodu sadece başka bir hesap bağlamak istersen girersin." : bodies[i], ui.body, x + 20, y + 74, w - 40, 210, WHITE(205), 0, 0);
+		bool done = i == 2 && paired_view;
+		text(done ? L"PS5 eşleşti. Bir daha kod girmen gerekmez.\n\nOynat sayfasından Ses veya Görüntü'yü aç, yeterli.\n\nKodu sadece başka bir hesap bağlamak istersen girersin." : bodies[i], ui.body, x + 20, y + 74, w - 40, 284, WHITE(205), 0, 0);
 		if(!done)
-			fill_round(x + 20, y + 300, w - 40, 44, 14, C_FIELD);
+		{
+			fill_round(x + 20, field_y, w - 40, 44, 14, C_FIELD);
+			if(GetFocus() == ui.edits[i])
+				stroke_round(x + 20, field_y, w - 40, 44, 14, 2, C_ACCENT);
+		}
 	}
-	ShowWindow(ui.edits[2], g.paired && !ui.repairing ? SW_HIDE : SW_SHOW);
-	float x0 = 24, x1 = 24 + w + 16, x2 = 24 + 2 * (w + 16), by = y + 360, bw = w - 40;
-	if(pill_button(UI_FIND, finding ? L"Aranıyor..." : L"Otomatik bul", x0 + 20, by, bw, 46, false, !finding))
+	ShowWindow(ui.edits[2], paired_view ? SW_HIDE : SW_SHOW);
+	float x0 = 24, x1 = 24 + w + 16, x2 = 24 + 2 * (w + 16), by = y + 432, bw = w - 40;
+	if(pill_button(UI_FIND, finding ? L"Aranıyor..." : L"Otomatik bul", x0 + 20, by, bw, 46, next_step == 0, !finding))
 		find_ps5();
-	if(pill_button(UI_LOGIN, ui.logging_in ? L"Giriş bekleniyor (iptal)" : L"PSN ile giriş yap", x1 + 20, by, bw - 58, 46, false, true))
+	if(pill_button(UI_LOGIN, ui.logging_in ? L"Giriş bekleniyor (iptal)" : L"PSN ile giriş yap", x1 + 20, by, bw - 58, 46, next_step == 1, true))
 	{
 		if(ui.logging_in)
 			login_cancel = 1;
@@ -616,7 +887,7 @@ static void page_pair(void)
 	}
 	if(mouse_in(x1 + 20 + bw - 50, by, 50, 46))
 		ui.tip = L"Kayıtlı hesap kimliğini siler. Eski eşleştirme, yenisini yapana kadar çalışır.";
-	if(g.paired && !ui.repairing)
+	if(paired_view)
 	{
 		if(pill_button(UI_REPAIR, L"Başka hesapla eşleştir", x2 + 20, by - 56, bw, 46, false, true))
 		{
@@ -626,24 +897,34 @@ static void page_pair(void)
 		if(pill_button(UI_PAIR, L"Oynat'a dön", x2 + 20, by, bw, 46, true, true))
 			show_page(PAGE_PLAY);
 	}
-	else if(pill_button(UI_PAIR, g.pairing ? L"Eşleştiriliyor..." : L"Eşleştir", x2 + 20, by, bw, 46, true, !g.pairing))
+	else if(pill_button(UI_PAIR, g.pairing ? L"Eşleştiriliyor..." : L"Eşleştir", x2 + 20, by, bw, 46, next_step == 2, !g.pairing))
 		pair_start();
 }
 
 static void top_bar(void)
 {
-	dot(24, 18, 44, COLOR(255, 240, 160, 40));
-	text(ICON_PLAY, ui.icon, 24, 18, 44, 44, C_DARK, 1, 1);
+	GdipFlush(ui.gx, FlushIntentionSync);
+	DrawIconEx(ui.back_dc, S(24), S(18), ui.logo, S(44), S(44), 0, NULL, DI_NORMAL);
+	text(L"PS Stream", ui.title, 76, 18, 104, 44, C_TEXT, 0, 1);
 
 	static const wchar_t *const names[] = { L"Oynat", L"Ayarlar", L"Eşleştirme" };
-	float x = 82, y = 20, h = 40, w = 108;
-	fill_round(x, y, w * 3 + 8, h, h / 2, WHITE(22));
+	float x = 182, y = 20, h = 40, w = 106;
+	fill_round(x, y, w * 3 + 8, h, h / 2, WHITE(18));
+	stroke_round(x, y, w * 3 + 8, h, h / 2, 1, WHITE(14));
+	float slide = anim(UI_NAV0 + UI_MAX, (float)ui.page);
 	for(int i = 0; i < 3; i++)
 	{
 		float bx = x + 4 + i * w;
 		Hit b = hit(UI_NAV0 + i, bx, y + 4, w, h - 8);
-		if(ui.page == i)
-			fill_round(bx, y + 4, w, h - 8, (h - 8) / 2, C_ACCENT);
+		float hover = anim(UI_NAV0 + i, b.hot && ui.page != i ? 1.0f : 0);
+		if(hover > 0)
+			fill_round(bx, y + 4, w, h - 8, (h - 8) / 2, COLOR((int)(18 * hover), 255, 255, 255));
+	}
+	fill_round(x + 4 + slide * w, y + 4, w, h - 8, (h - 8) / 2, C_ACCENT);
+	for(int i = 0; i < 3; i++)
+	{
+		float bx = x + 4 + i * w;
+		Hit b = hit(UI_NAV0 + i, bx, y + 4, w, h - 8);
 		text(names[i], ui.semi, bx, y + 4, w, h - 8, ui.page == i || b.hot ? C_TEXT : C_MUTED, 1, 1);
 		if(b.click)
 			show_page(i);
@@ -653,44 +934,50 @@ static void top_bar(void)
 	{
 		lang_english = false;
 		config_set("lang", "tr");
+		edit_cues();
 	}
 	if(chip(UI_LANG0 + 1, L"EN", 636, y + 4, 42, h - 8, lang_english) && !lang_english)
 	{
 		lang_english = true;
 		config_set("lang", "en");
+		edit_cues();
 	}
 
 	wchar_t host[300];
-	if(g.paired)
-		swprintf(host, 300, L"PS5  %hs", g.host);
-	else
-		swprintf(host, 300, L"PS5 eşleşmedi");
+	char host_text[256];
+	host_get(host_text, sizeof(host_text));
 	bool live = (g.want_audio || g.want_video) && g.connected;
+	wcscpy(host, !g.paired ? L"PS5 eşleşmedi" : live ? L"PS5 bağlı" : L"PS5 bağlı değil");
 	float pw = 210, px = UI_W - 24 - pw;
-	fill_round(px, y, pw, h, h / 2, WHITE(22));
+	fill_round(px, y, pw, h, h / 2, WHITE(18));
+	stroke_round(px, y, pw, h, h / 2, 1, WHITE(14));
 	dot(px + 16, y + 15, 10, live ? C_GREEN : g.paired ? WHITE(120) : C_AMBER);
+	if(g.paired && mouse_in(px, y, pw, h))
+	{
+		static wchar_t address_tip[300];
+		swprintf(address_tip, 300, tr(L"PS5 adresi: %hs"), host_text);
+		ui.tip = address_tip;
+	}
 	text(host, ui.body, px + 34, y, pw - 44, h, C_TEXT, 0, 1);
 }
 
 static void status_bar(void)
 {
 	float x = 24, y = UI_H - 64, w = UI_W - 48, h = 48;
-	fill_round(x, y, w, h, 16, COLOR(170, 44, 46, 52));
-	text(ICON_BULB, ui.icon, x + 8, y, 36, h, C_AMBER, 1, 1);
+	fill_round(x, y, w, h, 16, COLOR(190, 36, 38, 46));
+	stroke_round(x, y, w, h, 16, 1, WHITE(14));
+	bool on = g.want_audio || g.want_video;
+	bool live = on && g.connected;
+	text(live ? ICON_CHECK : on ? ICON_SYNC : ICON_INFO, ui.icon, x + 8, y, 36, h, live ? C_GREEN : on ? C_AMBER : C_MUTED, 1, 1);
 
 	wchar_t status[256];
 	EnterCriticalSection(&g.lock);
 	wcscpy(status, g.status);
 	LeaveCriticalSection(&g.lock);
 
-	Settings live = settings_get();
-	bool dirty = ui.page == PAGE_SETTINGS && (ui.draft.res != live.res || ui.draft.fps != live.fps || ui.draft.kbps != live.kbps
-		|| ui.draft.h265 != live.h265 || ui.draft.hw != live.hw || ui.draft.ao_res != live.ao_res || ui.draft.ao_kbps != live.ao_kbps
-		|| ui.draft.loss_pct != live.loss_pct || ui.draft.no_controller != live.no_controller || ui.draft.wifi_opt != live.wifi_opt || ui.draft.autostart_audio != live.autostart_audio || ui.draft.reconnect != live.reconnect || ui.draft.hotkey_audio != live.hotkey_audio
-		|| ui.draft.hotkey_video != live.hotkey_video || strcmp(ui.draft.device, live.device) != 0);
-
+	Settings current = settings_get();
 	float tw = w - 56;
-	if(dirty)
+	if(ui.page == PAGE_SETTINGS && settings_dirty(&ui.draft, &current))
 	{
 		tw -= 130;
 		if(pill_button(UI_APPLY, L"Uygula", x + w - 124, y + 7, 114, 34, true, true))
@@ -699,16 +986,46 @@ static void status_bar(void)
 			set_status(hotkeys_register(&ui.draft) ? L"Ayarlar uygulandı" : L"Ayarlar uygulandı ama bir kısayol başka programda kullanılıyor");
 		}
 	}
+	else if(g.ps5_standby)
+	{
+		tw -= 170;
+		if(pill_button(UI_WAKE, L"PS5'i uyandır", x + w - 164, y + 7, 154, 34, true, true))
+			CloseHandle(CreateThread(NULL, 0, ps5_wake_thread, NULL, 0, NULL));
+	}
+	else if(g.update_ready)
+	{
+		wchar_t label[64];
+		swprintf(label, 64, tr(L"Yeni sürüm: %hs"), g.update_tag);
+		tw -= 190;
+		if(pill_button(UI_UPDATE_NOW, label, x + w - 184, y + 7, 174, 34, true, true))
+			ShellExecuteW(NULL, L"open", RELEASES_URL, NULL, NULL, SW_SHOWNORMAL);
+	}
 	else if(ui.page == PAGE_PLAY)
 	{
-		wchar_t a[32], v[32], keys[80];
-		hotkey_name(live.hotkey_audio, a, 32);
-		hotkey_name(live.hotkey_video, v, 32);
-		swprintf(keys, 80, tr(L"Ses %ls   Görüntü %ls"), a, v);
-		tw -= 280;
-		text(keys, ui.small, x + w - 290, y, 278, h, C_MUTED, 2, 1);
+		tw -= 120;
+		if(pill_button(UI_DETAILS, ui.details ? L"Detayları gizle" : L"Detaylar", x + w - 134, y + 7, 124, 34, false, true))
+		{
+			ui.details = !ui.details;
+			config_set_int("details", ui.details);
+		}
 	}
 	text(ui.tip ? ui.tip : status, ui.body, x + 46, y, tw, h, C_TEXT, 0, 1);
+}
+
+static void devices_load(void)
+{
+	ui.device_count = SDL_GetNumAudioDevices(0);
+	if(ui.device_count <= 0)
+	{
+		ui.device_count = 0;
+		return;
+	}
+	ui.devices = calloc(ui.device_count, sizeof(char *));
+	for(int i = 0; i < ui.device_count; i++)
+	{
+		const char *name = SDL_GetAudioDeviceName(i, 0);
+		ui.devices[i] = strdup(name ? name : "");
+	}
 }
 
 static void ui_frame(void)
@@ -716,6 +1033,11 @@ static void ui_frame(void)
 	if(ui.in_frame)
 		return;
 	ui.in_frame = true;
+	double frame_at = now_ms();
+	double frame_ms = frame_at - ui.anim_last;
+	ui.anim_last = frame_at;
+	ui.anim_step = 1 - (float)exp(-(frame_ms > 33 ? 33 : frame_ms) / 45.0);
+	ui.animating = false;
 	BitBlt(ui.back_dc, 0, 0, S(UI_W), S(UI_H), ui.bg_dc, 0, 0, SRCCOPY);
 	int passes = 0;
 	do
@@ -741,12 +1063,22 @@ static void ui_frame(void)
 	for(int i = 1; i < UI_MAX; i++)
 		if(ui.rect_set[i] && mouse_in(ui.rects[i].X, ui.rects[i].Y, ui.rects[i].Width, ui.rects[i].Height))
 			ui.hot_id = i;
+	// Fast frames only while something moves, so the audio-only mode stays cheap
+	if(ui.animating)
+		SetTimer(g.hwnd, 2, 15, NULL);
+	else
+		KillTimer(g.hwnd, 2);
 	ui.in_frame = false;
 	InvalidateRect(g.hwnd, NULL, FALSE);
 
 	if(ui.open_device_menu)
 	{
 		ui.open_device_menu = false;
+		for(int i = 0; i < ui.device_count; i++)
+			free(ui.devices[i]);
+		free(ui.devices);
+		ui.devices = NULL;
+		devices_load();
 		HMENU menu = CreatePopupMenu();
 		AppendMenuW(menu, ui.draft.device[0] ? MF_STRING : MF_STRING | MF_CHECKED, 1, tr(L"Windows varsayılanı"));
 		for(int i = 0; i < ui.device_count; i++)
@@ -791,13 +1123,106 @@ static void capture_hotkey(int vk)
 	ui_frame();
 }
 
+static bool tray_icon(DWORD action)
+{
+	NOTIFYICONDATAW data = { 0 };
+	data.cbSize = sizeof(data);
+	data.hWnd = g.hwnd;
+	data.uID = 1;
+	data.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
+	data.uCallbackMessage = WM_APP_TRAY;
+	data.hIcon = LoadIconW(GetModuleHandleW(NULL), MAKEINTRESOURCEW(1));
+	wcscpy(data.szTip, L"PS Stream");
+	return Shell_NotifyIconW(action, &data) != 0;
+}
+
+static void tray_enter(void)
+{
+	ui.in_tray = tray_icon(NIM_ADD);
+	if(ui.in_tray)
+		ShowWindow(g.hwnd, SW_HIDE);
+	CHIAKI_LOGI(&g.log, "Tray icon: %s", ui.in_tray ? "on" : "failed");
+}
+
+static void tray_leave(void)
+{
+	if(ui.in_tray)
+		tray_icon(NIM_DELETE);
+	ui.in_tray = false;
+	ShowWindow(g.hwnd, SW_RESTORE);
+	SetForegroundWindow(g.hwnd);
+	ui_frame();
+}
+
+static void tray_menu(void)
+{
+	HMENU menu = CreatePopupMenu();
+	AppendMenuW(menu, MF_STRING, 1, tr(L"Pencereyi göster"));
+	AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
+	AppendMenuW(menu, MF_STRING | (g.want_audio ? MF_CHECKED : 0), 2, tr(L"Ses"));
+	AppendMenuW(menu, MF_STRING | (g.want_video ? MF_CHECKED : 0), 3, tr(L"Görüntü"));
+	AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
+	AppendMenuW(menu, MF_STRING, 4, tr(L"Çıkış"));
+	POINT pt;
+	GetCursorPos(&pt);
+	SetForegroundWindow(g.hwnd);
+	int cmd = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_NONOTIFY, pt.x, pt.y, 0, g.hwnd, NULL);
+	DestroyMenu(menu);
+	if(cmd == 1)
+		tray_leave();
+	else if(cmd == 2 || cmd == 3)
+		toggle(cmd == 2 ? UI_AUDIO : UI_VIDEO);
+	else if(cmd == 4)
+		DestroyWindow(g.hwnd);
+}
+
 static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 {
+	if(ui.taskbar_created && msg == ui.taskbar_created && ui.in_tray)
+		tray_icon(NIM_ADD); // Explorer restarted and forgot the icon
 	switch(msg)
 	{
+		case WM_SIZE:
+			if(wp == SIZE_MINIMIZED && settings_get().tray && !ui.in_tray)
+				tray_enter();
+			break;
+		case WM_APP_TRAY:
+			if(lp == WM_LBUTTONUP)
+				tray_leave();
+			else if(lp == WM_RBUTTONUP)
+				tray_menu();
+			return 0;
+		case WM_TIMER:
+			if(wp == 2)
+			{
+				ui_frame();
+				return 0;
+			}
+			// Live numbers and the blinking dot; nothing to draw while hidden or on the other pages.
+			// Once connected only the seconds change, so twice a second isn't needed.
+			if(IsWindowVisible(hwnd) && !IsIconic(hwnd) && ui.page == PAGE_PLAY && (g.want_audio || g.want_video) && (!g.connected || ++ui.timer_ticks % 2 == 0))
+				ui_frame();
+			return 0;
+		case WM_SETCURSOR:
+			if((HWND)wp == hwnd && LOWORD(lp) == HTCLIENT && ui.hot_id != UI_NONE)
+			{
+				SetCursor(LoadCursorW(NULL, IDC_HAND));
+				return TRUE;
+			}
+			break;
+		case WM_APP_HOST_CHANGED:
+		{
+			char host[256];
+			host_get(host, sizeof(host));
+			SetDlgItemTextA(hwnd, ID_HOST, host);
+			config_set("host", host);
+			ui_frame();
+			return 0;
+		}
 		case WM_COMMAND:
-			if(LOWORD(wp) == ID_PIN && HIWORD(wp) == EN_CHANGE && GetWindowTextLengthW(ui.edits[2]) == 8
-				&& GetWindowTextLengthW(ui.edits[1]) > 0 && !g.pairing)
+			if(HIWORD(wp) == EN_SETFOCUS || HIWORD(wp) == EN_KILLFOCUS)
+				ui_frame();
+			if(LOWORD(wp) == ID_PIN && HIWORD(wp) == EN_CHANGE && GetWindowTextLengthW(ui.edits[2]) == 8 && !g.pairing)
 			{
 				pair_start();
 				ui_frame();
@@ -842,7 +1267,7 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 				if(ui.rect_set[i] && mouse_in(ui.rects[i].X, ui.rects[i].Y, ui.rects[i].Width, ui.rects[i].Height))
 					hot = i;
 			// Settings tips follow the mouse between rows, so that page always redraws
-			if(hot != ui.hot_id || ui.active || ui.page != PAGE_PAIR)
+			if(hot != ui.hot_id || ui.active || ui.page == PAGE_SETTINGS)
 				ui_frame();
 			return 0;
 		}
@@ -856,6 +1281,7 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 			ui.mx = (float)(short)LOWORD(lp);
 			ui.my = (float)(short)HIWORD(lp);
 			ui.press = true;
+			ui.capturing = 0;
 			SetFocus(hwnd);
 			SetCapture(hwnd);
 			ui_frame();
@@ -909,8 +1335,17 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 			if(wp == 1)
 			{
 				SetDlgItemTextA(hwnd, ID_ACCOUNT, login_account_id);
+				// The browser has focus after signing in, and the code goes in here next
+				if(ui.in_tray)
+					tray_leave();
+				SetForegroundWindow(hwnd);
+				ui.repairing = true;
+				ui.again = true;
+				ShowWindow(ui.edits[2], SW_SHOW);
 				SetFocus(ui.edits[2]);
 				set_status(L"Hesap bağlandı. Şimdi PS5'teki 8 haneli kodu yaz");
+				if(GetWindowTextLengthW(ui.edits[2]) == 8 && !g.pairing)
+					pair_start();
 			}
 			else if(wp == 3)
 				set_status(L"Giriş iptal edildi veya süresi doldu");
@@ -940,8 +1375,18 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 		}
 #endif
 		case WM_DESTROY:
+		{
+			WINDOWPLACEMENT place = { sizeof(place) };
+			if(GetWindowPlacement(hwnd, &place))
+			{
+				config_set_int("win_x", place.rcNormalPosition.left);
+				config_set_int("win_y", place.rcNormalPosition.top);
+			}
+			if(ui.in_tray)
+				tray_icon(NIM_DELETE);
 			PostQuitMessage(0);
 			return 0;
+		}
 	}
 	return DefWindowProcW(hwnd, msg, wp, lp);
 }
@@ -971,6 +1416,8 @@ static void ui_create(HINSTANCE inst)
 	GdiplusStartupInput startup = { 1, NULL, FALSE, FALSE };
 	GdiplusStartup(&gdiplus_token, &startup, NULL);
 
+	ui.logo = LoadImageW(inst, MAKEINTRESOURCEW(1), IMAGE_ICON, S(44), S(44), LR_DEFAULTCOLOR);
+	ui.taskbar_created = RegisterWindowMessageW(L"TaskbarCreated");
 	ui.small = font_make(L"Segoe UI", 12);
 	ui.body = font_make(L"Segoe UI", 14);
 	ui.semi = font_make(L"Segoe UI Semibold", 14);
@@ -996,6 +1443,10 @@ static void ui_create(HINSTANCE inst)
 			rect.right - rect.left, rect.bottom - rect.top, NULL, NULL, inst, NULL);
 	BOOL dark = TRUE;
 	DwmSetWindowAttribute(g.hwnd, 20, &dark, sizeof(dark));
+	POINT saved = { config_int("win_x", 99999, -32768, 32767), config_int("win_y", 99999, -32768, 32767) };
+	POINT corner = { saved.x + 40, saved.y + 40 };
+	if(saved.x != 99999 && saved.y != 99999 && MonitorFromPoint(corner, MONITOR_DEFAULTTONULL))
+		SetWindowPos(g.hwnd, NULL, saved.x, saved.y, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
 
 	HDC screen = GetDC(g.hwnd);
 	ui.back_dc = CreateCompatibleDC(screen);
@@ -1017,7 +1468,7 @@ static void ui_create(HINSTANCE inst)
 
 	wchar_t host_w[256];
 	MultiByteToWideChar(CP_UTF8, 0, g.host, -1, host_w, 256);
-	float w = (UI_W - 48 - 32) / 3.0f, field_y = 78 + 310;
+	float w = (UI_W - 48 - 32) / 3.0f, field_y = 78 + 382;
 	ui.edits[0] = add_edit(ID_HOST, host_w, 0, 24 + 32, field_y, w - 64);
 	wchar_t account_w[128] = L"";
 	char account[128];
@@ -1026,18 +1477,12 @@ static void ui_create(HINSTANCE inst)
 	ui.edits[1] = add_edit(ID_ACCOUNT, account_w, 0, 24 + w + 16 + 32, field_y, w - 64);
 	ui.edits[2] = add_edit(ID_PIN, L"", ES_NUMBER, 24 + 2 * (w + 16) + 32, field_y, w - 64);
 
-	ui.device_count = SDL_GetNumAudioDevices(0);
-	if(ui.device_count > 0)
-	{
-		ui.devices = calloc(ui.device_count, sizeof(char *));
-		for(int i = 0; i < ui.device_count; i++)
-		{
-			const char *name = SDL_GetAudioDeviceName(i, 0);
-			ui.devices[i] = strdup(name ? name : "");
-		}
-	}
+	edit_cues();
+	devices_load();
+	ui.details = config_int("details", 0, 0, 1) != 0;
 	ui.draft = g.settings;
 	ui.mx = ui.my = -1;
+	SetTimer(g.hwnd, 1, 500, NULL);
 }
 
 #ifdef PSSTREAM_TEST
@@ -1117,7 +1562,7 @@ static DWORD WINAPI ui_test_main(void *arg)
 	Sleep(2600);
 	test_log_status("video on");
 	test_shot(dir, L"play_both");
-	test_click(UI_PRESET0 + 3);
+	test_click(UI_PRESET0 + 2);
 	Sleep(2600);
 	test_log_status("preset high");
 	test_click(UI_VIDEO);
@@ -1127,9 +1572,19 @@ static DWORD WINAPI ui_test_main(void *arg)
 	Sleep(800);
 	test_log_status("audio off");
 
+	test_click(UI_DETAILS);
+	Sleep(500);
+	test_shot(dir, L"play_details");
+	test_click(UI_DETAILS);
+	Sleep(500);
 	test_click(UI_NAV1);
 	test_shot(dir, L"settings");
-	test_click(UI_RES0 + 4);
+	test_click(UI_TRAY);
+	CHIAKI_LOGI(&g.log, "[simple settings] tray=%d applied without a press", settings_get().tray);
+	test_click(UI_TRAY);
+	test_click(UI_ADVANCED);
+	test_shot(dir, L"settings_advanced");
+	test_click(UI_RES0 + 3);
 	test_click(UI_FPS0 + 1);
 	RectF r = ui.rects[UI_BITRATE];
 	PostMessageW(g.hwnd, WM_MOUSEMOVE, 0, MAKELPARAM(S((int)(r.X + 40)), S((int)(r.Y + 14))));
@@ -1141,11 +1596,28 @@ static DWORD WINAPI ui_test_main(void *arg)
 	test_shot(dir, L"settings_dirty");
 	PostMessageW(g.hwnd, WM_KEYDOWN, VK_ESCAPE, 0);
 	Sleep(100);
+	CHIAKI_LOGI(&g.log, "[hotkey esc] still capturing=%d", ui.capturing);
+	if(GetEnvironmentVariableW(L"PSSTREAM_TEST_WINSTART", NULL, 0))
+	{
+		test_click(UI_WINSTART);
+		test_click(UI_APPLY);
+		CHIAKI_LOGI(&g.log, "[win start on] registry=%d", win_start_get());
+		test_click(UI_WINSTART);
+		test_click(UI_APPLY);
+		CHIAKI_LOGI(&g.log, "[win start off] registry=%d", win_start_get());
+	}
 	test_click(UI_APPLY);
 	Settings s = settings_get();
 	CHIAKI_LOGI(&g.log, "[applied] res=%d fps=%d kbps=%d", s.res, s.fps, s.kbps);
 	test_click(UI_NAV2);
 	test_shot(dir, L"pair_paired");
+	if(GetEnvironmentVariableW(L"PSSTREAM_TEST_TRAY", NULL, 0))
+	{
+		PostMessageW(g.hwnd, WM_SIZE, SIZE_MINIMIZED, 0);
+		Sleep(300);
+		CHIAKI_LOGI(&g.log, "[tray] in_tray=%d", ui.in_tray);
+		ui.in_tray = ui.in_tray && tray_icon(NIM_DELETE) && false;
+	}
 	PostMessageW(g.hwnd, WM_CLOSE, 0, 0);
 	return 0;
 }
@@ -1200,19 +1672,38 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmd, int show)
 	InitializeCriticalSection(&g.lock);
 	SetPriorityClass(GetCurrentProcess(), ABOVE_NORMAL_PRIORITY_CLASS);
 
-	char dir[MAX_PATH], log_path[MAX_PATH];
-	SHGetFolderPathA(NULL, CSIDL_APPDATA, NULL, 0, dir);
-	strncat(dir, "\\PSStream", sizeof(dir) - strlen(dir) - 1);
-	CreateDirectoryA(dir, NULL);
+	int argc = 0;
+	wchar_t **argv = CommandLineToArgvW(GetCommandLineW(), &argc);
+	bool start_in_tray = argc == 2 && wcscmp(argv[1], L"--tray") == 0;
+	// A second copy would fight the first one for the PS5 and the hotkeys, so show the first instead
+	if(argc < 3)
+	{
+		HANDLE single = CreateMutexW(NULL, FALSE, L"PSStreamSingleInstance");
+		if(single && GetLastError() == ERROR_ALREADY_EXISTS)
+		{
+			HWND first = FindWindowW(L"PSStreamWindow", NULL);
+			if(first)
+			{
+				PostMessageW(first, WM_APP_TRAY, 0, WM_LBUTTONUP);
+				SetForegroundWindow(first);
+			}
+			return 0;
+		}
+	}
+
+	wchar_t dir[MAX_PATH], log_path[MAX_PATH], old_log[MAX_PATH];
+	SHGetFolderPathW(NULL, CSIDL_APPDATA, NULL, 0, dir);
+	wcsncat(dir, L"\\PSStream", MAX_PATH - wcslen(dir) - 1);
+	CreateDirectoryW(dir, NULL);
 #ifdef PSSTREAM_TEST
-	GetEnvironmentVariableA("PSSTREAM_TEST_DIR", dir, sizeof(dir));
+	GetEnvironmentVariableW(L"PSSTREAM_TEST_DIR", dir, MAX_PATH);
 #endif
-	snprintf(g.config_path, sizeof(g.config_path), "%.240s\\config.ini", dir);
-	snprintf(log_path, sizeof(log_path), "%.240s\\log.txt", dir);
-	char old_log[MAX_PATH];
-	snprintf(old_log, sizeof(old_log), "%.240s\\log.onceki.txt", dir);
-	MoveFileExA(log_path, old_log, MOVEFILE_REPLACE_EXISTING);
-	g.log_file = fopen(log_path, "w");
+	wcscpy(g.data_dir, dir);
+	swprintf(g.config_path, MAX_PATH, L"%ls\\config.ini", dir);
+	swprintf(log_path, MAX_PATH, L"%ls\\log.txt", dir);
+	swprintf(old_log, MAX_PATH, L"%ls\\log.onceki.txt", dir);
+	MoveFileExW(log_path, old_log, MOVEFILE_REPLACE_EXISTING);
+	g.log_file = _wfopen(log_path, L"w");
 	chiaki_log_init(&g.log, CHIAKI_LOG_ALL & ~CHIAKI_LOG_VERBOSE & ~CHIAKI_LOG_DEBUG, log_cb, NULL);
 
 	chiaki_lib_init();
@@ -1240,13 +1731,13 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmd, int show)
 	ui_frame();
 	if(!g.host[0])
 		find_ps5();
+	if(g.settings.update_check)
+		CloseHandle(CreateThread(NULL, 0, update_check_main, NULL, 0, NULL));
 
 	LPTHREAD_START_ROUTINE thread_main = worker_main;
 	void *thread_arg = NULL;
 	HANDLE test_thread = NULL;
 #ifdef PSSTREAM_TEST
-	int argc;
-	wchar_t **argv = CommandLineToArgvW(GetCommandLineW(), &argc);
 	if(argc == 3 && wcscmp(argv[1], L"--demo") == 0)
 	{
 		g.test_hidden = true;
@@ -1272,11 +1763,17 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmd, int show)
 	}
 
 	if(!g.test_hidden)
-		ShowWindow(g.hwnd, show);
+	{
+		if(start_in_tray)
+			tray_enter();
+		else
+			ShowWindow(g.hwnd, show);
+	}
 	MSG msg;
 	while(GetMessageW(&msg, NULL, 0, 0) > 0)
 	{
-		if(IsDialogMessageW(g.hwnd, &msg))
+		// While assigning a hotkey, keys like Esc and Tab must reach the window instead of the dialog logic
+		if(!ui.capturing && IsDialogMessageW(g.hwnd, &msg))
 			continue;
 		TranslateMessage(&msg);
 		DispatchMessageW(&msg);
@@ -1284,7 +1781,9 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmd, int show)
 
 	g.quit = 1;
 	SetEvent(g.wake);
-	WaitForSingleObject(worker, 10000);
+	// Stopping tells the PS5 we left. If that hangs, leave anyway instead of tearing SDL down under it
+	if(WaitForSingleObject(worker, 10000) != WAIT_OBJECT_0)
+		ExitProcess(0);
 	SDL_Quit();
 	curl_global_cleanup();
 	if(g.log_file)

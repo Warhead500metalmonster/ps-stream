@@ -14,6 +14,7 @@
 
 #include <chiaki/base64.h>
 #include <chiaki/common.h>
+#include <chiaki/discovery.h>
 #include <chiaki/ffmpegdecoder.h>
 #include <chiaki/log.h>
 #include <chiaki/opusdecoder.h>
@@ -42,6 +43,13 @@
 
 // Below this rate we are outside what chiaki-ng offers, so a console that refuses to start
 // gets a second try with it.
+#define APP_VERSION "0.1.4"
+#define RELEASES_URL L"https://github.com/Warhead500metalmonster/ps-stream/releases/latest"
+#define REPO_URL L"https://github.com/Warhead500metalmonster/ps-stream"
+#define UPDATE_API_URL "https://api.github.com/repos/Warhead500metalmonster/ps-stream/releases/latest"
+#define LOG_MAX_BYTES (5 * 1024 * 1024)
+#define RETRY_MAX_MS 15000
+#define STATS_LOG_EVERY 15
 #define SAFE_KBPS 2000
 #define RES_MIN 1
 #define RETRY_MS 5000
@@ -65,7 +73,7 @@
 enum {
 	ID_HOST = 100, ID_ACCOUNT, ID_PIN,
 	HOTKEY_AUDIO = 1, HOTKEY_VIDEO,
-	WM_APP_STATUS = WM_APP + 1, WM_APP_VIDEO_CLOSED, WM_APP_PAIRED, WM_APP_ALL_OFF, WM_APP_TEST_SHOT, WM_APP_LOGIN
+	WM_APP_STATUS = WM_APP + 1, WM_APP_VIDEO_CLOSED, WM_APP_PAIRED, WM_APP_ALL_OFF, WM_APP_TEST_SHOT, WM_APP_LOGIN, WM_APP_TRAY, WM_APP_HOST_CHANGED
 };
 
 enum { PAGE_PLAY, PAGE_SETTINGS, PAGE_PAIR };
@@ -87,7 +95,7 @@ static const Resolution resolutions[] = {
 typedef struct {
 	int res, fps, kbps, h265, hw;
 	int ao_res, ao_kbps;
-	int volume, buffer_ms, loss_pct, reconnect, no_controller, wifi_opt, autostart_audio;
+	int volume, buffer_ms, loss_pct, reconnect, no_controller, wifi_opt, autostart_audio, win_start, tray, update_check;
 	int hotkey_audio, hotkey_video; // HKM_GETHOTKEY format
 	char device[256]; // empty is the system default
 } Settings;
@@ -110,7 +118,7 @@ static const Preset presets[] = {
 static struct {
 	HWND hwnd;
 	UINT dpi;
-	char config_path[MAX_PATH];
+	wchar_t config_path[MAX_PATH], data_dir[MAX_PATH];
 	FILE *log_file;
 	ChiakiLog log;
 	bool test_hidden;
@@ -141,9 +149,13 @@ static struct {
 	uint32_t audio_channels, audio_rate;
 	bool audio_waiting;
 	int audio_target_ms;
-	DWORD audio_last_dropout;
+	DWORD audio_last_dropout, connected_at;
+	volatile LONG audio_dropouts, video_fps10, video_lost_total, ps5_standby;
+	char update_tag[32];
+	volatile LONG update_ready;
 	HANDLE wlan;
 	int16_t *volume_buf;
+	int audio_fade_pos;
 	size_t volume_buf_size;
 
 	ChiakiFfmpegDecoder decoder;
@@ -152,6 +164,7 @@ static struct {
 } g;
 
 static int S(int v) { return MulDiv(v, g.dpi, 96); }
+static const wchar_t *tr(const wchar_t *s);
 
 static Settings settings_get(void)
 {
@@ -173,11 +186,14 @@ static void log_cb(ChiakiLogLevel level, const char *msg, void *user)
 {
 	(void)level;
 	(void)user;
-	if(!g.log_file)
+	static long written;
+	if(!g.log_file || written > LOG_MAX_BYTES)
 		return;
 	SYSTEMTIME t;
 	GetLocalTime(&t);
-	fprintf(g.log_file, "%02d:%02d:%02d %s\n", t.wHour, t.wMinute, t.wSecond, msg);
+	int n = fprintf(g.log_file, "%02d:%02d:%02d %s\n", t.wHour, t.wMinute, t.wSecond, msg);
+	if(n > 0)
+		written += n;
 	fflush(g.log_file);
 }
 
@@ -221,17 +237,32 @@ static void audio_settings_cb(uint32_t channels, uint32_t rate, void *user)
 static void audio_frame_cb(int16_t *buf, size_t samples_count, void *user)
 {
 	(void)user;
-	if(InterlockedExchange(&g.audio_reopen, 0) && g.audio_rate)
+	// A headset that was unplugged leaves the device stopped for good
+	if((InterlockedExchange(&g.audio_reopen, 0) || (g.audio_dev && SDL_GetAudioDeviceStatus(g.audio_dev) == SDL_AUDIO_STOPPED)) && g.audio_rate)
 		audio_open();
-	if(!g.audio_dev || !g.want_audio)
+	if(!g.audio_dev)
 		return;
+	if(!g.want_audio)
+	{
+		// Muted, so going quiet here isn't a dropout, and turning audio off is immediate
+		if(!g.audio_waiting)
+		{
+			SDL_PauseAudioDevice(g.audio_dev, 1);
+			SDL_ClearQueuedAudio(g.audio_dev);
+			g.audio_waiting = true;
+		}
+		return;
+	}
 	Settings s = settings_get();
 	size_t count = samples_count * g.audio_channels;
 	if(s.volume != 100)
 	{
 		if(count > g.volume_buf_size)
 		{
-			g.volume_buf = realloc(g.volume_buf, count * sizeof(int16_t));
+			int16_t *grown = realloc(g.volume_buf, count * sizeof(int16_t));
+			if(!grown)
+				return;
+			g.volume_buf = grown;
 			g.volume_buf_size = count;
 		}
 		for(size_t i = 0; i < count; i++)
@@ -258,6 +289,7 @@ static void audio_frame_cb(int16_t *buf, size_t samples_count, void *user)
 		SDL_PauseAudioDevice(g.audio_dev, 1);
 		g.audio_waiting = true;
 		g.audio_last_dropout = now;
+		InterlockedIncrement(&g.audio_dropouts);
 		if(g.audio_target_ms < target_max)
 		{
 			g.audio_target_ms += AUDIO_TARGET_STEP_MS;
@@ -268,6 +300,29 @@ static void audio_frame_cb(int16_t *buf, size_t samples_count, void *user)
 	{
 		g.audio_target_ms -= AUDIO_TARGET_STEP_MS;
 		g.audio_last_dropout = now;
+	}
+	// Starting from silence on a loud sample makes a click, so ramp up over 10 ms
+	int fade_frames = g.audio_rate / 100;
+	if(SDL_GetQueuedAudioSize(g.audio_dev) == 0)
+		g.audio_fade_pos = 0;
+	if(g.audio_fade_pos < fade_frames)
+	{
+		if(buf != g.volume_buf)
+		{
+			if(count > g.volume_buf_size)
+			{
+				int16_t *grown = realloc(g.volume_buf, count * sizeof(int16_t));
+				if(!grown)
+					return;
+				g.volume_buf = grown;
+				g.volume_buf_size = count;
+			}
+			memcpy(g.volume_buf, buf, count * sizeof(int16_t));
+			buf = g.volume_buf;
+		}
+		for(size_t frame = 0; frame < samples_count && g.audio_fade_pos < fade_frames; frame++, g.audio_fade_pos++)
+			for(int c = 0; c < g.audio_channels; c++)
+				buf[frame * g.audio_channels + c] = (int16_t)(buf[frame * g.audio_channels + c] * g.audio_fade_pos / fade_frames);
 	}
 	SDL_QueueAudio(g.audio_dev, buf, (Uint32)(count * sizeof(int16_t)));
 	if(g.audio_waiting && SDL_GetQueuedAudioSize(g.audio_dev) >= (Uint32)(g.audio_target_ms < target_max ? g.audio_target_ms : target_max) * bytes_per_ms)
@@ -290,6 +345,9 @@ static void frame_available_cb(ChiakiFfmpegDecoder *decoder, void *user)
 	SDL_PushEvent(&e);
 }
 
+static int config_int(const char *key, int fallback, int min, int max);
+static void config_set_int(const char *key, int value);
+
 static double now_ms(void)
 {
 	static LARGE_INTEGER freq;
@@ -310,8 +368,15 @@ static DWORD WINAPI video_thread_main(void *arg)
 		return 1;
 	}
 	SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, "linear");
-	SDL_Window *window = SDL_CreateWindow("PS Stream - Goruntu", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
-			S(960), S(540), SDL_WINDOW_RESIZABLE | (g.test_hidden ? SDL_WINDOW_HIDDEN : 0));
+	char title[128];
+	WideCharToMultiByte(CP_UTF8, 0, tr(L"PS Stream - Görüntü"), -1, title, sizeof(title), NULL, NULL);
+	// Back where it was last time, so a Discord layout doesn't have to be redone
+	int win_x = config_int("video_x", 99999, -32768, 32767), win_y = config_int("video_y", 99999, -32768, 32767);
+	POINT win_corner = { win_x + 40, win_y + 40 };
+	if(win_x == 99999 || win_y == 99999 || !MonitorFromPoint(win_corner, MONITOR_DEFAULTTONULL))
+		win_x = win_y = SDL_WINDOWPOS_CENTERED;
+	SDL_Window *window = SDL_CreateWindow(title, win_x, win_y, config_int("video_w", S(960), 320, 16384), config_int("video_h", S(540), 180, 16384),
+			SDL_WINDOW_RESIZABLE | (g.test_hidden ? SDL_WINDOW_HIDDEN : 0));
 	SDL_Renderer *renderer = window ? SDL_CreateRenderer(window, -1, 0) : NULL;
 	if(!renderer)
 		CHIAKI_LOGE(&g.log, "SDL window failed: %s", SDL_GetError());
@@ -322,7 +387,8 @@ static DWORD WINAPI video_thread_main(void *arg)
 	AVFrame *sw_frame = av_frame_alloc();
 	bool dirty = true;
 	double stat_pull = 0, stat_copy = 0, stat_upload = 0, stat_present = 0, stat_start = now_ms();
-	int stat_frames = 0, stat_lost = 0;
+	int stat_frames = 0, stat_lost = 0, stat_windows = 0;
+	bool fullscreen = false;
 	while(renderer && !g.video_stop)
 	{
 		SDL_Event e;
@@ -332,8 +398,22 @@ static DWORD WINAPI video_thread_main(void *arg)
 			{
 				if(e.type == SDL_QUIT)
 					PostMessageW(g.hwnd, WM_APP_VIDEO_CLOSED, 0, 0);
-				else if(e.type == SDL_WINDOWEVENT)
+				else if(e.type == SDL_WINDOWEVENT || e.type == SDL_RENDER_TARGETS_RESET)
 					dirty = true;
+				else if(e.type == SDL_RENDER_DEVICE_RESET)
+				{
+					// A GPU reset or switch loses the texture; the next frame builds a new one
+					if(texture)
+						SDL_DestroyTexture(texture);
+					texture = NULL;
+					dirty = true;
+				}
+				else if(e.type == SDL_KEYDOWN && !e.key.repeat && (e.key.keysym.sym == SDLK_F11 || (e.key.keysym.sym == SDLK_ESCAPE && fullscreen)))
+				{
+					fullscreen = !fullscreen;
+					SDL_SetWindowFullscreen(window, fullscreen ? SDL_WINDOW_FULLSCREEN_DESKTOP : 0);
+					dirty = true;
+				}
 			} while(SDL_PollEvent(&e));
 		}
 		if(InterlockedExchange(&g.frame_pending, 0))
@@ -404,10 +484,17 @@ static DWORD WINAPI video_thread_main(void *arg)
 			stat_present += now_ms() - t0;
 			dirty = false;
 		}
-		if(now_ms() - stat_start >= 5000 && stat_frames)
+		if(now_ms() - stat_start >= 2000 && stat_frames)
 		{
-			CHIAKI_LOGI(&g.log, "Video stats: %.1f fps, lost %d, per frame ms: pull %.1f, copy %.1f, upload %.1f, present %.1f",
-					stat_frames * 1000.0 / (now_ms() - stat_start), stat_lost, stat_pull / stat_frames, stat_copy / stat_frames, stat_upload / stat_frames, stat_present / stat_frames);
+			double fps = stat_frames * 1000.0 / (now_ms() - stat_start);
+			g.video_fps10 = (LONG)(fps * 10);
+			InterlockedExchangeAdd(&g.video_lost_total, stat_lost);
+			if(stat_lost || ++stat_windows >= STATS_LOG_EVERY)
+			{
+				stat_windows = 0;
+				CHIAKI_LOGI(&g.log, "Video stats: %.1f fps, lost %d, per frame ms: pull %.1f, copy %.1f, upload %.1f, present %.1f",
+						fps, stat_lost, stat_pull / stat_frames, stat_copy / stat_frames, stat_upload / stat_frames, stat_present / stat_frames);
+			}
 			stat_pull = stat_copy = stat_upload = stat_present = 0;
 			stat_frames = stat_lost = 0;
 			stat_start = now_ms();
@@ -419,7 +506,19 @@ static DWORD WINAPI video_thread_main(void *arg)
 	if(renderer)
 		SDL_DestroyRenderer(renderer);
 	if(window)
+	{
+		if(!fullscreen && !(SDL_GetWindowFlags(window) & SDL_WINDOW_MINIMIZED))
+		{
+			SDL_GetWindowPosition(window, &win_x, &win_y);
+			int win_w, win_h;
+			SDL_GetWindowSize(window, &win_w, &win_h);
+			config_set_int("video_x", win_x);
+			config_set_int("video_y", win_y);
+			config_set_int("video_w", win_w);
+			config_set_int("video_h", win_h);
+		}
 		SDL_DestroyWindow(window);
+	}
 	SDL_QuitSubSystem(SDL_INIT_VIDEO);
 	return 0;
 }
@@ -459,9 +558,10 @@ static void session_event_cb(ChiakiEvent *event, void *user)
 	switch(event->type)
 	{
 		case CHIAKI_EVENT_CONNECTED:
+			g.connected_at = GetTickCount();
 			g.connected = 1;
 			SetEvent(g.wake);
-			set_status(g.want_video ? L"Bağlı - görüntü açık" : L"Bağlı - sadece ses, görüntü çözülmüyor");
+			set_status(g.want_video ? L"Bağlandı. Görüntü açık" : L"Bağlandı. Ses açık");
 			break;
 		case CHIAKI_EVENT_LOGIN_PIN_REQUEST:
 			g.fatal = 1;
@@ -492,13 +592,29 @@ static void profile_set(ChiakiConnectVideoProfile *p, int res, int fps, int kbps
 	p->codec = codec;
 }
 
+static void host_get(char *out, size_t size)
+{
+	EnterCriticalSection(&g.lock);
+	snprintf(out, size, "%s", g.host);
+	LeaveCriticalSection(&g.lock);
+}
+
+static void host_set(const char *host)
+{
+	EnterCriticalSection(&g.lock);
+	snprintf(g.host, sizeof(g.host), "%s", host);
+	LeaveCriticalSection(&g.lock);
+}
+
 static bool session_start(bool video, const Settings *s, bool safe)
 {
 	ChiakiCodec codec = s->h265 ? CHIAKI_CODEC_H265 : CHIAKI_CODEC_H264;
 	ChiakiConnectInfo info;
 	memset(&info, 0, sizeof(info));
 	info.ps5 = true;
-	info.host = g.host;
+	char host[256];
+	host_get(host, sizeof(host));
+	info.host = host;
 	memcpy(info.regist_key, g.regist_key, sizeof(info.regist_key));
 	memcpy(info.morning, g.morning, sizeof(info.morning));
 	profile_set(&info.video_profile, s->res, s->fps, s->kbps, codec, safe);
@@ -518,6 +634,9 @@ static bool session_start(bool video, const Settings *s, bool safe)
 
 	g.connected = 0;
 	g.ended = 0;
+	g.audio_dropouts = 0;
+	g.video_fps10 = 0;
+	g.video_lost_total = 0;
 	ChiakiErrorCode err = chiaki_session_init(&g.session, &info, &g.log);
 	if(err != CHIAKI_ERR_SUCCESS)
 	{
@@ -566,7 +685,11 @@ static void session_stop(bool video)
 		video_stop();
 	chiaki_opus_decoder_fini(&g.opus);
 	if(g.audio_dev)
+	{
+		SDL_PauseAudioDevice(g.audio_dev, 1);
 		SDL_ClearQueuedAudio(g.audio_dev);
+		g.audio_waiting = true;
+	}
 }
 
 static const wchar_t *quit_reason_text(ChiakiQuitReason reason)
@@ -580,7 +703,7 @@ static const wchar_t *quit_reason_text(ChiakiQuitReason reason)
 		case CHIAKI_QUIT_REASON_SESSION_REQUEST_RP_VERSION_MISMATCH:
 			return L"PS5 yazılımı bu sürümle uyumsuz";
 		case CHIAKI_QUIT_REASON_STREAM_CONNECTION_REMOTE_SHUTDOWN:
-			return L"PS5 kapandı";
+			return L"PS5 kapandı, açılması bekleniyor...";
 		case CHIAKI_QUIT_REASON_SESSION_REQUEST_CONNECTION_REFUSED:
 		case CHIAKI_QUIT_REASON_CTRL_CONNECTION_REFUSED:
 			return L"PS5 bağlantıyı reddetti, tekrar deneniyor...";
@@ -591,8 +714,15 @@ static const wchar_t *quit_reason_text(ChiakiQuitReason reason)
 
 static bool quit_reason_is_final(ChiakiQuitReason reason)
 {
-	return reason == CHIAKI_QUIT_REASON_SESSION_REQUEST_RP_VERSION_MISMATCH
-		|| reason == CHIAKI_QUIT_REASON_STREAM_CONNECTION_REMOTE_SHUTDOWN;
+	return reason == CHIAKI_QUIT_REASON_SESSION_REQUEST_RP_VERSION_MISMATCH;
+}
+
+// Only a console that accepted the session and then ended the stream may be refusing the
+// bitrate. A console that's off or still busy says nothing about it.
+static bool quit_reason_refused_stream(ChiakiQuitReason reason)
+{
+	return reason == CHIAKI_QUIT_REASON_STREAM_CONNECTION_UNKNOWN
+		|| reason == CHIAKI_QUIT_REASON_STREAM_CONNECTION_REMOTE_DISCONNECTED;
 }
 
 // Stops Windows' periodic Wi-Fi scans, which stall traffic for moments, and asks the driver for
@@ -638,6 +768,73 @@ static void wifi_tune(bool on)
 	WlanFreeMemory(list);
 }
 
+// Asks for the console on the known address first, then on the whole network, so a PS5 that got a
+// new address from the router is found again. Returns false if no PS5 answered.
+static bool ps5_search(const char *prefer, int rounds, char *ip, size_t ip_size, bool *standby)
+{
+	SOCKET s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+	if(s == INVALID_SOCKET)
+		return false;
+	BOOL on = TRUE;
+	DWORD timeout = 700;
+	setsockopt(s, SOL_SOCKET, SO_BROADCAST, (char *)&on, sizeof(on));
+	setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (char *)&timeout, sizeof(timeout));
+
+	uint32_t targets[17];
+	int target_count = 0;
+	uint32_t prefer_addr = prefer && prefer[0] ? inet_addr(prefer) : INADDR_NONE;
+	if(prefer_addr != INADDR_NONE)
+		targets[target_count++] = prefer_addr;
+	targets[target_count++] = INADDR_BROADCAST;
+	static char table_buf[4096];
+	MIB_IPADDRTABLE *table = (MIB_IPADDRTABLE *)table_buf;
+	ULONG table_size = sizeof(table_buf);
+	if(GetIpAddrTable(table, &table_size, FALSE) == NO_ERROR)
+		for(DWORD i = 0; i < table->dwNumEntries && target_count < 17; i++)
+			if(table->table[i].dwAddr && table->table[i].dwAddr != htonl(INADDR_LOOPBACK))
+				targets[target_count++] = table->table[i].dwAddr | ~table->table[i].dwMask;
+
+	static const char msg[] = "SRCH * HTTP/1.1\ndevice-discovery-protocol-version:00030010\n";
+	bool found = false;
+	for(int round = 0; round < rounds && !g.quit; round++)
+	{
+		for(int i = 0; i < target_count; i++)
+		{
+			struct sockaddr_in to = { 0 };
+			to.sin_family = AF_INET;
+			to.sin_port = htons(9302);
+			to.sin_addr.s_addr = targets[i];
+			sendto(s, msg, sizeof(msg) - 1, 0, (struct sockaddr *)&to, sizeof(to));
+		}
+		// Read every answer of this round, so a second PS5 at home can't win over the known one
+		while(true)
+		{
+			char buf[1024];
+			struct sockaddr_in from;
+			int from_len = sizeof(from);
+			int n = recvfrom(s, buf, sizeof(buf) - 1, 0, (struct sockaddr *)&from, &from_len);
+			if(n <= 0)
+				break;
+			buf[n] = 0;
+			if(!strstr(buf, "host-type:PS5"))
+				continue;
+			bool preferred = from.sin_addr.s_addr == prefer_addr;
+			if(!found || preferred)
+			{
+				snprintf(ip, ip_size, "%s", inet_ntoa(from.sin_addr));
+				*standby = strstr(buf, "HTTP/1.1 620") != NULL;
+			}
+			found = true;
+			if(preferred)
+				break;
+		}
+		if(found)
+			break;
+	}
+	closesocket(s);
+	return found;
+}
+
 static bool stream_changed(const Settings *a, const Settings *b, bool video)
 {
 	if(a->loss_pct != b->loss_pct || a->no_controller != b->no_controller)
@@ -651,7 +848,8 @@ static bool stream_changed(const Settings *a, const Settings *b, bool video)
 static DWORD WINAPI worker_main(void *arg)
 {
 	(void)arg;
-	bool running = false, run_video = false, safe = false, waiting = false;
+	bool running = false, run_video = false, safe = false, waiting = false, hold_status = false;
+	int fails = 0;
 	Settings run = { 0 };
 	DWORD retry_at = 0;
 	while(true)
@@ -672,51 +870,97 @@ static DWORD WINAPI worker_main(void *arg)
 		wifi_tune(live && s.wifi_opt);
 		// The PC often sits untouched while the game plays on the TV
 		SetThreadExecutionState(ES_CONTINUOUS | (live ? ES_SYSTEM_REQUIRED : 0) | (live && want_video ? ES_DISPLAY_REQUIRED : 0));
+		if(live)
+		{
+			fails = 0;
+			g.ps5_standby = 0;
+		}
 
 		if(running)
 		{
 			bool ended = InterlockedExchange(&g.ended, 0) != 0;
-			if(ended || !want_any || want_video != run_video || stream_changed(&s, &run, run_video))
+			bool changed = stream_changed(&s, &run, run_video);
+			if(ended || !want_any || want_video != run_video || changed)
 			{
 				bool was_connected = g.connected != 0;
 				ChiakiQuitReason reason = g.quit_reason;
 				session_stop(run_video);
 				running = false;
 				waiting = true;
-				retry_at = GetTickCount() + (ended ? RETRY_MS : RECONNECT_MS);
+				if(changed)
+					safe = false;
 				if(ended && want_any)
 				{
-					// "In use" only means the console has not released the last session yet
-					if(!was_connected && reason != CHIAKI_QUIT_REASON_SESSION_REQUEST_RP_IN_USE)
+					if(!was_connected && quit_reason_refused_stream(reason))
 						safe = true;
 					if(g.fatal || quit_reason_is_final(reason) || !s.reconnect)
 					{
 						if(!g.fatal)
 							set_status(quit_reason_is_final(reason) ? quit_reason_text(reason) : L"Bağlantı koptu");
 						g.fatal = 0;
+						// Keep the reason on screen instead of replacing it with "off"
+						hold_status = true;
+						g.want_audio = 0;
+						g.want_video = 0;
 						PostMessageW(g.hwnd, WM_APP_ALL_OFF, 0, 0);
 						waiting = false;
 						continue;
 					}
+					if(!was_connected)
+						fails++;
+					int delay = RETRY_MS + fails * 2000;
+					retry_at = GetTickCount() + (delay < RETRY_MAX_MS ? delay : RETRY_MAX_MS);
 					set_status(quit_reason_text(reason));
 				}
-				else if(want_any)
-					set_status(L"Yeni ayarlarla yeniden bağlanıyor...");
+				else
+				{
+					retry_at = GetTickCount() + RECONNECT_MS;
+					if(want_any)
+						set_status(L"Yeni ayarlarla yeniden bağlanıyor...");
+				}
 			}
 		}
 		if(g.quit)
 			break;
 		if(!want_any)
 		{
-			if(waiting || !running)
+			if(hold_status)
+				hold_status = false;
+			else if(waiting || !running)
 				set_status(g.paired ? L"Kapalı. Başlamak için Ses veya Görüntü'ye bas" : L"Önce Eşleştirme sayfasından PS5'i bağla");
 			waiting = false;
 			safe = false;
+			fails = 0;
+			g.ps5_standby = 0;
 			continue;
 		}
+		hold_status = false;
 		if(!running && (!waiting || (LONG)(retry_at - GetTickCount()) <= 0))
 		{
 			waiting = false;
+			if(fails > 0)
+			{
+				char host[256], ip[64] = "";
+				bool standby = false;
+				host_get(host, sizeof(host));
+				bool answered = ps5_search(host, 3, ip, sizeof(ip), &standby);
+				g.ps5_standby = answered && standby;
+				if(answered && strcmp(ip, host) != 0)
+				{
+					CHIAKI_LOGI(&g.log, "PS5 moved to a new address");
+					host_set(ip);
+					PostMessageW(g.hwnd, WM_APP_HOST_CHANGED, 0, 0);
+				}
+				// Discovery can be blocked while Remote Play still works, so try anyway now and then
+				if((!answered || standby) && fails % 3 != 0)
+				{
+					set_status(standby ? L"PS5 uyku modunda. Uyandırabilir veya PS5'i açabilirsin" : L"PS5 ağda görünmüyor, açılması bekleniyor...");
+					fails++;
+					waiting = true;
+					retry_at = GetTickCount() + RETRY_MAX_MS;
+					continue;
+				}
+			}
 			set_status(L"Bağlanıyor...");
 			if(session_start(want_video, &s, safe))
 			{
@@ -727,6 +971,7 @@ static DWORD WINAPI worker_main(void *arg)
 			else
 			{
 				set_status(L"Bağlanılamadı, PS5 IP adresini kontrol et. Tekrar deneniyor...");
+				fails++;
 				waiting = true;
 				retry_at = GetTickCount() + RETRY_MS;
 			}
@@ -757,19 +1002,38 @@ static bool hex_decode(const char *in, uint8_t *out, size_t n)
 	return true;
 }
 
+static void config_read(const wchar_t *section, const char *key, char *buf, DWORD size)
+{
+	wchar_t k[64], v[1024];
+	MultiByteToWideChar(CP_UTF8, 0, key, -1, k, 64);
+	GetPrivateProfileStringW(section, k, L"", v, 1024, g.config_path);
+	if(!WideCharToMultiByte(CP_UTF8, 0, v, -1, buf, size, NULL, NULL))
+		buf[0] = 0;
+}
+
+static void config_write(const wchar_t *section, const char *key, const char *value)
+{
+	wchar_t k[64], v[1024];
+	MultiByteToWideChar(CP_UTF8, 0, key, -1, k, 64);
+	MultiByteToWideChar(CP_UTF8, 0, value, -1, v, 1024);
+	WritePrivateProfileStringW(section, k, v, g.config_path);
+}
+
 static void config_get(const char *key, char *buf, DWORD size)
 {
-	GetPrivateProfileStringA("ps5", key, "", buf, size, g.config_path);
+	config_read(L"ps5", key, buf, size);
 }
 
 static void config_set(const char *key, const char *value)
 {
-	WritePrivateProfileStringA("ps5", key, value, g.config_path);
+	config_write(L"ps5", key, value);
 }
 
 static int config_int(const char *key, int fallback, int min, int max)
 {
-	int v = GetPrivateProfileIntA("settings", key, fallback, g.config_path);
+	wchar_t k[64];
+	MultiByteToWideChar(CP_UTF8, 0, key, -1, k, 64);
+	int v = GetPrivateProfileIntW(L"settings", k, fallback, g.config_path);
 	return v < min || v > max ? fallback : v;
 }
 
@@ -777,7 +1041,38 @@ static void config_set_int(const char *key, int value)
 {
 	char v[16];
 	snprintf(v, sizeof(v), "%d", value);
-	WritePrivateProfileStringA("settings", key, v, g.config_path);
+	config_write(L"settings", key, v);
+}
+
+#define RUN_KEY L"Software\\Microsoft\\Windows\\CurrentVersion\\Run"
+#define RUN_VALUE L"PS Stream"
+
+static bool win_start_get(void)
+{
+	return RegGetValueW(HKEY_CURRENT_USER, RUN_KEY, RUN_VALUE, RRF_RT_REG_SZ, NULL, NULL, NULL) == ERROR_SUCCESS;
+}
+
+static void win_start_set(bool on)
+{
+	if(!on)
+	{
+		RegDeleteKeyValueW(HKEY_CURRENT_USER, RUN_KEY, RUN_VALUE);
+		return;
+	}
+	wchar_t exe[MAX_PATH], line[MAX_PATH + 16];
+	GetModuleFileNameW(NULL, exe, MAX_PATH);
+	swprintf(line, MAX_PATH + 16, L"\"%ls\" --tray", exe);
+	RegSetKeyValueW(HKEY_CURRENT_USER, RUN_KEY, RUN_VALUE, REG_SZ, line, (DWORD)((wcslen(line) + 1) * sizeof(wchar_t)));
+}
+
+static int hotkey_load(const char *key, int fallback)
+{
+	int hotkey = config_int(key, fallback, 0, 0xffff);
+	int vk = LOBYTE(hotkey), f = HIBYTE(hotkey);
+	// An older version allowed a bare ordinary key, which takes it away from every other program
+	if(vk && !(f & (HOTKEYF_CONTROL | HOTKEYF_ALT)) && !(vk >= VK_F1 && vk <= VK_F24))
+		return fallback;
+	return hotkey;
 }
 
 static void config_load(void)
@@ -805,9 +1100,17 @@ static void config_load(void)
 	s->no_controller = config_int("no_controller", 1, 0, 1);
 	s->wifi_opt = config_int("wifi_opt", 1, 0, 1);
 	s->autostart_audio = config_int("autostart_audio", 1, 0, 1);
-	s->hotkey_audio = config_int("hotkey_audio", MAKEWORD(VK_F9, HOTKEYF_CONTROL | HOTKEYF_ALT), 0, 0xffff);
-	s->hotkey_video = config_int("hotkey_video", MAKEWORD(VK_F10, HOTKEYF_CONTROL | HOTKEYF_ALT), 0, 0xffff);
-	GetPrivateProfileStringA("settings", "device", "", s->device, sizeof(s->device), g.config_path);
+	s->win_start = win_start_get();
+	s->tray = config_int("tray", 1, 0, 1);
+	s->update_check = config_int("update_check", 1, 0, 1);
+	s->hotkey_audio = hotkey_load("hotkey_audio", MAKEWORD(VK_F9, HOTKEYF_CONTROL | HOTKEYF_ALT));
+	s->hotkey_video = hotkey_load("hotkey_video", MAKEWORD(VK_F10, HOTKEYF_CONTROL | HOTKEYF_ALT));
+	char device_hex[sizeof(s->device) * 2 + 1];
+	config_read(L"settings", "device_hex", device_hex, sizeof(device_hex));
+	size_t device_len = strlen(device_hex) / 2;
+	memset(s->device, 0, sizeof(s->device));
+	if(!device_len || device_len >= sizeof(s->device) || !hex_decode(device_hex, (uint8_t *)s->device, device_len))
+		config_read(L"settings", "device", s->device, sizeof(s->device));
 }
 
 static void config_save_settings(const Settings *s)
@@ -826,9 +1129,15 @@ static void config_save_settings(const Settings *s)
 	config_set_int("no_controller", s->no_controller);
 	config_set_int("wifi_opt", s->wifi_opt);
 	config_set_int("autostart_audio", s->autostart_audio);
+	config_set_int("tray", s->tray);
+	config_set_int("update_check", s->update_check);
 	config_set_int("hotkey_audio", s->hotkey_audio);
 	config_set_int("hotkey_video", s->hotkey_video);
-	WritePrivateProfileStringA("settings", "device", s->device, g.config_path);
+	// Device names can hold any language, and an old INI file only stores its own code page
+	char device_hex[sizeof(s->device) * 2 + 1];
+	hex_encode((const uint8_t *)s->device, strlen(s->device), device_hex);
+	device_hex[strlen(s->device) * 2] = 0;
+	config_write(L"settings", "device_hex", device_hex);
 }
 
 // ---------- pairing ----------
@@ -847,65 +1156,35 @@ static volatile LONG finding;
 static DWORD WINAPI find_ps5_thread(void *arg)
 {
 	(void)arg;
-	SOCKET s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-	if(s == INVALID_SOCKET)
-	{
-		finding = 0;
-		return 1;
-	}
-	BOOL on = TRUE;
-	DWORD timeout = 700;
-	setsockopt(s, SOL_SOCKET, SO_BROADCAST, (char *)&on, sizeof(on));
-	setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (char *)&timeout, sizeof(timeout));
-
-	uint32_t targets[17];
-	int target_count = 0;
-	targets[target_count++] = INADDR_BROADCAST;
-	static char table_buf[4096];
-	MIB_IPADDRTABLE *table = (MIB_IPADDRTABLE *)table_buf;
-	ULONG table_size = sizeof(table_buf);
-	if(GetIpAddrTable(table, &table_size, FALSE) == NO_ERROR)
-		for(DWORD i = 0; i < table->dwNumEntries && target_count < 16; i++)
-			if(table->table[i].dwAddr && table->table[i].dwAddr != htonl(INADDR_LOOPBACK))
-				targets[target_count++] = table->table[i].dwAddr | ~table->table[i].dwMask;
-	char typed[64];
+	char typed[64], ip[64] = "";
+	bool standby = false;
 	get_text(ID_HOST, typed, sizeof(typed));
-	uint32_t typed_addr = inet_addr(typed);
-	if(typed[0] && typed_addr != INADDR_NONE)
-		targets[target_count++] = typed_addr;
-
-	static const char msg[] = "SRCH * HTTP/1.1\ndevice-discovery-protocol-version:00030010\n";
 	set_status(L"PS5 aranıyor...");
-	bool found = false;
-	for(int round = 0; round < 12 && !found && !g.quit; round++)
+	bool found = ps5_search(typed, 12, ip, sizeof(ip), &standby);
+	if(found)
 	{
-		for(int i = 0; i < target_count; i++)
-		{
-			struct sockaddr_in to = { 0 };
-			to.sin_family = AF_INET;
-			to.sin_port = htons(9302);
-			to.sin_addr.s_addr = targets[i];
-			sendto(s, msg, sizeof(msg) - 1, 0, (struct sockaddr *)&to, sizeof(to));
-		}
-		char buf[1024];
-		struct sockaddr_in from;
-		int from_len = sizeof(from);
-		int n = recvfrom(s, buf, sizeof(buf) - 1, 0, (struct sockaddr *)&from, &from_len);
-		if(n <= 0)
-			continue;
-		buf[n] = 0;
-		if(!strstr(buf, "host-type:PS5"))
-			continue;
-		found = true;
-		SetDlgItemTextA(g.hwnd, ID_HOST, inet_ntoa(from.sin_addr));
-		set_status(strstr(buf, "HTTP/1.1 620") ? L"PS5 bulundu ama uyku modunda, PS5'i aç" : L"PS5 bulundu");
+		SetDlgItemTextA(g.hwnd, ID_HOST, ip);
+		set_status(standby ? L"PS5 bulundu ama uyku modunda, PS5'i aç" : L"PS5 bulundu");
 	}
-	closesocket(s);
-	if(!found)
+	else
 		set_status(L"PS5 bulunamadı. PS5 açık mı, aynı ağda mı?");
-	CHIAKI_LOGI(&g.log, "PS5 search: %s, tried %d addresses", found ? "found" : "not found", target_count);
+	CHIAKI_LOGI(&g.log, "PS5 search: %s", found ? "found" : "not found");
 	finding = 0;
 	PostMessageW(g.hwnd, WM_APP_STATUS, 0, 0);
+	return 0;
+}
+
+// Needs the console's rest mode to allow turning on over the network.
+static DWORD WINAPI ps5_wake_thread(void *arg)
+{
+	(void)arg;
+	char key[CHIAKI_SESSION_AUTH_SIZE + 1], host[256];
+	memcpy(key, g.regist_key, CHIAKI_SESSION_AUTH_SIZE);
+	key[CHIAKI_SESSION_AUTH_SIZE] = 0;
+	host_get(host, sizeof(host));
+	ChiakiErrorCode err = chiaki_discovery_wakeup(&g.log, NULL, host, strtoull(key, NULL, 16), true);
+	CHIAKI_LOGI(&g.log, "PS5 wake-up sent: %s", chiaki_error_string(err));
+	set_status(err == CHIAKI_ERR_SUCCESS ? L"Uyandırma sinyali gönderildi, PS5 açılıyor olabilir" : L"Uyandırma sinyali gönderilemedi");
 	return 0;
 }
 
@@ -917,7 +1196,7 @@ static void find_ps5(void)
 }
 
 typedef struct {
-	char data[16384];
+	char data[65536];
 	size_t size;
 } HttpBody;
 
@@ -988,7 +1267,53 @@ static bool account_id_from_url(const char *url, char *out, size_t out_size)
 	if(!psn_request(request, NULL, &body) || !json_get(body.data, "user_id", user_id, sizeof(user_id)))
 		return false;
 	uint64_t id = strtoull(user_id, NULL, 10);
+	if(!id)
+		return false;
 	return chiaki_base64_encode((const uint8_t *)&id, sizeof(id), out, out_size) == CHIAKI_ERR_SUCCESS;
+}
+
+static int version_number(const char *v)
+{
+	int a = 0, b = 0, c = 0;
+	if(*v == 'v')
+		v++;
+	sscanf(v, "%d.%d.%d", &a, &b, &c);
+	return a * 1000000 + b * 1000 + c;
+}
+
+// Only asks GitHub for the latest version number. Nothing about the user is sent, nothing is downloaded.
+static DWORD WINAPI update_check_main(void *arg)
+{
+	(void)arg;
+	const char *current = APP_VERSION;
+#ifdef PSSTREAM_TEST
+	static char test_version[16];
+	if(GetEnvironmentVariableA("PSSTREAM_TEST_VERSION", test_version, sizeof(test_version)))
+		current = test_version;
+#endif
+	static HttpBody body;
+	body.size = 0;
+	body.data[0] = 0;
+	CURL *curl = curl_easy_init();
+	if(!curl)
+		return 0;
+	curl_easy_setopt(curl, CURLOPT_URL, UPDATE_API_URL);
+	curl_easy_setopt(curl, CURLOPT_USERAGENT, "PS-Stream/" APP_VERSION);
+	curl_easy_setopt(curl, CURLOPT_SSL_OPTIONS, (long)CURLSSLOPT_NATIVE_CA);
+	curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, http_write);
+	curl_easy_setopt(curl, CURLOPT_WRITEDATA, &body);
+	curl_easy_setopt(curl, CURLOPT_TIMEOUT, 15L);
+	CURLcode res = curl_easy_perform(curl);
+	curl_easy_cleanup(curl);
+	char tag[32] = "";
+	if(res == CURLE_OK && json_get(body.data, "tag_name", tag, sizeof(tag)) && version_number(tag) > version_number(current))
+	{
+		snprintf(g.update_tag, sizeof(g.update_tag), "%s", tag);
+		g.update_ready = 1;
+		PostMessageW(g.hwnd, WM_APP_STATUS, 0, 0);
+	}
+	CHIAKI_LOGI(&g.log, "Update check: current %s, latest %s", current, tag[0] ? tag : "unknown");
+	return 0;
 }
 
 static char login_account_id[64];
@@ -1192,26 +1517,20 @@ static void regist_cb(ChiakiRegistEvent *event, void *user)
 
 static void pair_start(void)
 {
-	char account[1024], pin[32];
-	get_text(ID_HOST, g.host, sizeof(g.host));
+	char account[1024], pin[32], host[256];
+	get_text(ID_HOST, host, sizeof(host));
 	get_text(ID_ACCOUNT, account, sizeof(account));
 	get_text(ID_PIN, pin, sizeof(pin));
-	if(!g.host[0])
+	if(!host[0])
 	{
 		set_status(L"PS5 IP adresini gir veya Bul'a bas");
 		return;
 	}
+	host_set(host);
 	if(strstr(account, "code="))
 	{
-		SetCursor(LoadCursor(NULL, IDC_WAIT));
-		char id[64];
-		if(!account_id_from_url(account, id, sizeof(id)))
-		{
-			set_status(L"Sony'den hesap ID alınamadı, girişi tekrar dene");
-			return;
-		}
-		SetDlgItemTextA(g.hwnd, ID_ACCOUNT, id);
-		snprintf(account, sizeof(account), "%s", id);
+		set_status(L"Hesap bilgisi alınıyor...");
+		return;
 	}
 
 	if(!account[0])
@@ -1254,6 +1573,7 @@ static void pair_finished(void)
 	if(!g.regist_ok)
 	{
 		set_status(L"Eşleştirme olmadı. Kodu ve IP'yi kontrol et");
+		SetDlgItemTextW(g.hwnd, ID_PIN, L"");
 		return;
 	}
 	memcpy(g.regist_key, g.registered.rp_regist_key, sizeof(g.regist_key));
@@ -1268,6 +1588,11 @@ static void pair_finished(void)
 	SetDlgItemTextW(g.hwnd, ID_PIN, L"");
 	show_page(PAGE_PLAY);
 	set_status(L"Eşleştirildi. Ses veya Görüntü'ye basabilirsin");
+	if(g.settings.autostart_audio)
+	{
+		g.want_audio = 1;
+		SetEvent(g.wake);
+	}
 }
 
 #include "ui.c"

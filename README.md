@@ -22,10 +22,13 @@ If you play on a TV and use Discord on your PC, the usual way to get game audio 
 ## Features
 
 - **Audio-only mode.** Video isn't decoded, and the PS5 is asked for the smallest stream.
-- **Video on demand.** Turn video on when you want to stream to Discord, and pick the "PS Stream - Goruntu" window there. Turning video on or off reconnects, which takes a few seconds.
-- **Quality from lowest to highest.** Presets from 360p at 0.5 Mbps to 1080p 60 FPS at 50 Mbps, or set resolution, frame rate, bitrate and codec yourself.
+- **Video on demand.** Turn video on when you want to stream to Discord, and pick the "PS Stream - Video" window there. Press `F11` in that window for full screen. Turning video on or off reconnects, which takes a few seconds.
+- **Simple by default.** Two big buttons and three quality choices: Low, Medium and High. Everything else, from resolution and frame rate to bitrate and codec, is under **Advanced settings**.
 - **Built for Wi-Fi.** Pauses Windows' background Wi-Fi scans while connected, uses an audio buffer that adapts to jitter, and keeps your PC awake.
-- **Audio controls.** Choose the output device, volume and maximum delay.
+- **Audio controls.** Choose the output device and maximum delay, and change the volume right on the Play page.
+- **Live connection numbers.** Press **Details** to see connection time, ping, audio dropouts, video frame rate and lost frames.
+- **Stays connected.** Keeps trying when the PS5 turns off, and finds the console again if the router gives it a new address.
+- **Runs in the background.** Minimizes to the tray, can start with Windows, remembers where its windows were, and opening it a second time shows the running copy.
 - **Global hotkeys.** `Ctrl+Alt+F9` for audio and `Ctrl+Alt+F10` for video. You can change them.
 - **Turkish and English interface.**
 
@@ -51,19 +54,24 @@ You only pair once. After that, audio starts when you open the app, and you can 
 
 Until then, pair the app with a **second PSN account** on the console, and your DualSense keeps working on the PS5. You don't need a controller on the PC.
 
-The **DualSense on PS5** setting stops the app from announcing a virtual controller, but this doesn't fix the problem on its own. It's on by default. Turn it off if connecting fails.
+The **DualSense on PS5** setting under **Advanced settings** stops the app from announcing a virtual controller, but this doesn't fix the problem on its own. It's on by default. Turn it off if connecting fails.
 
 ## Settings
 
 ![Settings page](docs/settings.png)
 
-The PS5 address and account ID stay saved until you delete them. To use another account, press **Delete** on the Pairing page, sign in again and pair. Settings, pairing data and a log are stored in `%APPDATA%\PSStream`. The log (`log.txt`) is the first place to look if something goes wrong.
+The PS5 address and account ID stay saved until you delete them. To use another account, press **Delete** on the Pairing page, sign in again and pair. Settings, pairing data and a log are stored in `%APPDATA%\PSStream`. The log (`log.txt`) is the first place to look if something goes wrong, and **Open logs** in Settings takes you there.
 
-For the best results on Wi-Fi, connect the PS5 to your router with a cable, or use 5 GHz. If the picture breaks up, lower the quality to **Balanced**.
+For the best results on Wi-Fi, connect the PS5 to your router with a cable, or use 5 GHz. If the picture breaks up, lower the quality to **Medium** or **Low**.
+
+## Update check
+
+At startup, the app asks GitHub for the latest release number, and shows a button if there is a newer one. It only reads the public release page: it sends no account or console data and downloads nothing by itself. Turn off **Check for updates** in Settings to stop it.
 
 ## Known limitations
 
 - Windows only.
+- **Wake PS5** appears when the console is in rest mode. It needs the PS5's option to turn on over the network, and hasn't been tested on a real console yet.
 - Local network only.
 - No controller input from the PC. The app is for audio and video.
 - The PS5 sends some video even in audio-only mode, so the network use doesn't reach zero.
