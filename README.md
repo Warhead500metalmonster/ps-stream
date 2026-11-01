@@ -31,13 +31,13 @@ If you play on a TV and use Discord on your PC, the usual way to get game audio 
 
 ## Getting started
 
-You need Windows 10 or 11 (64-bit), a PS5 on the same network, and Google Chrome or Microsoft Edge for signing in.
+You need Windows 10 or 11 (64-bit), a PS5 on the same network, and a web browser for signing in.
 
 1. Download the latest zip from [Releases](../../releases/latest) and extract it.
 2. Open `PS Stream.exe`. Keep the folder together, because the app needs the files in `dist`. Windows may warn you because the app isn't signed. Choose **More info**, then **Run anyway**.
 3. On the **Pairing** page:
    - The app looks for your PS5. If it can't find it, type the console's IP address.
-   - Press **Sign in with PSN** and sign in on Sony's page. Your password goes only to Sony.
+   - Press **Sign in with PSN** and sign in on Sony's page in your browser. Your password goes only to Sony. While it waits, the app checks your browser's address bar and clipboard for Sony's redirect address, and links your account when it appears. If it doesn't link, copy the address from the address bar.
    - On the PS5, go to **Settings > System > Remote Play > Link Device** and type the 8-digit code into the app. Pairing starts by itself.
 4. Press **Turn on** under **Audio** or **Video**.
 
@@ -55,7 +55,7 @@ The **DualSense on PS5** setting stops the app from announcing a virtual control
 
 ![Settings page](docs/settings.png)
 
-Settings, pairing data and a log are stored in `%APPDATA%\PSStream`. The log (`log.txt`) is the first place to look if something goes wrong.
+The PS5 address and account ID stay saved until you delete them. To use another account, press **Delete** on the Pairing page, sign in again and pair. Settings, pairing data and a log are stored in `%APPDATA%\PSStream`. The log (`log.txt`) is the first place to look if something goes wrong.
 
 For the best results on Wi-Fi, connect the PS5 to your router with a cable, or use 5 GHz. If the picture breaks up, lower the quality to **Balanced**.
 

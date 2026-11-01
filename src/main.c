@@ -5,6 +5,7 @@
 #ifndef UNICODE
 #define UNICODE
 #endif
+#define COBJMACROS
 #define _UNICODE
 #undef WINVER
 #undef _WIN32_WINNT
@@ -31,6 +32,9 @@
 #include <shlobj.h>
 #include <iphlpapi.h>
 #include <wlanapi.h>
+#define Off UiaOff // uiautomationcore.h clashes with an enum from the Wi-Fi headers
+#include <uiautomation.h>
+#undef Off
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -781,8 +785,7 @@ static void config_load(void)
 	config_get("host", g.host, sizeof(g.host));
 	config_get("regist_key", regist, sizeof(regist));
 	config_get("morning", morning, sizeof(morning));
-	g.paired = g.host[0]
-		&& hex_decode(regist, (uint8_t *)g.regist_key, sizeof(g.regist_key))
+	g.paired = hex_decode(regist, (uint8_t *)g.regist_key, sizeof(g.regist_key))
 		&& hex_decode(morning, g.morning, sizeof(g.morning));
 
 	Settings *s = &g.settings;
@@ -987,53 +990,98 @@ static bool account_id_from_url(const char *url, char *out, size_t out_size)
 
 static char login_account_id[64];
 
-static bool local_get(const char *url, HttpBody *body)
+// A brand-new browser profile leaves Sony's page blank, so sign-in happens in the user's own browser.
+// The address Sony redirects to is read from the browser's address bar, or from the clipboard if
+// the user copies it. Nothing else read here is kept, and this only runs while waiting for sign-in.
+#define REDIRECT_MARK L"remoteplay/redirect?code="
+
+static const CLSID clsid_uia = { 0xff48dba4, 0x60ef, 0x4201, { 0xaa, 0x87, 0x54, 0x10, 0x3e, 0xef, 0x59, 0x4e } };
+static const IID iid_uia = { 0x30cbe57d, 0xd9d0, 0x452a, { 0xab, 0x13, 0x7a, 0xc5, 0xac, 0x48, 0x25, 0xee } };
+enum { UIA_EDIT_TYPE = 50004, UIA_CONTROL_TYPE_PROP = 30003, UIA_VALUE_PROP = 30045 };
+
+typedef struct {
+	IUIAutomation *uia;
+	IUIAutomationCondition *edit;
+	wchar_t found[1024];
+} AddressScan;
+
+static bool is_browser_window(HWND h)
 {
-	CURL *curl = curl_easy_init();
-	if(!curl)
+	if(!IsWindowVisible(h))
 		return false;
-	body->size = 0;
-	body->data[0] = 0;
-	curl_easy_setopt(curl, CURLOPT_URL, url);
-	curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, http_write);
-	curl_easy_setopt(curl, CURLOPT_WRITEDATA, body);
-	curl_easy_setopt(curl, CURLOPT_TIMEOUT, 2L);
-	CURLcode res = curl_easy_perform(curl);
-	curl_easy_cleanup(curl);
-	return res == CURLE_OK;
-}
-
-// Finds Chrome, or Edge if there is none. Returns whether it is Edge.
-static bool login_browser_find(wchar_t *path)
-{
-	static const struct { int folder; const wchar_t *file; } browsers[] = {
-		{ CSIDL_PROGRAM_FILES, L"\\Google\\Chrome\\Application\\chrome.exe" },
-		{ CSIDL_PROGRAM_FILESX86, L"\\Google\\Chrome\\Application\\chrome.exe" },
-		{ CSIDL_LOCAL_APPDATA, L"\\Google\\Chrome\\Application\\chrome.exe" },
-	};
+	wchar_t cls[64];
+	GetClassNameW(h, cls, 64);
+	if(wcscmp(cls, L"Chrome_WidgetWin_1") != 0 && wcscmp(cls, L"MozillaWindowClass") != 0)
+		return false;
+	// Discord and other Electron apps share Chrome's window class
+	DWORD pid = 0;
+	GetWindowThreadProcessId(h, &pid);
+	HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+	if(!process)
+		return false;
+	wchar_t path[MAX_PATH];
+	DWORD size = MAX_PATH;
+	bool ok = QueryFullProcessImageNameW(process, 0, path, &size) != 0;
+	CloseHandle(process);
+	if(!ok)
+		return false;
+	const wchar_t *name = wcsrchr(path, L'\\');
+	name = name ? name + 1 : path;
+	static const wchar_t *const browsers[] = { L"chrome.exe", L"msedge.exe", L"firefox.exe", L"brave.exe", L"opera.exe", L"vivaldi.exe" };
 	for(size_t i = 0; i < sizeof(browsers) / sizeof(browsers[0]); i++)
-	{
-		SHGetFolderPathW(NULL, browsers[i].folder, NULL, 0, path);
-		wcsncat(path, browsers[i].file, MAX_PATH - wcslen(path) - 1);
-		if(GetFileAttributesW(path) != INVALID_FILE_ATTRIBUTES)
-			return false;
-	}
-	SHGetFolderPathW(NULL, CSIDL_PROGRAM_FILESX86, NULL, 0, path);
-	wcsncat(path, L"\\Microsoft\\Edge\\Application\\msedge.exe", MAX_PATH - wcslen(path) - 1);
-	return true;
+		if(_wcsicmp(name, browsers[i]) == 0)
+			return true;
+	return false;
 }
 
-// Sony's page in a throwaway browser window, so the password only ever goes to Sony. Edge needs
-// InPrivate, or its new profile signs in to the Microsoft account and loads extensions. The browser's local
-// debug port is read for the address Sony redirects to; it and the profile die with this login.
+static BOOL CALLBACK address_scan_window(HWND h, LPARAM param)
+{
+	AddressScan *scan = (AddressScan *)param;
+	if(!is_browser_window(h))
+		return TRUE;
+	IUIAutomationElement *root = NULL, *edit = NULL;
+	if(IUIAutomation_ElementFromHandle(scan->uia, h, &root) == S_OK && root)
+	{
+		if(IUIAutomationElement_FindFirst(root, TreeScope_Descendants, scan->edit, &edit) == S_OK && edit)
+		{
+			VARIANT value;
+			VariantInit(&value);
+			if(IUIAutomationElement_GetCurrentPropertyValue(edit, UIA_VALUE_PROP, &value) == S_OK && value.vt == VT_BSTR && value.bstrVal
+				&& wcsstr(value.bstrVal, REDIRECT_MARK))
+				wcsncpy(scan->found, wcsstr(value.bstrVal, REDIRECT_MARK), 1023);
+			VariantClear(&value);
+			IUIAutomationElement_Release(edit);
+		}
+		IUIAutomationElement_Release(root);
+	}
+	return scan->found[0] ? FALSE : TRUE;
+}
+
+static void clipboard_redirect(wchar_t *out, size_t size)
+{
+	out[0] = 0;
+	if(!OpenClipboard(NULL))
+		return;
+	HANDLE data = GetClipboardData(CF_UNICODETEXT);
+	const wchar_t *text = data ? GlobalLock(data) : NULL;
+	if(text)
+	{
+		const wchar_t *mark = wcsstr(text, REDIRECT_MARK);
+		if(mark)
+		{
+			wcsncpy(out, mark, size - 1);
+			out[size - 1] = 0;
+		}
+		GlobalUnlock(data);
+	}
+	CloseClipboard();
+}
+
+static volatile LONG login_cancel;
+
 static DWORD WINAPI login_main(void *arg)
 {
 	(void)arg;
-	wchar_t edge[MAX_PATH], temp[MAX_PATH], profile[MAX_PATH], port_path[MAX_PATH], cmd[2048];
-	bool is_edge = login_browser_find(edge);
-	GetTempPathW(MAX_PATH, temp);
-	swprintf(profile, MAX_PATH, L"%lsPSStreamLogin%lu", temp, GetTickCount());
-	swprintf(port_path, MAX_PATH, L"%ls\\DevToolsActivePort", profile);
 	const wchar_t *login_url = PSN_LOGIN_URL;
 	bool test_mode = false;
 #ifdef PSSTREAM_TEST
@@ -1044,77 +1092,77 @@ static DWORD WINAPI login_main(void *arg)
 		test_mode = true;
 	}
 #endif
-	swprintf(cmd, 2048, L"\"%ls\" --app=\"%ls\" --user-data-dir=\"%ls\" --remote-debugging-port=0%ls --no-first-run --no-default-browser-check --window-size=560,800",
-			edge, login_url, profile, is_edge ? L" --inprivate" : L"");
-
-	HANDLE job = CreateJobObjectW(NULL, NULL);
-	JOBOBJECT_EXTENDED_LIMIT_INFORMATION limit = { 0 };
-	limit.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-	SetInformationJobObject(job, JobObjectExtendedLimitInformation, &limit, sizeof(limit));
-	STARTUPINFOW si = { 0 };
-	si.cb = sizeof(si);
-	PROCESS_INFORMATION pi;
-	if(!CreateProcessW(edge, cmd, NULL, NULL, FALSE, CREATE_SUSPENDED, NULL, NULL, &si, &pi))
+	CoInitializeEx(NULL, COINIT_MULTITHREADED);
+	AddressScan scan = { 0 };
+	if(CoCreateInstance(&clsid_uia, NULL, CLSCTX_INPROC_SERVER, &iid_uia, (void **)&scan.uia) == S_OK)
 	{
-		CloseHandle(job);
-		CHIAKI_LOGE(&g.log, "Browser could not start: %lu", GetLastError());
-		PostMessageW(g.hwnd, WM_APP_LOGIN, 2, 0);
-		return 1;
+		VARIANT type;
+		VariantInit(&type);
+		type.vt = VT_I4;
+		type.lVal = UIA_EDIT_TYPE;
+		IUIAutomation_CreatePropertyCondition(scan.uia, UIA_CONTROL_TYPE_PROP, type, &scan.edit);
 	}
-	AssignProcessToJobObject(job, pi.hProcess);
-	ResumeThread(pi.hThread);
-	CloseHandle(pi.hThread);
-	CloseHandle(pi.hProcess);
+	else
+		CHIAKI_LOGW(&g.log, "Address bar reading unavailable, waiting for the clipboard");
 
-	static HttpBody body;
-	char redirect[1024] = "";
+	// Anything already showing a redirect is an old, used code
+	wchar_t stale_address[1024] = L"", stale_clip[1024];
+	if(scan.edit)
+	{
+		EnumWindows(address_scan_window, (LPARAM)&scan);
+		wcscpy(stale_address, scan.found);
+	}
+	clipboard_redirect(stale_clip, 1024);
+
+	ShellExecuteW(NULL, L"open", login_url, NULL, NULL, SW_SHOWNORMAL);
+
+	wchar_t redirect[1024] = L"";
+	const char *source = "";
 	DWORD start = GetTickCount();
-	while(!g.quit && !redirect[0] && GetTickCount() - start < LOGIN_TIMEOUT_MS)
+	login_cancel = 0;
+	while(!g.quit && !login_cancel && !redirect[0] && GetTickCount() - start < LOGIN_TIMEOUT_MS)
 	{
-		Sleep(400);
-		JOBOBJECT_BASIC_ACCOUNTING_INFORMATION acct = { 0 };
-		QueryInformationJobObject(job, JobObjectBasicAccountingInformation, &acct, sizeof(acct), NULL);
-		if(acct.ActiveProcesses == 0)
+		Sleep(700);
+		wchar_t clip[1024];
+		clipboard_redirect(clip, 1024);
+		if(clip[0] && wcscmp(clip, stale_clip) != 0)
+		{
+			wcscpy(redirect, clip);
+			source = "clipboard";
 			break;
-		FILE *f = _wfopen(port_path, L"r");
-		if(!f)
-			continue;
-		int port = 0;
-		fscanf(f, "%d", &port);
-		fclose(f);
-		if(port <= 0)
-			continue;
-		char url[64];
-		snprintf(url, sizeof(url), "http://127.0.0.1:%d/json/list", port);
-		if(!local_get(url, &body))
-			continue;
-		const char *found = strstr(body.data, "remoteplay/redirect?code=");
-		if(found)
-			snprintf(redirect, sizeof(redirect), "%s", found);
+		}
+		if(scan.edit)
+		{
+			scan.found[0] = 0;
+			EnumWindows(address_scan_window, (LPARAM)&scan);
+			if(scan.found[0] && wcscmp(scan.found, stale_address) != 0)
+			{
+				wcscpy(redirect, scan.found);
+				source = "address bar";
+			}
+		}
 	}
-	CloseHandle(job); // closes the login window
-	Sleep(700);
-	wchar_t from[MAX_PATH + 1] = { 0 };
-	wcsncpy(from, profile, MAX_PATH);
-	SHFILEOPSTRUCTW op = { 0 };
-	op.wFunc = FO_DELETE;
-	op.pFrom = from;
-	op.fFlags = FOF_NO_UI;
-	SHFileOperationW(&op);
+	if(scan.edit)
+		IUIAutomationCondition_Release(scan.edit);
+	if(scan.uia)
+		IUIAutomation_Release(scan.uia);
+	CoUninitialize();
 
 	if(!redirect[0])
 	{
 		PostMessageW(g.hwnd, WM_APP_LOGIN, 3, 0);
 		return 0;
 	}
+	CHIAKI_LOGI(&g.log, "Sign-in detected from the %s", source);
+	char redirect_utf8[2048];
+	WideCharToMultiByte(CP_UTF8, 0, redirect, -1, redirect_utf8, sizeof(redirect_utf8), NULL, NULL);
 	if(test_mode)
 	{
-		CHIAKI_LOGI(&g.log, "Login test: redirect detected, profile removed: %d", GetFileAttributesW(profile) == INVALID_FILE_ATTRIBUTES);
 		snprintf(login_account_id, sizeof(login_account_id), "TEST");
 		PostMessageW(g.hwnd, WM_APP_LOGIN, 1, 0);
 		return 0;
 	}
-	bool ok = account_id_from_url(redirect, login_account_id, sizeof(login_account_id));
+	bool ok = account_id_from_url(redirect_utf8, login_account_id, sizeof(login_account_id));
 	PostMessageW(g.hwnd, WM_APP_LOGIN, ok ? 1 : 0, 0);
 	return 0;
 }

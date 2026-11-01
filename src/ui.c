@@ -26,7 +26,7 @@
 #define ICON_BULB L""
 #define ICON_PLAY L""
 
-enum { UI_NONE, UI_NAV0, UI_NAV1, UI_NAV2, UI_AUDIO, UI_VIDEO, UI_GEAR_A, UI_GEAR_V, UI_APPLY, UI_FIND, UI_LOGIN, UI_PAIR,
+enum { UI_NONE, UI_NAV0, UI_NAV1, UI_NAV2, UI_AUDIO, UI_VIDEO, UI_GEAR_A, UI_GEAR_V, UI_APPLY, UI_FIND, UI_LOGIN, UI_ACCOUNT_CLEAR, UI_PAIR,
 	UI_DEVICE, UI_HK_AUDIO, UI_HK_VIDEO, UI_HW, UI_RECONNECT, UI_CONTROLLER, UI_WIFI, UI_BITRATE, UI_AO_BITRATE, UI_VOLUME, UI_BUFFER, UI_LOSS,
 	UI_PRESET0 = 40, UI_RES0 = 50, UI_FPS0 = 60, UI_CODEC0 = 65, UI_AORES0 = 70, UI_LANG0 = 80, UI_MAX = 96 };
 
@@ -44,7 +44,7 @@ static struct {
 	float mx, my;
 	bool press, release;
 	int active, released_id, capturing;
-	bool again, open_device_menu, in_frame, logging_in, login_in_browser;
+	bool again, open_device_menu, in_frame, logging_in;
 	const wchar_t *tip;
 	RectF rects[UI_MAX];
 	bool rect_set[UI_MAX];
@@ -308,12 +308,12 @@ static void toggle(int which)
 		set_status(L"Önce PS5'i eşleştir");
 		return;
 	}
-	char host[256];
-	get_text(ID_HOST, host, sizeof(host));
-	if(host[0] && strcmp(host, g.host) != 0)
+	get_text(ID_HOST, g.host, sizeof(g.host));
+	if(!g.host[0])
 	{
-		snprintf(g.host, sizeof(g.host), "%s", host);
-		config_set("host", g.host);
+		show_page(PAGE_PAIR);
+		set_status(L"PS5 IP adresini gir veya Otomatik bul'a bas");
+		return;
 	}
 	if(which == UI_AUDIO)
 		g.want_audio = !g.want_audio;
@@ -571,7 +571,7 @@ static void page_pair(void)
 	static const wchar_t *const titles[] = { L"PS5'i bul", L"Hesabını bağla", L"Kodu gir" };
 	static const wchar_t *const bodies[] = {
 		L"PS5 açık ve bu bilgisayarla aynı ağda olmalı. Uygulama kendisi arar. Bulamazsa Otomatik bul'a bas veya PS5'teki IP adresini yaz.\n\nPS5'te: Ayarlar > Sistem > Sistem Yazılımı > Konsol Bilgisi",
-		L"PSN ile giriş yap'a bas. Sony'nin giriş penceresi açılır, giriş yapınca kapanır ve hesabın kendiliğinden bağlanır.\n\nŞifren sadece Sony'ye gider, bu uygulama görmez ve saklamaz.",
+		L"PSN ile giriş yap'a bas. Sony'nin sayfası tarayıcında açılır. Giriş yapınca hesabın kendiliğinden bağlanır, sonra sekmeyi kapatabilirsin.\n\nŞifren sadece Sony'ye gider. Olmazsa adres çubuğundaki adresi kopyala.\n\nBaşka hesap için Sil'e bas, yeniden giriş yap ve eşleştir.",
 		L"PS5'te: Ayarlar > Sistem > Uzaktan Oynatma > Cihazı Bağla\n\nEkranda çıkan 8 haneli kodu yaz. Eşleştirme kendiliğinden başlar. Bunu bir kere yapman yeterli."
 	};
 	static const wchar_t *const nums[] = { L"1", L"2", L"3" };
@@ -588,20 +588,24 @@ static void page_pair(void)
 	float x0 = 24, x1 = 24 + w + 16, x2 = 24 + 2 * (w + 16), by = y + 360, bw = w - 40;
 	if(pill_button(UI_FIND, finding ? L"Aranıyor..." : L"Otomatik bul", x0 + 20, by, bw, 46, false, !finding))
 		find_ps5();
-	if(pill_button(UI_LOGIN, ui.logging_in ? L"Giriş bekleniyor..." : L"PSN ile giriş yap", x1 + 20, by, bw, 46, false, !ui.logging_in))
+	if(pill_button(UI_LOGIN, ui.logging_in ? L"Giriş bekleniyor (iptal)" : L"PSN ile giriş yap", x1 + 20, by, bw - 58, 46, false, true))
 	{
-		if(ui.login_in_browser)
-		{
-			ShellExecuteW(NULL, L"open", PSN_LOGIN_URL, NULL, NULL, SW_SHOWNORMAL);
-			set_status(L"Tarayıcıda giriş yap, sonra adres çubuğundaki adresi 2. kutuya yapıştır");
-		}
+		if(ui.logging_in)
+			login_cancel = 1;
 		else
 		{
 			ui.logging_in = true;
 			CloseHandle(CreateThread(NULL, 0, login_main, NULL, 0, NULL));
-			set_status(L"Açılan Sony penceresinden giriş yap. Hata verirse pencereyi kapat");
+			set_status(L"Tarayıcında açılan Sony sayfasından giriş yap");
 		}
 	}
+	if(pill_button(UI_ACCOUNT_CLEAR, L"Sil", x1 + 20 + bw - 50, by, 50, 46, false, true))
+	{
+		SetDlgItemTextW(g.hwnd, ID_ACCOUNT, L"");
+		set_status(L"Hesap kimliği silindi. Yeni hesapla giriş yapıp eşleştirebilirsin");
+	}
+	if(mouse_in(x1 + 20 + bw - 50, by, 50, 46))
+		ui.tip = L"Kayıtlı hesap kimliğini siler. Eski eşleştirme, yenisini yapana kadar çalışır.";
 	if(pill_button(UI_PAIR, g.pairing ? L"Eşleştiriliyor..." : L"Eşleştir", x2 + 20, by, bw, 46, true, !g.pairing))
 		pair_start();
 }
@@ -772,10 +776,18 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 				pair_start();
 				ui_frame();
 			}
-			if(LOWORD(wp) == ID_ACCOUNT && HIWORD(wp) == EN_CHANGE && !ui.logging_in)
+			if(LOWORD(wp) == ID_HOST && HIWORD(wp) == EN_CHANGE)
+			{
+				char host[256];
+				get_text(ID_HOST, host, sizeof(host));
+				config_set("host", host);
+			}
+			if(LOWORD(wp) == ID_ACCOUNT && HIWORD(wp) == EN_CHANGE)
 			{
 				get_text(ID_ACCOUNT, pasted_redirect, sizeof(pasted_redirect));
-				if(strstr(pasted_redirect, "code="))
+				if(!strstr(pasted_redirect, "code="))
+					config_set("account", pasted_redirect);
+				else if(!ui.logging_in)
 				{
 					ui.logging_in = true;
 					set_status(L"Hesap bilgisi alınıyor...");
@@ -870,17 +882,11 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 			if(wp == 1)
 			{
 				SetDlgItemTextA(hwnd, ID_ACCOUNT, login_account_id);
-				config_set("account", login_account_id);
 				SetFocus(ui.edits[2]);
 				set_status(L"Hesap bağlandı. Şimdi PS5'teki 8 haneli kodu yaz");
 			}
-			else if(wp == 2)
-				set_status(L"Giriş penceresi açılamadı, Chrome veya Edge kurulu mu?");
 			else if(wp == 3)
-			{
-				ui.login_in_browser = true;
-				set_status(L"Pencere kapandı. Tekrar basarsan giriş normal tarayıcında açılır");
-			}
+				set_status(L"Giriş iptal edildi veya süresi doldu");
 			else
 				set_status(L"Sony'den hesap bilgisi alınamadı, tekrar dene");
 			ui_frame();
@@ -1048,6 +1054,15 @@ static DWORD WINAPI ui_test_main(void *arg)
 	{
 		test_shot(dir, L"pair");
 		test_log_status("unpaired start");
+		char saved[128];
+		get_text(ID_ACCOUNT, saved, sizeof(saved));
+		CHIAKI_LOGI(&g.log, "Account field at start: %s", saved);
+		if(GetEnvironmentVariableW(L"PSSTREAM_TEST_CLEAR", NULL, 0))
+		{
+			test_click(UI_ACCOUNT_CLEAR);
+			get_text(ID_ACCOUNT, saved, sizeof(saved));
+			CHIAKI_LOGI(&g.log, "Account field after delete: '%s'", saved);
+		}
 		for(int i = 0; i < 60 && finding; i++)
 			Sleep(200);
 		test_log_status("search finished");
