@@ -45,9 +45,11 @@ You need Windows 10 or 11 (64-bit), a PS5 on the same network, and Google Chrome
 
 ## Keeping your DualSense on the PS5
 
-PS Stream doesn't need a controller on the PC. To keep your DualSense connected to the PS5, pair the app with a **second PSN account** on the console. With the account you're playing on, the DualSense currently stops working while connected.
+> **Not working yet.** Keeping the DualSense on the PS5 while connected with the account you're playing on doesn't work in this version. Support is planned for a future update.
 
-The **DualSense on PS5** setting stops the app from announcing a virtual controller. It's on by default. Turn it off if connecting fails.
+Until then, pair the app with a **second PSN account** on the console, and your DualSense keeps working on the PS5. You don't need a controller on the PC.
+
+The **DualSense on PS5** setting stops the app from announcing a virtual controller, but this doesn't fix the problem on its own. It's on by default. Turn it off if connecting fails.
 
 ## Settings
 
