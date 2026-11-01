@@ -26,7 +26,7 @@
 #define ICON_BULB L""
 #define ICON_PLAY L""
 
-enum { UI_NONE, UI_NAV0, UI_NAV1, UI_NAV2, UI_AUDIO, UI_VIDEO, UI_GEAR_A, UI_GEAR_V, UI_APPLY, UI_FIND, UI_LOGIN, UI_ACCOUNT_CLEAR, UI_PAIR,
+enum { UI_NONE, UI_NAV0, UI_NAV1, UI_NAV2, UI_AUDIO, UI_VIDEO, UI_GEAR_A, UI_GEAR_V, UI_APPLY, UI_FIND, UI_LOGIN, UI_ACCOUNT_CLEAR, UI_PAIR, UI_REPAIR,
 	UI_DEVICE, UI_HK_AUDIO, UI_HK_VIDEO, UI_HW, UI_RECONNECT, UI_CONTROLLER, UI_WIFI, UI_BITRATE, UI_AO_BITRATE, UI_VOLUME, UI_BUFFER, UI_LOSS,
 	UI_PRESET0 = 40, UI_RES0 = 50, UI_FPS0 = 60, UI_CODEC0 = 65, UI_AORES0 = 70, UI_LANG0 = 80, UI_MAX = 96 };
 
@@ -44,7 +44,7 @@ static struct {
 	float mx, my;
 	bool press, release;
 	int active, released_id, capturing;
-	bool again, open_device_menu, in_frame, logging_in;
+	bool again, open_device_menu, in_frame, logging_in, repairing;
 	const wchar_t *tip;
 	RectF rects[UI_MAX];
 	bool rect_set[UI_MAX];
@@ -280,11 +280,12 @@ static void hotkey_name(int hotkey, wchar_t *out, size_t n)
 		swprintf(out, n, L"Yok");
 		return;
 	}
-	wchar_t key[16];
-	if(vk >= VK_F1 && vk <= VK_F24)
-		swprintf(key, 16, L"F%d", vk - VK_F1 + 1);
-	else
-		swprintf(key, 16, L"%lc", (wchar_t)vk);
+	wchar_t key[32];
+	LONG scan = (LONG)MapVirtualKeyW(vk, MAPVK_VK_TO_VSC) << 16;
+	if(vk >= VK_PRIOR && vk <= VK_DELETE)
+		scan |= 1 << 24; // Home, arrows and friends are extended keys
+	if(!GetKeyNameTextW(scan, key, 32))
+		swprintf(key, 32, L"%d", vk);
 	swprintf(out, n, L"%ls%ls%ls%ls", f & HOTKEYF_CONTROL ? L"Ctrl+" : L"", f & HOTKEYF_ALT ? L"Alt+" : L"", f & HOTKEYF_SHIFT ? L"Shift+" : L"", key);
 }
 
@@ -582,9 +583,12 @@ static void page_pair(void)
 		dot(x + 20, y + 20, 36, C_ACCENT);
 		text(nums[i], ui.title, x + 20, y + 20, 36, 36, C_TEXT, 1, 1);
 		text(titles[i], ui.title, x + 66, y + 20, w - 80, 36, C_TEXT, 0, 1);
-		text(bodies[i], ui.body, x + 20, y + 74, w - 40, 210, WHITE(205), 0, 0);
-		fill_round(x + 20, y + 300, w - 40, 44, 14, C_FIELD);
+		bool done = i == 2 && g.paired && !ui.repairing;
+		text(done ? L"PS5 eşleşti. Bir daha kod girmen gerekmez.\n\nOynat sayfasından Ses veya Görüntü'yü aç, yeterli.\n\nKodu sadece başka bir hesap bağlamak istersen girersin." : bodies[i], ui.body, x + 20, y + 74, w - 40, 210, WHITE(205), 0, 0);
+		if(!done)
+			fill_round(x + 20, y + 300, w - 40, 44, 14, C_FIELD);
 	}
+	ShowWindow(ui.edits[2], g.paired && !ui.repairing ? SW_HIDE : SW_SHOW);
 	float x0 = 24, x1 = 24 + w + 16, x2 = 24 + 2 * (w + 16), by = y + 360, bw = w - 40;
 	if(pill_button(UI_FIND, finding ? L"Aranıyor..." : L"Otomatik bul", x0 + 20, by, bw, 46, false, !finding))
 		find_ps5();
@@ -602,11 +606,23 @@ static void page_pair(void)
 	if(pill_button(UI_ACCOUNT_CLEAR, L"Sil", x1 + 20 + bw - 50, by, 50, 46, false, true))
 	{
 		SetDlgItemTextW(g.hwnd, ID_ACCOUNT, L"");
+		ui.repairing = true;
+		ui.again = true;
 		set_status(L"Hesap kimliği silindi. Yeni hesapla giriş yapıp eşleştirebilirsin");
 	}
 	if(mouse_in(x1 + 20 + bw - 50, by, 50, 46))
 		ui.tip = L"Kayıtlı hesap kimliğini siler. Eski eşleştirme, yenisini yapana kadar çalışır.";
-	if(pill_button(UI_PAIR, g.pairing ? L"Eşleştiriliyor..." : L"Eşleştir", x2 + 20, by, bw, 46, true, !g.pairing))
+	if(g.paired && !ui.repairing)
+	{
+		if(pill_button(UI_REPAIR, L"Başka hesapla eşleştir", x2 + 20, by - 56, bw, 46, false, true))
+		{
+			ui.repairing = true;
+			ui.again = true;
+		}
+		if(pill_button(UI_PAIR, L"Oynat'a dön", x2 + 20, by, bw, 46, true, true))
+			show_page(PAGE_PLAY);
+	}
+	else if(pill_button(UI_PAIR, g.pairing ? L"Eşleştiriliyor..." : L"Eşleştir", x2 + 20, by, bw, 46, true, !g.pairing))
 		pair_start();
 }
 
@@ -759,6 +775,12 @@ static void capture_hotkey(int vk)
 	else if(vk != VK_ESCAPE)
 	{
 		int f = (GetKeyState(VK_CONTROL) < 0 ? HOTKEYF_CONTROL : 0) | (GetKeyState(VK_MENU) < 0 ? HOTKEYF_ALT : 0) | (GetKeyState(VK_SHIFT) < 0 ? HOTKEYF_SHIFT : 0);
+		// A bare ordinary key would be taken away from every other program
+		if(!(f & (HOTKEYF_CONTROL | HOTKEYF_ALT)) && !(vk >= VK_F1 && vk <= VK_F24))
+		{
+			set_status(L"Ctrl veya Alt ile birlikte bas, ya da bir F tuşu seç");
+			return;
+		}
 		*target = MAKEWORD(vk, f);
 	}
 	ui.capturing = 0;
@@ -875,6 +897,7 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 			return 0;
 		case WM_APP_PAIRED:
 			pair_finished();
+			ui.repairing = !g.regist_ok && ui.repairing;
 			ui_frame();
 			return 0;
 		case WM_APP_LOGIN:
@@ -1182,6 +1205,9 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmd, int show)
 #endif
 	snprintf(g.config_path, sizeof(g.config_path), "%.240s\\config.ini", dir);
 	snprintf(log_path, sizeof(log_path), "%.240s\\log.txt", dir);
+	char old_log[MAX_PATH];
+	snprintf(old_log, sizeof(old_log), "%.240s\\log.onceki.txt", dir);
+	MoveFileExA(log_path, old_log, MOVEFILE_REPLACE_EXISTING);
 	g.log_file = fopen(log_path, "w");
 	chiaki_log_init(&g.log, CHIAKI_LOG_ALL & ~CHIAKI_LOG_VERBOSE & ~CHIAKI_LOG_DEBUG, log_cb, NULL);
 

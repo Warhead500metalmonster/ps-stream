@@ -41,6 +41,8 @@ You need Windows 10 or 11 (64-bit), a PS5 on the same network, and a web browser
    - On the PS5, go to **Settings > System > Remote Play > Link Device** and type the 8-digit code into the app. Pairing starts by itself.
 4. Press **Turn on** under **Audio** or **Video**.
 
+You only pair once. After that, open the app and turn on what you need.
+
 ![Pairing page](docs/pair.png)
 
 ## Keeping your DualSense on the PS5
