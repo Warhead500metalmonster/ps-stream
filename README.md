@@ -41,7 +41,7 @@ You need Windows 10 or 11 (64-bit), a PS5 on the same network, and a web browser
    - On the PS5, go to **Settings > System > Remote Play > Link Device** and type the 8-digit code into the app. Pairing starts by itself.
 4. Press **Turn on** under **Audio** or **Video**.
 
-You only pair once. After that, open the app and turn on what you need.
+You only pair once. After that, audio starts when you open the app, and you can turn video on whenever you need it. To choose yourself each time, turn off **Audio at startup** in Settings.
 
 ![Pairing page](docs/pair.png)
 
@@ -67,7 +67,8 @@ For the best results on Wi-Fi, connect the PS5 to your router with a cable, or u
 - Local network only.
 - No controller input from the PC. The app is for audio and video.
 - The PS5 sends some video even in audio-only mode, so the network use doesn't reach zero.
-- 144p and rates below 2 Mbps are experimental. If the console refuses them, the app falls back to 360p and 2 Mbps.
+- 360p is the lowest resolution. A PS5 refused 144p when tested.
+- Rates below 2 Mbps are outside what chiaki-ng offers. If the console refuses one, the app falls back to 2 Mbps.
 
 ## Is it safe for my account?
 

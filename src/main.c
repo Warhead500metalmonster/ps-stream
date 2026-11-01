@@ -40,10 +40,10 @@
 #include <stdlib.h>
 #include <string.h>
 
-// Below this rate or size we are outside what chiaki-ng offers, so a console that refuses
-// to start gets a second try with these values.
+// Below this rate we are outside what chiaki-ng offers, so a console that refuses to start
+// gets a second try with it.
 #define SAFE_KBPS 2000
-#define SAFE_RES_INDEX 1
+#define RES_MIN 1
 #define RETRY_MS 5000
 // Audio waits for this much backlog before playing; each dropout raises it, quiet minutes lower it
 #define AUDIO_TARGET_MIN_MS 30
@@ -76,7 +76,7 @@ typedef struct {
 } Resolution;
 
 static const Resolution resolutions[] = {
-	{ L"144p (deneysel, PS5 kabul etmeyebilir)", 256, 144 },
+	{ L"144p", 256, 144 }, // kept so saved indexes stay valid; the PS5 refuses it ("AvCap failed to initialize")
 	{ L"360p", 640, 360 },
 	{ L"540p", 960, 540 },
 	{ L"720p", 1280, 720 },
@@ -87,7 +87,7 @@ static const Resolution resolutions[] = {
 typedef struct {
 	int res, fps, kbps, h265, hw;
 	int ao_res, ao_kbps;
-	int volume, buffer_ms, loss_pct, reconnect, no_controller, wifi_opt;
+	int volume, buffer_ms, loss_pct, reconnect, no_controller, wifi_opt, autostart_audio;
 	int hotkey_audio, hotkey_video; // HKM_GETHOTKEY format
 	char device[256]; // empty is the system default
 } Settings;
@@ -460,6 +460,7 @@ static void session_event_cb(ChiakiEvent *event, void *user)
 	{
 		case CHIAKI_EVENT_CONNECTED:
 			g.connected = 1;
+			SetEvent(g.wake);
 			set_status(g.want_video ? L"Bağlı - görüntü açık" : L"Bağlı - sadece ses, görüntü çözülmüyor");
 			break;
 		case CHIAKI_EVENT_LOGIN_PIN_REQUEST:
@@ -482,8 +483,6 @@ static void session_event_cb(ChiakiEvent *event, void *user)
 
 static void profile_set(ChiakiConnectVideoProfile *p, int res, int fps, int kbps, ChiakiCodec codec, bool safe)
 {
-	if(safe && res < SAFE_RES_INDEX)
-		res = SAFE_RES_INDEX;
 	if(safe && kbps < SAFE_KBPS)
 		kbps = SAFE_KBPS;
 	p->width = resolutions[res].width;
@@ -668,9 +667,11 @@ static DWORD WINAPI worker_main(void *arg)
 		bool want_video = g.want_video != 0;
 		bool want_any = !g.quit && (g.want_audio || want_video);
 		Settings s = settings_get();
-		wifi_tune(want_any && s.wifi_opt);
+		// Only while connected, so a PS5 that's off doesn't keep the PC awake or its Wi-Fi tuned
+		bool live = want_any && g.connected;
+		wifi_tune(live && s.wifi_opt);
 		// The PC often sits untouched while the game plays on the TV
-		SetThreadExecutionState(ES_CONTINUOUS | (want_any ? ES_SYSTEM_REQUIRED : 0) | (want_video && !g.quit ? ES_DISPLAY_REQUIRED : 0));
+		SetThreadExecutionState(ES_CONTINUOUS | (live ? ES_SYSTEM_REQUIRED : 0) | (live && want_video ? ES_DISPLAY_REQUIRED : 0));
 
 		if(running)
 		{
@@ -790,12 +791,12 @@ static void config_load(void)
 
 	Settings *s = &g.settings;
 	const Preset *p = &presets[PRESET_DEFAULT];
-	s->res = config_int("res", p->res, 0, RES_COUNT - 1);
+	s->res = config_int("res", p->res, RES_MIN, RES_COUNT - 1);
 	s->fps = config_int("fps", p->fps, 30, 60) == 60 ? 60 : 30;
 	s->kbps = config_int("kbps", p->kbps, 500, 100000);
 	s->h265 = config_int("h265", p->h265, 0, 1);
 	s->hw = config_int("hw", 1, 0, 1);
-	s->ao_res = config_int("ao_res", 1, 0, 1);
+	s->ao_res = config_int("ao_res", RES_MIN, RES_MIN, RES_MIN);
 	s->ao_kbps = config_int("ao_kbps", 500, 100, 2000);
 	s->volume = config_int("volume", 100, 0, 200);
 	s->buffer_ms = config_int("buffer_ms", 150, 40, 500);
@@ -803,6 +804,7 @@ static void config_load(void)
 	s->reconnect = config_int("reconnect", 1, 0, 1);
 	s->no_controller = config_int("no_controller", 1, 0, 1);
 	s->wifi_opt = config_int("wifi_opt", 1, 0, 1);
+	s->autostart_audio = config_int("autostart_audio", 1, 0, 1);
 	s->hotkey_audio = config_int("hotkey_audio", MAKEWORD(VK_F9, HOTKEYF_CONTROL | HOTKEYF_ALT), 0, 0xffff);
 	s->hotkey_video = config_int("hotkey_video", MAKEWORD(VK_F10, HOTKEYF_CONTROL | HOTKEYF_ALT), 0, 0xffff);
 	GetPrivateProfileStringA("settings", "device", "", s->device, sizeof(s->device), g.config_path);
@@ -823,6 +825,7 @@ static void config_save_settings(const Settings *s)
 	config_set_int("reconnect", s->reconnect);
 	config_set_int("no_controller", s->no_controller);
 	config_set_int("wifi_opt", s->wifi_opt);
+	config_set_int("autostart_audio", s->autostart_audio);
 	config_set_int("hotkey_audio", s->hotkey_audio);
 	config_set_int("hotkey_video", s->hotkey_video);
 	WritePrivateProfileStringA("settings", "device", s->device, g.config_path);

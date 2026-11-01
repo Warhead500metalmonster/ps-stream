@@ -27,7 +27,7 @@
 #define ICON_PLAY L""
 
 enum { UI_NONE, UI_NAV0, UI_NAV1, UI_NAV2, UI_AUDIO, UI_VIDEO, UI_GEAR_A, UI_GEAR_V, UI_APPLY, UI_FIND, UI_LOGIN, UI_ACCOUNT_CLEAR, UI_PAIR, UI_REPAIR,
-	UI_DEVICE, UI_HK_AUDIO, UI_HK_VIDEO, UI_HW, UI_RECONNECT, UI_CONTROLLER, UI_WIFI, UI_BITRATE, UI_AO_BITRATE, UI_VOLUME, UI_BUFFER, UI_LOSS,
+	UI_DEVICE, UI_HK_AUDIO, UI_HK_VIDEO, UI_HW, UI_RECONNECT, UI_CONTROLLER, UI_WIFI, UI_AUTOSTART, UI_BITRATE, UI_AO_BITRATE, UI_VOLUME, UI_BUFFER, UI_LOSS,
 	UI_PRESET0 = 40, UI_RES0 = 50, UI_FPS0 = 60, UI_CODEC0 = 65, UI_AORES0 = 70, UI_LANG0 = 80, UI_MAX = 96 };
 
 static struct {
@@ -450,15 +450,17 @@ static void page_settings(void)
 	panel(lx, py, pw, ph);
 	panel(rx, py, pw, ph);
 
-	static const wchar_t *const res_names[] = { L"144p", L"360p", L"540p", L"720p", L"1080p" };
+	static const wchar_t *const res_names[] = { L"360p", L"540p", L"720p", L"1080p" };
 	static const wchar_t *const fps_names[] = { L"30 FPS", L"60 FPS" };
 	static const wchar_t *const codec_names[] = { L"H.264", L"H.265" };
 
 	float x = lx + 20, cx = lx + 150, cw = pw - 170, y = py + 14;
 	heading(L"GÖRÜNTÜ MODU", x, y);
 	y += 30;
-	row_label(L"Çözünürlük", L"144p deneyseldir, PS5 kabul etmezse otomatik olarak 360p'ye döner.", x, y, pw - 40);
-	chips_row(UI_RES0, res_names, RES_COUNT, &d->res, cx, y, cw);
+	row_label(L"Çözünürlük", L"Yüksek çözünürlük daha fazla veri ister. PS5 360p'nin altını kabul etmez.", x, y, pw - 40);
+	int res_i = d->res - RES_MIN;
+	chips_row(UI_RES0, res_names, RES_COUNT - RES_MIN, &res_i, cx, y, cw);
+	d->res = res_i + RES_MIN;
 	y += 42;
 	row_label(L"Kare hızı", L"60 FPS daha akıcıdır ama daha fazla veri ister.", x, y, pw - 40);
 	int fps_i = d->fps == 60;
@@ -481,21 +483,23 @@ static void page_settings(void)
 	y += 50;
 	heading(L"SADECE SES MODU", x, y);
 	y += 30;
-	row_label(L"Çözünürlük", L"PS5 görüntüyü yine gönderir, bu yüzden en küçüğü istenir. Görüntü çözülmez.", x, y, pw - 40);
-	chips_row(UI_AORES0, res_names, 2, &d->ao_res, cx, y, cw);
-	y += 42;
-	row_label(L"İstenen veri", L"Wi-Fi'ın kötüyse en düşükte bırak. PS5 kabul etmezse 2 Mbps'ye döner.", x, y, pw - 40);
+	row_label(L"İstenen veri", L"PS5 görüntüyü yine 360p gönderir ama çözülmez. Wi-Fi'ın kötüyse en düşükte bırak. PS5 kabul etmezse 2 Mbps'ye döner.", x, y, pw - 40);
 	steps = d->ao_kbps / 100;
 	slider(UI_AO_BITRATE, cx + 8, y, cw - 94, &steps, 1, 20);
 	d->ao_kbps = steps * 100;
 	bitrate_text(t, 64, d->ao_kbps);
 	text(t, ui.body, cx + cw - 80, y, 80, 30, C_TEXT, 2, 1);
 	y += 38;
-	heading(L"WI-FI", x, y);
+	heading(L"GENEL", x, y);
 	y += 24;
 	row_label(L"Düşük gecikme", L"Bağlıyken Windows'un Wi-Fi taramalarını durdurur, bilgisayarı uyanık tutar. Bağlantı kapanınca eski hâline döner.", x, y, pw - 40);
 	if(switch_toggle(UI_WIFI, cx, y + 2, d->wifi_opt != 0))
 		d->wifi_opt = !d->wifi_opt;
+	text(L"Açılışta ses", ui.body, cx + 60, y, 140, 30, C_TEXT, 0, 1);
+	if(mouse_in(cx + 60, y, cw - 60, 34))
+		ui.tip = L"Uygulama açılınca ses kendiliğinden başlar. PS5 kapalıysa açılana kadar dener.";
+	if(switch_toggle(UI_AUTOSTART, cx + cw - 46, y + 2, d->autostart_audio != 0))
+		d->autostart_audio = !d->autostart_audio;
 
 	x = rx + 20;
 	cx = rx + 150;
@@ -682,7 +686,7 @@ static void status_bar(void)
 	Settings live = settings_get();
 	bool dirty = ui.page == PAGE_SETTINGS && (ui.draft.res != live.res || ui.draft.fps != live.fps || ui.draft.kbps != live.kbps
 		|| ui.draft.h265 != live.h265 || ui.draft.hw != live.hw || ui.draft.ao_res != live.ao_res || ui.draft.ao_kbps != live.ao_kbps
-		|| ui.draft.loss_pct != live.loss_pct || ui.draft.no_controller != live.no_controller || ui.draft.wifi_opt != live.wifi_opt || ui.draft.reconnect != live.reconnect || ui.draft.hotkey_audio != live.hotkey_audio
+		|| ui.draft.loss_pct != live.loss_pct || ui.draft.no_controller != live.no_controller || ui.draft.wifi_opt != live.wifi_opt || ui.draft.autostart_audio != live.autostart_audio || ui.draft.reconnect != live.reconnect || ui.draft.hotkey_audio != live.hotkey_audio
 		|| ui.draft.hotkey_video != live.hotkey_video || strcmp(ui.draft.device, live.device) != 0);
 
 	float tw = w - 56;
@@ -1257,6 +1261,15 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmd, int show)
 #endif
 	(void)test_thread;
 	HANDLE worker = CreateThread(NULL, 0, thread_main, thread_arg, 0, NULL);
+	bool autostart = !g.test_hidden;
+#ifdef PSSTREAM_TEST
+	autostart = autostart || GetEnvironmentVariableW(L"PSSTREAM_TEST_AUTOSTART", NULL, 0) != 0;
+#endif
+	if(autostart && g.paired && g.host[0] && g.settings.autostart_audio)
+	{
+		g.want_audio = 1;
+		SetEvent(g.wake);
+	}
 
 	if(!g.test_hidden)
 		ShowWindow(g.hwnd, show);
