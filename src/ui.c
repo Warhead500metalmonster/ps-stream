@@ -10,6 +10,14 @@
 #include "i18n.c"
 
 #define UI_W 920
+// A test copy must never find, or be stopped by, the copy someone is using
+#ifdef PSSTREAM_TEST
+#define WINDOW_CLASS L"PSStreamTestWindow"
+#define INSTANCE_MUTEX L"PSStreamTestInstance"
+#else
+#define WINDOW_CLASS L"PSStreamWindow"
+#define INSTANCE_MUTEX L"PSStreamSingleInstance"
+#endif
 #define UI_H 662
 
 #define COLOR(a, r, g, b) ((ARGB)(((a) << 24) | ((r) << 16) | ((g) << 8) | (b)))
@@ -908,7 +916,8 @@ static void page_pair(void)
 	};
 	static const wchar_t *const nums[] = { L"1", L"2", L"3" };
 	bool paired_view = g.paired && !ui.repairing;
-	bool steps_done[3] = { GetWindowTextLengthW(ui.edits[0]) > 0, GetWindowTextLengthW(ui.edits[1]) > 0, paired_view };
+	// A paired PS5 has done step two even if the account field was cleared afterwards
+	bool steps_done[3] = { GetWindowTextLengthW(ui.edits[0]) > 0, GetWindowTextLengthW(ui.edits[1]) > 0 || paired_view, paired_view };
 	float field_y = y + 372;
 	int next_step = !steps_done[0] ? 0 : !steps_done[1] ? 1 : !steps_done[2] ? 2 : 3;
 	for(int i = 0; i < 3; i++)
@@ -965,8 +974,18 @@ static void page_pair(void)
 		if(pill_button(UI_PAIR, L"Oynat'a dön", x2 + 20, by, bw, 46, true, true))
 			show_page(PAGE_PLAY);
 	}
-	else if(pill_button(UI_PAIR, g.pairing ? L"Eşleştiriliyor..." : L"Eşleştir", x2 + 20, by, bw, 46, next_step == 2, !g.pairing))
-		pair_start();
+	else
+	{
+		// The old pairing keeps working until a new one replaces it, so this can always be undone
+		if(g.paired && pill_button(UI_REPAIR, L"Vazgeç", x2 + 20, by - 56, bw, 46, false, true))
+		{
+			ui.repairing = false;
+			ui.again = true;
+			set_status(L"Eski eşleştirme kullanılmaya devam ediyor");
+		}
+		if(pill_button(UI_PAIR, g.pairing ? L"Eşleştiriliyor..." : L"Eşleştir", x2 + 20, by, bw, 46, next_step == 2, !g.pairing))
+			pair_start();
+	}
 }
 
 static void top_bar(void)
@@ -1544,7 +1563,7 @@ static void ui_create(HINSTANCE inst)
 	wc.hInstance = inst;
 	wc.hCursor = LoadCursor(NULL, IDC_ARROW);
 	wc.hIcon = LoadIconW(inst, MAKEINTRESOURCEW(1));
-	wc.lpszClassName = L"PSStreamWindow";
+	wc.lpszClassName = WINDOW_CLASS;
 	RegisterClassW(&wc);
 
 	DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_CLIPCHILDREN;
@@ -1717,6 +1736,12 @@ static DWORD WINAPI ui_test_main(void *arg)
 	CHIAKI_LOGI(&g.log, "[applied] res=%d fps=%d kbps=%d", s.res, s.fps, s.kbps);
 	test_click(UI_NAV2);
 	test_shot(dir, L"pair_paired");
+	test_click(UI_ACCOUNT_CLEAR);
+	Sleep(300);
+	test_shot(dir, L"pair_repair");
+	test_click(UI_REPAIR);
+	Sleep(300);
+	test_shot(dir, L"pair_cancelled");
 	if(GetEnvironmentVariableW(L"PSSTREAM_TEST_TRAY", NULL, 0))
 	{
 		PostMessageW(g.hwnd, WM_SIZE, SIZE_MINIMIZED, 0);
@@ -1796,11 +1821,11 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmd, int show)
 	// A second copy would fight the first one for the PS5 and the hotkeys, so show the first instead
 	if(argc < 3)
 	{
-		HANDLE single = CreateMutexW(NULL, FALSE, L"PSStreamSingleInstance");
+		HANDLE single = CreateMutexW(NULL, FALSE, INSTANCE_MUTEX);
 		g.single_instance = single;
 		if(single && GetLastError() == ERROR_ALREADY_EXISTS)
 		{
-			HWND first = FindWindowW(L"PSStreamWindow", NULL);
+			HWND first = FindWindowW(WINDOW_CLASS, NULL);
 			if(first)
 			{
 				PostMessageW(first, WM_APP_TRAY, 0, WM_LBUTTONUP);

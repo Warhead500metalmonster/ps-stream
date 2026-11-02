@@ -44,13 +44,15 @@
 
 // Below this rate we are outside what chiaki-ng offers, so a console that refuses to start
 // gets a second try with it.
-#define APP_VERSION "0.1.6"
+#define APP_VERSION "0.1.7"
 #define UPDATE_DOWNLOAD_PREFIX "https://github.com/Warhead500metalmonster/ps-stream/releases/download/"
 #define RELEASES_URL L"https://github.com/Warhead500metalmonster/ps-stream/releases/latest"
 #define REPO_URL L"https://github.com/Warhead500metalmonster/ps-stream"
 #define UPDATE_API_URL "https://api.github.com/repos/Warhead500metalmonster/ps-stream/releases/latest"
 #define LOG_MAX_BYTES (5 * 1024 * 1024)
 #define RETRY_MAX_MS 15000
+#define RETRY_FAST_MS 2000
+#define RETRY_FAST_WINDOW_MS 60000
 #define STATS_LOG_EVERY 15
 #define SAFE_KBPS 2000
 #define RES_MIN 1
@@ -154,6 +156,7 @@ static struct {
 	DWORD audio_last_dropout, connected_at;
 	volatile LONG audio_dropouts, video_fps10, video_lost_total, ps5_standby;
 	char update_tag[32];
+	volatile LONG network_changed;
 	volatile LONG update_ready, update_busy, update_failed, update_restart;
 	char update_url[512], update_digest[72];
 	bool relaunched;
@@ -842,6 +845,45 @@ static bool ps5_search(const char *prefer, int rounds, char *ip, size_t ip_size,
 	return found;
 }
 
+// Discovery answers get lost while Wi-Fi or Windows' firewall are still settling after startup,
+// but the console's Remote Play port answers or it doesn't.
+static bool ps5_port_open(const char *host)
+{
+	struct sockaddr_in to = { 0 };
+	to.sin_family = AF_INET;
+	to.sin_port = htons(9295);
+	to.sin_addr.s_addr = inet_addr(host);
+	if(to.sin_addr.s_addr == INADDR_NONE)
+		return false;
+	SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+	if(s == INVALID_SOCKET)
+		return false;
+	u_long nonblocking = 1;
+	ioctlsocket(s, FIONBIO, &nonblocking);
+	connect(s, (struct sockaddr *)&to, sizeof(to));
+	fd_set writable, failed;
+	FD_ZERO(&writable);
+	FD_ZERO(&failed);
+	FD_SET(s, &writable);
+	FD_SET(s, &failed);
+	struct timeval timeout = { 2, 0 };
+	bool open = select(0, NULL, &writable, &failed, &timeout) > 0 && FD_ISSET(s, &writable);
+	closesocket(s);
+	return open;
+}
+
+// A network coming up is the best moment to try again, so don't wait for the next retry.
+static DWORD WINAPI network_watch_main(void *arg)
+{
+	(void)arg;
+	while(!g.quit && NotifyAddrChange(NULL, NULL) == NO_ERROR)
+	{
+		g.network_changed = 1;
+		SetEvent(g.wake);
+	}
+	return 0;
+}
+
 static bool stream_changed(const Settings *a, const Settings *b, bool video)
 {
 	if(a->loss_pct != b->loss_pct || a->no_controller != b->no_controller)
@@ -858,7 +900,8 @@ static DWORD WINAPI worker_main(void *arg)
 	bool running = false, run_video = false, safe = false, waiting = false, hold_status = false;
 	int fails = 0;
 	Settings run = { 0 };
-	DWORD retry_at = 0;
+	DWORD retry_at = 0, trying_since = 0;
+	CloseHandle(CreateThread(NULL, 0, network_watch_main, NULL, 0, NULL));
 	while(true)
 	{
 		DWORD timeout = INFINITE;
@@ -868,6 +911,12 @@ static DWORD WINAPI worker_main(void *arg)
 			timeout = left > 0 ? (DWORD)left : 0;
 		}
 		WaitForSingleObject(g.wake, timeout);
+		if(InterlockedExchange(&g.network_changed, 0) && waiting && !running)
+		{
+			CHIAKI_LOGI(&g.log, "Network changed, trying again soon");
+			trying_since = GetTickCount();
+			retry_at = trying_since + 1000;
+		}
 
 		bool want_video = g.want_video != 0;
 		bool want_any = !g.quit && (g.want_audio || want_video);
@@ -880,6 +929,7 @@ static DWORD WINAPI worker_main(void *arg)
 		if(live)
 		{
 			fails = 0;
+			trying_since = 0;
 			g.ps5_standby = 0;
 		}
 
@@ -915,9 +965,17 @@ static DWORD WINAPI worker_main(void *arg)
 					}
 					if(!was_connected)
 						fails++;
-					int delay = RETRY_MS + fails * 2000;
-					retry_at = GetTickCount() + (delay < RETRY_MAX_MS ? delay : RETRY_MAX_MS);
-					set_status(quit_reason_text(reason));
+					if(!trying_since)
+						trying_since = GetTickCount();
+					// Right after startup the network needs a moment, so keep trying quickly and quietly
+					bool early = GetTickCount() - trying_since < RETRY_FAST_WINDOW_MS;
+					int delay = early ? RETRY_FAST_MS : RETRY_MAX_MS;
+					retry_at = GetTickCount() + delay;
+					const wchar_t *text = quit_reason_text(reason);
+					if(wcscmp(text, L"Bağlantı yok, tekrar deneniyor...") == 0)
+						text = early ? L"PS5'e bağlanılıyor..." : L"PS5'e ulaşılamıyor. Açık mı? Denemeye devam ediyorum";
+					set_status(text);
+					CHIAKI_LOGI(&g.log, "Connection attempt failed (%s), %d in a row, next in %d ms", chiaki_quit_reason_string(reason), fails, delay);
 				}
 				else
 				{
@@ -938,6 +996,7 @@ static DWORD WINAPI worker_main(void *arg)
 			waiting = false;
 			safe = false;
 			fails = 0;
+			trying_since = 0;
 			g.ps5_standby = 0;
 			continue;
 		}
@@ -952,16 +1011,18 @@ static DWORD WINAPI worker_main(void *arg)
 				host_get(host, sizeof(host));
 				bool answered = ps5_search(host, 3, ip, sizeof(ip), &standby);
 				g.ps5_standby = answered && standby;
+				CHIAKI_LOGI(&g.log, "PS5 search before retry: %s", !answered ? "no answer" : standby ? "rest mode" : "on");
 				if(answered && strcmp(ip, host) != 0)
 				{
 					CHIAKI_LOGI(&g.log, "PS5 moved to a new address");
 					host_set(ip);
 					PostMessageW(g.hwnd, WM_APP_HOST_CHANGED, 0, 0);
 				}
-				// Discovery can be blocked while Remote Play still works, so try anyway now and then
-				if((!answered || standby) && fails % 3 != 0)
+				// No answer proves nothing, since discovery gets lost easily. Only a console that says
+				// it's resting can't take a session, and even that's worth checking now and then.
+				if(answered && standby && fails % 3 != 0)
 				{
-					set_status(standby ? L"PS5 uyku modunda. Uyandırabilir veya PS5'i açabilirsin" : L"PS5 ağda görünmüyor, açılması bekleniyor...");
+					set_status(L"PS5 uyku modunda. Uyandırabilir veya PS5'i açabilirsin");
 					fails++;
 					waiting = true;
 					retry_at = GetTickCount() + RETRY_MAX_MS;
@@ -1167,7 +1228,14 @@ static DWORD WINAPI find_ps5_thread(void *arg)
 	bool standby = false;
 	get_text(ID_HOST, typed, sizeof(typed));
 	set_status(L"PS5 aranıyor...");
-	bool found = ps5_search(typed, 12, ip, sizeof(ip), &standby);
+	bool found = false;
+	if(typed[0] && ps5_port_open(typed))
+	{
+		found = true;
+		snprintf(ip, sizeof(ip), "%s", typed);
+	}
+	else
+		found = ps5_search(typed, 30, ip, sizeof(ip), &standby);
 	if(found)
 	{
 		SetDlgItemTextA(g.hwnd, ID_HOST, ip);
