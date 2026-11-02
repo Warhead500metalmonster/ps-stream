@@ -44,7 +44,7 @@
 
 // Below this rate we are outside what chiaki-ng offers, so a console that refuses to start
 // gets a second try with it.
-#define APP_VERSION "0.1.8"
+#define APP_VERSION "0.1.9"
 #define UPDATE_DOWNLOAD_PREFIX "https://github.com/Warhead500metalmonster/ps-stream/releases/download/"
 #define RELEASES_URL L"https://github.com/Warhead500metalmonster/ps-stream/releases/latest"
 #define REPO_URL L"https://github.com/Warhead500metalmonster/ps-stream"
@@ -57,7 +57,9 @@
 #define PROBE_SLOW_DELAY_MS 5000
 #define PROBE_SLOW_AFTER_MS 300000
 #define PROBES_PER_SWEEP 15
-#define PROBES_PER_SESSION_TRY 20
+#define PROBE_TIMEOUT_MS 800
+#define PROBE_LONG_TIMEOUT_MS 3000
+#define PROBES_PER_LONG_WAIT 5
 #define WAKE_REPEAT_MS 30000
 #define WAKE_MAX_TRIES 3
 #define REGIST_TRIES 6
@@ -72,7 +74,9 @@
 #define AUDIO_TARGET_MAX_MS 100
 #define AUDIO_TARGET_STEP_MS 10
 #define AUDIO_TARGET_DECAY_MS 60000
-#define RECONNECT_MS 3000
+#define RECONNECT_MS 1500
+#define AUDIO_REOPEN_MS 2000
+#define IN_USE_QUIET_MS 15000
 
 #define PSN_CLIENT_ID "ba495a24-818c-472b-b12d-ff231c1b5745"
 #define PSN_CLIENT_ID_W L"ba495a24-818c-472b-b12d-ff231c1b5745"
@@ -177,6 +181,8 @@ static struct {
 	HANDLE wlan;
 	int16_t *volume_buf;
 	int audio_fade_pos;
+	DWORD audio_opened_at;
+	char host_id[16];
 	size_t volume_buf_size;
 
 	ChiakiFfmpegDecoder decoder;
@@ -198,9 +204,12 @@ static Settings settings_get(void)
 static void set_status(const wchar_t *text)
 {
 	EnterCriticalSection(&g.lock);
-	wcsncpy(g.status, text, 255);
+	bool same = wcscmp(g.status, text) == 0;
+	if(!same)
+		wcsncpy(g.status, text, 255);
 	LeaveCriticalSection(&g.lock);
-	PostMessageW(g.hwnd, WM_APP_STATUS, 0, 0);
+	if(!same)
+		PostMessageW(g.hwnd, WM_APP_STATUS, 0, 0);
 }
 
 static void log_cb(ChiakiLogLevel level, const char *msg, void *user)
@@ -228,6 +237,7 @@ static void audio_open(void)
 {
 	if(g.audio_dev)
 		SDL_CloseAudioDevice(g.audio_dev);
+	g.audio_opened_at = GetTickCount();
 	Settings s = settings_get();
 	SDL_AudioSpec want = { 0 };
 	want.freq = g.audio_rate;
@@ -262,8 +272,10 @@ static void audio_settings_cb(uint32_t channels, uint32_t rate, void *user)
 static void audio_frame_cb(int16_t *buf, size_t samples_count, void *user)
 {
 	(void)user;
-	// A headset that was unplugged leaves the device stopped for good
-	if((InterlockedExchange(&g.audio_reopen, 0) || (g.audio_dev && SDL_GetAudioDeviceStatus(g.audio_dev) == SDL_AUDIO_STOPPED)) && g.audio_rate)
+	// A headset that was unplugged leaves the device stopped for good, and with no device at all
+	// this runs a hundred times a second, so only try every so often
+	bool device_gone = !g.audio_dev || SDL_GetAudioDeviceStatus(g.audio_dev) == SDL_AUDIO_STOPPED;
+	if(g.audio_rate && (InterlockedExchange(&g.audio_reopen, 0) || (device_gone && GetTickCount() - g.audio_opened_at >= AUDIO_REOPEN_MS)))
 		audio_open();
 	if(!g.audio_dev)
 		return;
@@ -404,7 +416,10 @@ static DWORD WINAPI video_thread_main(void *arg)
 			SDL_WINDOW_RESIZABLE | (g.test_hidden ? SDL_WINDOW_HIDDEN : 0));
 	SDL_Renderer *renderer = window ? SDL_CreateRenderer(window, -1, 0) : NULL;
 	if(!renderer)
+	{
 		CHIAKI_LOGE(&g.log, "SDL window failed: %s", SDL_GetError());
+		set_status(L"Görüntü penceresi açılamadı, ses çalışmaya devam eder");
+	}
 	SetEvent(g.video_ready);
 
 	SDL_Texture *texture = NULL;
@@ -789,13 +804,26 @@ static void wifi_tune(bool on)
 		if(active)
 			WlanFreeMemory(active);
 		CHIAKI_LOGI(&g.log, "Wi-Fi low latency on: scan result %lu, streaming result %lu, streaming active %d", scan, stream, confirmed);
+		// Connection problems usually come down to these, so the log should say them
+		WLAN_CONNECTION_ATTRIBUTES *link = NULL;
+		ULONG *channel = NULL;
+		bool have_link = WlanQueryInterface(g.wlan, id, wlan_intf_opcode_current_connection, NULL, &size, (void **)&link, NULL) == ERROR_SUCCESS && link;
+		bool have_channel = WlanQueryInterface(g.wlan, id, wlan_intf_opcode_channel_number, NULL, &size, (void **)&channel, NULL) == ERROR_SUCCESS && channel;
+		if(have_link)
+			CHIAKI_LOGI(&g.log, "Wi-Fi link: signal %lu%%, receive %lu Mbps, send %lu Mbps, channel %lu",
+					link->wlanAssociationAttributes.wlanSignalQuality, link->wlanAssociationAttributes.ulRxRate / 1000,
+					link->wlanAssociationAttributes.ulTxRate / 1000, have_channel ? *channel : 0);
+		if(link)
+			WlanFreeMemory(link);
+		if(channel)
+			WlanFreeMemory(channel);
 	}
 	WlanFreeMemory(list);
 }
 
 // Asks for the console on the known address first, then on the whole network, so a PS5 that got a
 // new address from the router is found again. Returns false if no PS5 answered.
-static bool ps5_search(const char *prefer, int rounds, bool sweep, char *ip, size_t ip_size, bool *standby)
+static bool ps5_search(const char *prefer, int rounds, bool sweep, char *ip, size_t ip_size, bool *standby, char *host_id, size_t host_id_size)
 {
 	SOCKET s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
 	if(s == INVALID_SOCKET)
@@ -866,6 +894,12 @@ static bool ps5_search(const char *prefer, int rounds, bool sweep, char *ip, siz
 			{
 				snprintf(ip, ip_size, "%s", inet_ntoa(from.sin_addr));
 				*standby = strstr(buf, "HTTP/1.1 620") != NULL;
+				const char *id = strstr(buf, "host-id:");
+				if(host_id && id)
+				{
+					id += 8;
+					snprintf(host_id, host_id_size, "%.*s", (int)strcspn(id, "\r\n"), id);
+				}
 			}
 			found = true;
 			if(preferred)
@@ -918,6 +952,7 @@ static DWORD WINAPI network_watch_main(void *arg)
 }
 
 static bool ps5_wake_send(void);
+static void config_set(const char *key, const char *value);
 
 static bool stream_changed(const Settings *a, const Settings *b, bool video)
 {
@@ -937,6 +972,7 @@ static DWORD WINAPI worker_main(void *arg)
 	Settings run = { 0 };
 	DWORD retry_at = 0, trying_since = 0, wake_at = 0;
 	int probes = 0, wake_tries = 0;
+	bool may_wake = true, id_checked = false;
 	CloseHandle(CreateThread(NULL, 0, network_watch_main, NULL, 0, NULL));
 	while(true)
 	{
@@ -947,11 +983,16 @@ static DWORD WINAPI worker_main(void *arg)
 			timeout = left > 0 ? (DWORD)left : 0;
 		}
 		WaitForSingleObject(g.wake, timeout);
-		if(InterlockedExchange(&g.network_changed, 0) && waiting && !running)
+		if(InterlockedExchange(&g.network_changed, 0))
 		{
-			CHIAKI_LOGI(&g.log, "Network changed, trying again soon");
-			trying_since = GetTickCount();
-			retry_at = trying_since + 1000;
+			// Reconnecting Wi-Fi forgets the low latency settings, so they're applied again below
+			wifi_tune(false);
+			if(waiting && !running)
+			{
+				CHIAKI_LOGI(&g.log, "Network changed, trying again soon");
+				trying_since = GetTickCount();
+				retry_at = trying_since + 1000;
+			}
 		}
 
 		bool want_video = g.want_video != 0;
@@ -959,7 +1000,8 @@ static DWORD WINAPI worker_main(void *arg)
 		Settings s = settings_get();
 		// Only while connected, so a PS5 that's off doesn't keep the PC awake or its Wi-Fi tuned
 		bool live = want_any && g.connected;
-		wifi_tune(live && s.wifi_opt);
+		// Connecting has to survive the same Wi-Fi stalls as playing
+		wifi_tune((live || (running && want_any)) && s.wifi_opt);
 		// The PC often sits untouched while the game plays on the TV
 		SetThreadExecutionState(ES_CONTINUOUS | (live ? ES_SYSTEM_REQUIRED : 0) | (live && want_video ? ES_DISPLAY_REQUIRED : 0));
 		if(live)
@@ -969,6 +1011,22 @@ static DWORD WINAPI worker_main(void *arg)
 			probes = 0;
 			wake_tries = 0;
 			g.ps5_standby = 0;
+			// A connected PS5 was on purpose or was already on. If it goes away from here, someone
+			// probably turned it off, and it must not come back by itself.
+			may_wake = false;
+			if(!id_checked && !g.host_id[0])
+			{
+				// Remembers which console this is, so a second one at home can't take its place
+				char host[256], ip[64] = "", id[16] = "";
+				bool standby = false;
+				host_get(host, sizeof(host));
+				if(ps5_search(host, 2, false, ip, sizeof(ip), &standby, id, sizeof(id)) && strcmp(ip, host) == 0 && id[0])
+				{
+					snprintf(g.host_id, sizeof(g.host_id), "%s", id);
+					config_set("host_id", id);
+				}
+			}
+			id_checked = true;
 		}
 
 		if(running)
@@ -1012,6 +1070,9 @@ static DWORD WINAPI worker_main(void *arg)
 					const wchar_t *text = quit_reason_text(reason);
 					if(wcscmp(text, L"Bağlantı yok, tekrar deneniyor...") == 0)
 						text = early ? L"PS5'e bağlanılıyor..." : L"PS5'e ulaşılamıyor. Açık mı? Denemeye devam ediyorum";
+					// The PS5 stays "in use" for seconds after our own previous connection
+					if(reason == CHIAKI_QUIT_REASON_SESSION_REQUEST_RP_IN_USE && GetTickCount() - trying_since < IN_USE_QUIET_MS)
+						text = L"PS5'e bağlanılıyor...";
 					set_status(text);
 					CHIAKI_LOGI(&g.log, "Connection attempt failed (%s), %d in a row, next in %d ms", chiaki_quit_reason_string(reason), fails, delay);
 				}
@@ -1037,6 +1098,8 @@ static DWORD WINAPI worker_main(void *arg)
 			trying_since = 0;
 			probes = 0;
 			wake_tries = 0;
+			may_wake = true;
+			id_checked = false;
 			g.ps5_standby = 0;
 			continue;
 		}
@@ -1053,20 +1116,34 @@ static DWORD WINAPI worker_main(void *arg)
 				// A full attempt takes 5 s to give up on a PS5 that's away. This takes a moment, so
 				// connecting can begin the moment the console is back.
 				probes++;
-				bool open = ps5_port_open(host, 800);
+				// A name instead of an address can't be checked this way, so it goes straight to connecting.
+				// The longer wait now and then covers a link too slow to answer in the usual time.
+				bool open = inet_addr(host) == INADDR_NONE
+					|| ps5_port_open(host, probes % PROBES_PER_LONG_WAIT == 0 ? PROBE_LONG_TIMEOUT_MS : PROBE_TIMEOUT_MS);
 				if(!open)
 				{
-					bool answered = ps5_search(host, 1, probes % PROBES_PER_SWEEP == 1, ip, sizeof(ip), &standby);
-					g.ps5_standby = answered && standby;
+					char id[16] = "";
+					bool answered = ps5_search(host, 1, probes % PROBES_PER_SWEEP == 1, ip, sizeof(ip), &standby, id, sizeof(id));
 					if(answered && strcmp(ip, host) != 0)
 					{
-						CHIAKI_LOGI(&g.log, "PS5 moved to a new address");
-						host_set(ip);
-						PostMessageW(g.hwnd, WM_APP_HOST_CHANGED, 0, 0);
-						open = !standby;
+						if(g.host_id[0] && id[0] && _stricmp(g.host_id, id) != 0)
+						{
+							if(probes % 30 == 1)
+								CHIAKI_LOGI(&g.log, "A different PS5 answered, ignoring it");
+							answered = false;
+							standby = false;
+						}
+						else
+						{
+							CHIAKI_LOGI(&g.log, "PS5 moved to a new address");
+							host_set(ip);
+							PostMessageW(g.hwnd, WM_APP_HOST_CHANGED, 0, 0);
+							open = !standby;
+						}
 					}
+					g.ps5_standby = answered && standby;
 					// A resting PS5 may not answer the search at all, so try waking it either way
-					if(s.auto_wake && g.paired && wake_tries < WAKE_MAX_TRIES && (LONG)(GetTickCount() - wake_at) >= 0)
+					if(s.auto_wake && may_wake && g.paired && wake_tries < WAKE_MAX_TRIES && (LONG)(GetTickCount() - wake_at) >= 0)
 					{
 						wake_tries++;
 						wake_at = GetTickCount() + WAKE_REPEAT_MS;
@@ -1075,12 +1152,12 @@ static DWORD WINAPI worker_main(void *arg)
 					if(probes % 30 == 1)
 						CHIAKI_LOGI(&g.log, "PS5 check %d: port closed, search %s", probes, !answered ? "no answer" : standby ? "rest mode" : "on");
 				}
-				// In case the check itself is what's being blocked, a real attempt now and then
-				if(!open && probes % PROBES_PER_SESSION_TRY != 0)
+				// Starting a session connects to this same port, so with it closed there's no point
+				if(!open)
 				{
 					DWORD waited = GetTickCount() - trying_since;
 					if(g.ps5_standby)
-						set_status(s.auto_wake ? L"PS5 uyanıyor..." : L"PS5 uyku modunda. Uyandırabilir veya PS5'i açabilirsin");
+						set_status(s.auto_wake && may_wake ? L"PS5 uyanıyor..." : L"PS5 uyku modunda. Uyandırabilir veya PS5'i açabilirsin");
 					else
 						set_status(waited < RETRY_FAST_WINDOW_MS ? L"PS5'e bağlanılıyor..." : L"PS5'e ulaşılamıyor. Açık mı? Denemeye devam ediyorum");
 					waiting = true;
@@ -1100,7 +1177,7 @@ static DWORD WINAPI worker_main(void *arg)
 			}
 			else
 			{
-				set_status(L"Bağlanılamadı, PS5 IP adresini kontrol et. Tekrar deneniyor...");
+				set_status(L"Bağlantı başlatılamadı, tekrar deneniyor...");
 				fails++;
 				waiting = true;
 				retry_at = GetTickCount() + RETRY_MS;
@@ -1209,6 +1286,7 @@ static void config_load(void)
 {
 	char regist[64], morning[64];
 	config_get("host", g.host, sizeof(g.host));
+	config_get("host_id", g.host_id, sizeof(g.host_id));
 	config_get("regist_key", regist, sizeof(regist));
 	config_get("morning", morning, sizeof(morning));
 	g.paired = hex_decode(regist, (uint8_t *)g.regist_key, sizeof(g.regist_key))
@@ -1299,7 +1377,7 @@ static DWORD WINAPI find_ps5_thread(void *arg)
 		snprintf(ip, sizeof(ip), "%s", typed);
 	}
 	else
-		found = ps5_search(typed, 50, true, ip, sizeof(ip), &standby);
+		found = ps5_search(typed, 50, true, ip, sizeof(ip), &standby, NULL, 0);
 	if(found)
 	{
 		SetDlgItemTextA(g.hwnd, ID_HOST, ip);
@@ -2159,6 +2237,9 @@ static void pair_finished(void)
 	g.paired = true;
 	char hex[64];
 	config_set("host", g.host);
+	const uint8_t *mac = g.registered.server_mac;
+	snprintf(g.host_id, sizeof(g.host_id), "%02X%02X%02X%02X%02X%02X", mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+	config_set("host_id", g.host_id);
 	hex_encode((const uint8_t *)g.regist_key, sizeof(g.regist_key), hex);
 	config_set("regist_key", hex);
 	hex_encode(g.morning, sizeof(g.morning), hex);

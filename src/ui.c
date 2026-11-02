@@ -1295,6 +1295,14 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 		tray_icon(NIM_ADD); // Explorer restarted and forgot the icon
 	switch(msg)
 	{
+		case WM_POWERBROADCAST:
+			// Back from sleep: whatever was being waited for may be there now
+			if(wp == PBT_APMRESUMEAUTOMATIC)
+			{
+				g.network_changed = 1;
+				SetEvent(g.wake);
+			}
+			return TRUE;
 		case WM_SIZE:
 			if(wp == SIZE_MINIMIZED && settings_get().tray && !ui.in_tray)
 				tray_enter();
