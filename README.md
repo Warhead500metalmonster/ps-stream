@@ -64,9 +64,11 @@ The PS5 address and account ID stay saved until you delete them. To use another 
 
 For the best results on Wi-Fi, connect the PS5 to your router with a cable, or use 5 GHz. If the picture breaks up, lower the quality to **Medium** or **Low**.
 
-## Update check
+## Updates
 
-At startup, the app asks GitHub for the latest release number, and shows a button if there is a newer one. It only reads the public release page: it sends no account or console data and downloads nothing by itself. Turn off **Check for updates** in Settings to stop it.
+At startup, the app asks GitHub for the latest release number, and shows an **Update** button if there is a newer one. That check sends no account or console data. Nothing is downloaded until you press the button.
+
+When you press it, the app downloads the release from GitHub, checks it against the checksum GitHub lists for that file, replaces its files and restarts. Your pairing and settings stay as they are. If the new version doesn't start, the old files go back. Turn off **Check for updates** in Settings to stop the check.
 
 ## Known limitations
 

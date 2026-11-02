@@ -20,7 +20,7 @@ pkg_check_modules(SDL2 REQUIRED IMPORTED_TARGET sdl2)
 pkg_check_modules(JSONC REQUIRED IMPORTED_TARGET json-c)
 
 add_executable(ps-stream WIN32 src/main.c src/app.rc)
-target_link_libraries(ps-stream chiaki-lib PkgConfig::SDL2 PkgConfig::JSONC comctl32 shell32 ws2_32 iphlpapi wlanapi gdiplus ole32 oleaut32 gdi32 dwmapi advapi32)
+target_link_libraries(ps-stream chiaki-lib PkgConfig::SDL2 PkgConfig::JSONC comctl32 shell32 ws2_32 iphlpapi wlanapi gdiplus ole32 oleaut32 gdi32 dwmapi advapi32 bcrypt)
 target_link_options(ps-stream PRIVATE -municode)
 if(PSSTREAM_TEST)
 	target_compile_definitions(ps-stream PRIVATE PSSTREAM_TEST)

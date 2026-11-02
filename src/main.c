@@ -28,6 +28,7 @@
 #include <libavutil/hwcontext.h>
 
 #include <windows.h>
+#include <bcrypt.h>
 #include <commctrl.h>
 #include <shellapi.h>
 #include <shlobj.h>
@@ -43,7 +44,8 @@
 
 // Below this rate we are outside what chiaki-ng offers, so a console that refuses to start
 // gets a second try with it.
-#define APP_VERSION "0.1.4"
+#define APP_VERSION "0.1.5"
+#define UPDATE_DOWNLOAD_PREFIX "https://github.com/Warhead500metalmonster/ps-stream/releases/download/"
 #define RELEASES_URL L"https://github.com/Warhead500metalmonster/ps-stream/releases/latest"
 #define REPO_URL L"https://github.com/Warhead500metalmonster/ps-stream"
 #define UPDATE_API_URL "https://api.github.com/repos/Warhead500metalmonster/ps-stream/releases/latest"
@@ -152,7 +154,12 @@ static struct {
 	DWORD audio_last_dropout, connected_at;
 	volatile LONG audio_dropouts, video_fps10, video_lost_total, ps5_standby;
 	char update_tag[32];
-	volatile LONG update_ready;
+	volatile LONG update_ready, update_busy, update_failed, update_restart;
+	char update_url[512], update_digest[72];
+	bool relaunched;
+	HANDLE single_instance;
+	const wchar_t *update_note;
+	DWORD update_note_at;
 	HANDLE wlan;
 	int16_t *volume_buf;
 	int audio_fade_pos;
@@ -1281,6 +1288,410 @@ static int version_number(const char *v)
 	return a * 1000000 + b * 1000 + c;
 }
 
+// ---------- update ----------
+
+// The file list of a release, and which of its files the update takes.
+static void update_asset_find(const char *json, const char *tag)
+{
+	const char *prefix = UPDATE_DOWNLOAD_PREFIX;
+#ifdef PSSTREAM_TEST
+	static char test_prefix[256];
+	if(GetEnvironmentVariableA("PSSTREAM_TEST_UPDATE_PREFIX", test_prefix, sizeof(test_prefix)))
+		prefix = test_prefix;
+#endif
+	char wanted[96];
+	snprintf(wanted, sizeof(wanted), "PS-Stream-%s-windows-x64.zip", tag);
+	struct json_object *root = json_tokener_parse(json), *assets;
+	if(root && json_object_object_get_ex(root, "assets", &assets) && json_object_is_type(assets, json_type_array))
+	{
+		for(size_t i = 0; i < json_object_array_length(assets); i++)
+		{
+			struct json_object *asset = json_object_array_get_idx(assets, i), *name, *url, *digest;
+			if(!json_object_object_get_ex(asset, "name", &name) || !json_object_object_get_ex(asset, "browser_download_url", &url)
+				|| !json_object_object_get_ex(asset, "digest", &digest) || strcmp(json_object_get_string(name), wanted) != 0)
+				continue;
+			const char *url_text = json_object_get_string(url), *digest_text = json_object_get_string(digest);
+			if(digest_text && strncmp(url_text, prefix, strlen(prefix)) == 0 && strncmp(digest_text, "sha256:", 7) == 0 && strlen(digest_text) == 71)
+			{
+				snprintf(g.update_url, sizeof(g.update_url), "%s", url_text);
+				snprintf(g.update_digest, sizeof(g.update_digest), "%s", digest_text + 7);
+			}
+		}
+	}
+	json_object_put(root);
+}
+
+// The folder holding the launcher and dist, or false when the app wasn't installed from the zip.
+static bool update_install_root(wchar_t *root)
+{
+	GetModuleFileNameW(NULL, root, MAX_PATH);
+	wchar_t *slash = wcsrchr(root, L'\\');
+	if(!slash)
+		return false;
+	*slash = 0;
+	slash = wcsrchr(root, L'\\');
+	if(!slash || _wcsicmp(slash + 1, L"dist") != 0)
+		return false;
+	*slash = 0;
+	wchar_t launcher[MAX_PATH + 32];
+	swprintf(launcher, MAX_PATH + 32, L"%ls\\PS Stream.exe", root);
+	return GetFileAttributesW(launcher) != INVALID_FILE_ATTRIBUTES;
+}
+
+static bool update_available_here(void)
+{
+	wchar_t root[MAX_PATH];
+	return g.update_url[0] && !g.update_failed && update_install_root(root);
+}
+
+static void update_temp_dir(wchar_t *dir)
+{
+	wchar_t temp[MAX_PATH];
+	GetTempPathW(MAX_PATH, temp);
+	swprintf(dir, MAX_PATH, L"%lsPSStreamUpdate", temp);
+}
+
+static void dir_delete(const wchar_t *dir)
+{
+	wchar_t pattern[MAX_PATH + 8], path[MAX_PATH + 300];
+	swprintf(pattern, MAX_PATH + 8, L"%ls\\*", dir);
+	WIN32_FIND_DATAW found;
+	HANDLE find = FindFirstFileW(pattern, &found);
+	if(find == INVALID_HANDLE_VALUE)
+		return;
+	do
+	{
+		if(wcscmp(found.cFileName, L".") == 0 || wcscmp(found.cFileName, L"..") == 0)
+			continue;
+		swprintf(path, MAX_PATH + 300, L"%ls\\%ls", dir, found.cFileName);
+		if((found.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) && !(found.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT))
+			dir_delete(path);
+		else
+			DeleteFileW(path);
+	} while(FindNextFileW(find, &found));
+	FindClose(find);
+	RemoveDirectoryW(dir);
+}
+
+static bool file_sha256(const wchar_t *path, char *hex)
+{
+	FILE *f = _wfopen(path, L"rb");
+	if(!f)
+		return false;
+	BCRYPT_ALG_HANDLE alg = NULL;
+	BCRYPT_HASH_HANDLE hash = NULL;
+	uint8_t digest[32];
+	bool ok = BCRYPT_SUCCESS(BCryptOpenAlgorithmProvider(&alg, BCRYPT_SHA256_ALGORITHM, NULL, 0))
+		&& BCRYPT_SUCCESS(BCryptCreateHash(alg, &hash, NULL, 0, NULL, 0, 0));
+	static uint8_t chunk[65536];
+	size_t n;
+	while(ok && (n = fread(chunk, 1, sizeof(chunk), f)) > 0)
+		ok = BCRYPT_SUCCESS(BCryptHashData(hash, chunk, (ULONG)n, 0));
+	ok = ok && BCRYPT_SUCCESS(BCryptFinishHash(hash, digest, sizeof(digest), 0));
+	if(hash)
+		BCryptDestroyHash(hash);
+	if(alg)
+		BCryptCloseAlgorithmProvider(alg, 0);
+	fclose(f);
+	if(ok)
+	{
+		hex_encode(digest, sizeof(digest), hex);
+		hex[64] = 0;
+	}
+	return ok;
+}
+
+static int update_progress_cb(void *user, curl_off_t total, curl_off_t now, curl_off_t ul_total, curl_off_t ul_now)
+{
+	(void)ul_total;
+	(void)ul_now;
+	int *last = user;
+	int percent = total > 0 ? (int)(now * 100 / total) : 0;
+	if(percent != *last)
+	{
+		*last = percent;
+		wchar_t text[128];
+		swprintf(text, 128, tr(L"Güncelleme indiriliyor... %%%d"), percent);
+		set_status(text);
+	}
+	return g.quit != 0;
+}
+
+static void update_fail(const wchar_t *text, const char *why)
+{
+	CHIAKI_LOGE(&g.log, "Update failed: %s", why);
+	wchar_t dir[MAX_PATH];
+	update_temp_dir(dir);
+	dir_delete(dir);
+	g.update_failed = 1;
+	g.update_busy = 0;
+	set_status(text);
+}
+
+static DWORD WINAPI update_download_main(void *arg)
+{
+	(void)arg;
+	wchar_t dir[MAX_PATH], zip[MAX_PATH + 16], command[MAX_PATH * 3], tar[MAX_PATH], staged[MAX_PATH + 48];
+	update_temp_dir(dir);
+	dir_delete(dir);
+	CreateDirectoryW(dir, NULL);
+	swprintf(zip, MAX_PATH + 16, L"%ls\\update.zip", dir);
+	FILE *f = _wfopen(zip, L"wb");
+	CURL *curl = f ? curl_easy_init() : NULL;
+	if(!curl)
+	{
+		if(f)
+			fclose(f);
+		update_fail(L"Güncelleme indirilemedi. Yeni sürümü sayfasından indirebilirsin", "couldn't create the temp file");
+		return 0;
+	}
+	int last_percent = -1;
+	curl_easy_setopt(curl, CURLOPT_URL, g.update_url);
+	curl_easy_setopt(curl, CURLOPT_USERAGENT, "PS-Stream/" APP_VERSION);
+	curl_easy_setopt(curl, CURLOPT_SSL_OPTIONS, (long)CURLSSLOPT_NATIVE_CA);
+	curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+	curl_easy_setopt(curl, CURLOPT_FAILONERROR, 1L);
+	curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 20L);
+	curl_easy_setopt(curl, CURLOPT_LOW_SPEED_LIMIT, 1024L);
+	curl_easy_setopt(curl, CURLOPT_LOW_SPEED_TIME, 60L);
+	curl_easy_setopt(curl, CURLOPT_WRITEDATA, f);
+	curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
+	curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, update_progress_cb);
+	curl_easy_setopt(curl, CURLOPT_XFERINFODATA, &last_percent);
+#ifndef PSSTREAM_TEST
+	curl_easy_setopt(curl, CURLOPT_PROTOCOLS_STR, "https");
+	curl_easy_setopt(curl, CURLOPT_REDIR_PROTOCOLS_STR, "https");
+#endif
+	CURLcode res = curl_easy_perform(curl);
+	curl_easy_cleanup(curl);
+	bool written = fclose(f) == 0;
+	if(res != CURLE_OK || !written)
+	{
+		CHIAKI_LOGE(&g.log, "Update download: %s", curl_easy_strerror(res));
+		update_fail(L"Güncelleme indirilemedi. Yeni sürümü sayfasından indirebilirsin", "download");
+		return 0;
+	}
+
+	set_status(L"Güncelleme hazırlanıyor...");
+	char hex[65];
+	if(!file_sha256(zip, hex) || _stricmp(hex, g.update_digest) != 0)
+	{
+		update_fail(L"Güncelleme dosyası doğrulanamadı. Yeni sürümü sayfasından indirebilirsin", "checksum mismatch");
+		return 0;
+	}
+
+	GetSystemDirectoryW(tar, MAX_PATH);
+	wcsncat(tar, L"\\tar.exe", MAX_PATH - wcslen(tar) - 1);
+	swprintf(command, MAX_PATH * 3, L"\"%ls\" -xf \"%ls\" -C \"%ls\"", tar, zip, dir);
+	STARTUPINFOW si = { 0 };
+	si.cb = sizeof(si);
+	PROCESS_INFORMATION pi;
+	DWORD code = 1;
+	if(CreateProcessW(tar, command, NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi))
+	{
+		WaitForSingleObject(pi.hProcess, 120000);
+		GetExitCodeProcess(pi.hProcess, &code);
+		CloseHandle(pi.hProcess);
+		CloseHandle(pi.hThread);
+	}
+	swprintf(staged, MAX_PATH + 48, L"%ls\\PS Stream\\dist\\PS Stream.exe", dir);
+	if(code != 0 || GetFileAttributesW(staged) == INVALID_FILE_ATTRIBUTES)
+	{
+		update_fail(L"Güncelleme dosyası doğrulanamadı. Yeni sürümü sayfasından indirebilirsin", "unpacking");
+		return 0;
+	}
+	CHIAKI_LOGI(&g.log, "Update %s ready, restarting", g.update_tag);
+	// The rest happens after a normal exit, so the PS5 is told we left and settings are saved
+	g.update_restart = 1;
+	PostMessageW(g.hwnd, WM_CLOSE, 0, 0);
+	return 0;
+}
+
+static void update_begin(void)
+{
+	if(InterlockedExchange(&g.update_busy, 1))
+		return;
+	set_status(L"Güncelleme indiriliyor...");
+	CloseHandle(CreateThread(NULL, 0, update_download_main, NULL, 0, NULL));
+}
+
+#define UPDATE_MAX_FILES 512
+#define UPDATE_OLD_SUFFIX L".ps-old"
+
+typedef struct { wchar_t target[MAX_PATH]; bool had_old, placed; } UpdateMove;
+static UpdateMove update_moves[UPDATE_MAX_FILES];
+static int update_move_count;
+
+// OneDrive and antivirus programs hold new files open for a moment
+static bool move_retry(const wchar_t *from, const wchar_t *to, DWORD flags)
+{
+	for(int i = 0; i < 20; i++)
+	{
+		if(MoveFileExW(from, to, flags))
+			return true;
+		Sleep(250);
+	}
+	return false;
+}
+
+static bool update_swap_folder(const wchar_t *from, const wchar_t *to)
+{
+	wchar_t pattern[MAX_PATH + 8], src[MAX_PATH + 300], old[MAX_PATH + 16];
+	swprintf(pattern, MAX_PATH + 8, L"%ls\\*", from);
+	WIN32_FIND_DATAW found;
+	HANDLE find = FindFirstFileW(pattern, &found);
+	if(find == INVALID_HANDLE_VALUE)
+		return false;
+	bool ok = true;
+	do
+	{
+		if(found.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
+			continue;
+		if(update_move_count >= UPDATE_MAX_FILES)
+		{
+			ok = false;
+			break;
+		}
+		UpdateMove *m = &update_moves[update_move_count];
+		swprintf(src, MAX_PATH + 300, L"%ls\\%ls", from, found.cFileName);
+		if(swprintf(m->target, MAX_PATH, L"%ls\\%ls", to, found.cFileName) < 0)
+		{
+			ok = false;
+			break;
+		}
+		swprintf(old, MAX_PATH + 16, L"%ls" UPDATE_OLD_SUFFIX, m->target);
+		m->had_old = false;
+		m->placed = false;
+		update_move_count++;
+		if(GetFileAttributesW(m->target) != INVALID_FILE_ATTRIBUTES)
+		{
+			// A running program's files can't be overwritten, but they can be renamed
+			if(!move_retry(m->target, old, MOVEFILE_REPLACE_EXISTING))
+			{
+				ok = false;
+				break;
+			}
+			m->had_old = true;
+		}
+		if(!move_retry(src, m->target, MOVEFILE_REPLACE_EXISTING | MOVEFILE_COPY_ALLOWED))
+		{
+			ok = false;
+			break;
+		}
+		m->placed = true;
+	} while(FindNextFileW(find, &found));
+	FindClose(find);
+	return ok;
+}
+
+static void update_roll_back(void)
+{
+	wchar_t old[MAX_PATH + 16];
+	for(int i = update_move_count - 1; i >= 0; i--)
+	{
+		UpdateMove *m = &update_moves[i];
+		swprintf(old, MAX_PATH + 16, L"%ls" UPDATE_OLD_SUFFIX, m->target);
+		if(m->placed)
+			DeleteFileW(m->target);
+		if(m->had_old)
+			move_retry(old, m->target, MOVEFILE_REPLACE_EXISTING);
+	}
+}
+
+static bool update_launch(const wchar_t *exe, const wchar_t *arg, PROCESS_INFORMATION *pi)
+{
+	wchar_t command[MAX_PATH + 64];
+	swprintf(command, MAX_PATH + 64, L"\"%ls\" %ls", exe, arg);
+	STARTUPINFOW si = { 0 };
+	si.cb = sizeof(si);
+	return CreateProcessW(exe, command, NULL, NULL, FALSE, 0, NULL, NULL, &si, pi);
+}
+
+// Last thing the old version does. The new one has to reach its window, or the old files go back.
+static void update_finish(void)
+{
+	wchar_t root[MAX_PATH], exe[MAX_PATH + 48], dir[MAX_PATH], staged[MAX_PATH + 32], staged_dist[MAX_PATH + 32], dist[MAX_PATH + 16];
+	if(!update_install_root(root))
+		return;
+	swprintf(exe, MAX_PATH + 48, L"%ls\\dist\\PS Stream.exe", root);
+	swprintf(dist, MAX_PATH + 16, L"%ls\\dist", root);
+	update_temp_dir(dir);
+	swprintf(staged, MAX_PATH + 32, L"%ls\\PS Stream", dir);
+	swprintf(staged_dist, MAX_PATH + 32, L"%ls\\PS Stream\\dist", dir);
+
+	if(g.single_instance)
+		CloseHandle(g.single_instance);
+	HANDLE ready = CreateEventW(NULL, TRUE, FALSE, L"PSStreamUpdated");
+	// The new version takes over the log file
+	if(g.log_file)
+		fclose(g.log_file);
+	g.log_file = NULL;
+
+	PROCESS_INFORMATION pi;
+	bool ok = update_swap_folder(staged, root) && update_swap_folder(staged_dist, dist) && update_launch(exe, L"--updated", &pi);
+	if(ok)
+	{
+		HANDLE waits[2] = { ready, pi.hProcess };
+		ok = WaitForMultipleObjects(2, waits, FALSE, 60000) == WAIT_OBJECT_0;
+		if(!ok)
+		{
+			TerminateProcess(pi.hProcess, 1);
+			WaitForSingleObject(pi.hProcess, 5000);
+		}
+		CloseHandle(pi.hProcess);
+		CloseHandle(pi.hThread);
+	}
+	if(!ok)
+	{
+		update_roll_back();
+		if(update_launch(exe, L"--update-failed", &pi))
+		{
+			CloseHandle(pi.hProcess);
+			CloseHandle(pi.hThread);
+		}
+	}
+}
+
+// Clears what the previous version left behind. It may still be closing, so this tries for a while.
+static DWORD WINAPI update_cleanup_main(void *arg)
+{
+	(void)arg;
+	wchar_t root[MAX_PATH], dir[MAX_PATH];
+	bool installed = update_install_root(root);
+	for(int attempt = 0; attempt < 6 && !g.quit; attempt++)
+	{
+		if(attempt)
+			Sleep(2000);
+		bool left = false;
+		for(int folder = 0; folder < 2 && installed; folder++)
+		{
+			wchar_t base[MAX_PATH + 16], pattern[MAX_PATH + 32], path[MAX_PATH + 300];
+			swprintf(base, MAX_PATH + 16, folder ? L"%ls\\dist" : L"%ls", root);
+			swprintf(pattern, MAX_PATH + 32, L"%ls\\*" UPDATE_OLD_SUFFIX, base);
+			WIN32_FIND_DATAW found;
+			HANDLE find = FindFirstFileW(pattern, &found);
+			if(find == INVALID_HANDLE_VALUE)
+				continue;
+			do
+			{
+				swprintf(path, MAX_PATH + 300, L"%ls\\%ls", base, found.cFileName);
+				if(!DeleteFileW(path))
+					left = true;
+			} while(FindNextFileW(find, &found));
+			FindClose(find);
+		}
+		if(!left)
+			break;
+	}
+	// An update in progress uses this folder, but one can't have started this early
+	if(!g.update_busy)
+	{
+		update_temp_dir(dir);
+		dir_delete(dir);
+	}
+	return 0;
+}
+
 // Only asks GitHub for the latest version number. Nothing about the user is sent, nothing is downloaded.
 static DWORD WINAPI update_check_main(void *arg)
 {
@@ -1297,7 +1708,13 @@ static DWORD WINAPI update_check_main(void *arg)
 	CURL *curl = curl_easy_init();
 	if(!curl)
 		return 0;
-	curl_easy_setopt(curl, CURLOPT_URL, UPDATE_API_URL);
+	const char *api_url = UPDATE_API_URL;
+#ifdef PSSTREAM_TEST
+	static char test_api[256];
+	if(GetEnvironmentVariableA("PSSTREAM_TEST_UPDATE_API", test_api, sizeof(test_api)))
+		api_url = test_api;
+#endif
+	curl_easy_setopt(curl, CURLOPT_URL, api_url);
 	curl_easy_setopt(curl, CURLOPT_USERAGENT, "PS-Stream/" APP_VERSION);
 	curl_easy_setopt(curl, CURLOPT_SSL_OPTIONS, (long)CURLSSLOPT_NATIVE_CA);
 	curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, http_write);
@@ -1308,11 +1725,16 @@ static DWORD WINAPI update_check_main(void *arg)
 	char tag[32] = "";
 	if(res == CURLE_OK && json_get(body.data, "tag_name", tag, sizeof(tag)) && version_number(tag) > version_number(current))
 	{
+		update_asset_find(body.data, tag);
 		snprintf(g.update_tag, sizeof(g.update_tag), "%s", tag);
 		g.update_ready = 1;
+#ifdef PSSTREAM_TEST
+		if(!g.relaunched && !g.update_failed && GetEnvironmentVariableA("PSSTREAM_TEST_AUTOUPDATE", NULL, 0))
+			update_begin();
+#endif
 		PostMessageW(g.hwnd, WM_APP_STATUS, 0, 0);
 	}
-	CHIAKI_LOGI(&g.log, "Update check: current %s, latest %s", current, tag[0] ? tag : "unknown");
+	CHIAKI_LOGI(&g.log, "Update check: current %s, latest %s (%s)", current, tag[0] ? tag : "unknown", curl_easy_strerror(res));
 	return 0;
 }
 

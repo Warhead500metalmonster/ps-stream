@@ -285,6 +285,64 @@ static bool slider(int id, float x, float y, float w, int *value, int min, int m
 	return *value != old;
 }
 
+// Large soft shapes are the slowest thing to paint and hardly ever change, so each is kept as a
+// finished picture. Only something of the same size and kind can reuse one.
+#define LAYER_COUNT 16
+#define LAYER_MARGIN 14
+typedef struct { GpBitmap *image; float x, y, w, h; int kind, left, top, width, height; } Layer;
+static Layer layers[LAYER_COUNT];
+static int layer_next;
+static Layer *layer_current;
+static GpGraphics *layer_saved_gx;
+
+static bool layer_begin(float x, float y, float w, float h, int kind)
+{
+	for(int i = 0; i < LAYER_COUNT; i++)
+	{
+		Layer *l = &layers[i];
+		if(l->image && l->x == x && l->y == y && l->w == w && l->h == h && l->kind == kind)
+		{
+			layer_current = l;
+			return false;
+		}
+	}
+	Layer *l = &layers[layer_next];
+	layer_next = (layer_next + 1) % LAYER_COUNT;
+	if(l->image)
+		GdipDisposeImage((GpImage *)l->image);
+	l->x = x;
+	l->y = y;
+	l->w = w;
+	l->h = h;
+	l->kind = kind;
+	l->left = (int)F(x - LAYER_MARGIN);
+	l->top = (int)F(y - LAYER_MARGIN);
+	l->width = (int)F(w + LAYER_MARGIN * 2) + 2;
+	l->height = (int)F(h + LAYER_MARGIN * 2) + 2;
+	GdipCreateBitmapFromScan0(l->width, l->height, 0, PixelFormat32bppPARGB, NULL, &l->image);
+	layer_saved_gx = ui.gx;
+	GdipGetImageGraphicsContext((GpImage *)l->image, &ui.gx);
+	GdipSetSmoothingMode(ui.gx, SmoothingModeAntiAlias);
+	GdipTranslateWorldTransform(ui.gx, (float)-l->left, (float)-l->top, MatrixOrderPrepend);
+	layer_current = l;
+	return true;
+}
+
+static void layer_end(void)
+{
+	GdipDeleteGraphics(ui.gx);
+	ui.gx = layer_saved_gx;
+}
+
+static void layer_draw(void)
+{
+	Layer *l = layer_current;
+	GdipSetInterpolationMode(ui.gx, InterpolationModeNearestNeighbor);
+	GdipSetPixelOffsetMode(ui.gx, PixelOffsetModeHalf);
+	GdipDrawImageRectI(ui.gx, (GpImage *)l->image, l->left, l->top, l->width, l->height);
+	GdipSetPixelOffsetMode(ui.gx, PixelOffsetModeDefault);
+}
+
 static void shadow(float x, float y, float w, float h, float r)
 {
 	for(int i = 7; i >= 1; i -= 2)
@@ -293,9 +351,14 @@ static void shadow(float x, float y, float w, float h, float r)
 
 static void panel(float x, float y, float w, float h)
 {
-	shadow(x, y, w, h, 22);
-	fill_round(x, y, w, h, 22, WHITE(13));
-	stroke_round(x, y, w, h, 22, 1, WHITE(20));
+	if(layer_begin(x, y, w, h, 0))
+	{
+		shadow(x, y, w, h, 22);
+		fill_round(x, y, w, h, 22, WHITE(13));
+		stroke_round(x, y, w, h, 22, 1, WHITE(20));
+		layer_end();
+	}
+	layer_draw();
 }
 
 static void heading(const wchar_t *s, float x, float y)
@@ -442,28 +505,36 @@ static void bitrate_text(wchar_t *out, size_t n, int kbps)
 static void card(int id, float x, float y, float w, float h, ARGB c1, ARGB c2, const wchar_t *icon,
 		const wchar_t *title, const wchar_t *subtitle, bool on)
 {
-	shadow(x, y, w, h, 26);
 	float dx = F(x), dy = F(y), dw = F(w), dh = F(h);
-	GpPath *p = path_round(dx, dy, dw, dh, F(26));
-	GpPointF a = { dx, dy }, b = { dx + dw, dy + dh };
-	GpLineGradient *grad;
-	GdipCreateLineBrush(&a, &b, c1, c2, WrapModeTile, &grad);
-	GdipFillPath(ui.gx, (GpBrush *)grad, p);
-	GdipDeleteBrush((GpBrush *)grad);
-
-	GdipSetClipPath(ui.gx, p, CombineModeReplace);
-	wave(ui.gx, dx, dy, dw, dh, 0.38f, 0.12f, 0.70f, 0.30f, WHITE(18));
-	wave(ui.gx, dx, dy, dw, dh, 0.60f, 0.84f, 0.32f, 0.52f, WHITE(20));
 	float lit = anim(id + UI_MAX, on ? 1.0f : 0);
-	if(lit < 1)
+	// A settled card is one finished picture. Only the fade in between paints the dimming live.
+	if(layer_begin(x, y, w, h, id * 2 + (lit == 0)))
 	{
-		GpSolidFill *dim;
-		GdipCreateSolidFill(COLOR((int)(135 * (1 - lit)), 16, 17, 22), &dim);
-		GdipFillPath(ui.gx, (GpBrush *)dim, p);
-		GdipDeleteBrush((GpBrush *)dim);
+		shadow(x, y, w, h, 26);
+		GpPath *p = path_round(dx, dy, dw, dh, F(26));
+		GpPointF a = { dx, dy }, b = { dx + dw, dy + dh };
+		GpLineGradient *grad;
+		GdipCreateLineBrush(&a, &b, c1, c2, WrapModeTile, &grad);
+		GdipFillPath(ui.gx, (GpBrush *)grad, p);
+		GdipDeleteBrush((GpBrush *)grad);
+
+		GdipSetClipPath(ui.gx, p, CombineModeReplace);
+		wave(ui.gx, dx, dy, dw, dh, 0.38f, 0.12f, 0.70f, 0.30f, WHITE(18));
+		wave(ui.gx, dx, dy, dw, dh, 0.60f, 0.84f, 0.32f, 0.52f, WHITE(20));
+		if(lit == 0)
+		{
+			GpSolidFill *dim;
+			GdipCreateSolidFill(COLOR(135, 16, 17, 22), &dim);
+			GdipFillPath(ui.gx, (GpBrush *)dim, p);
+			GdipDeleteBrush((GpBrush *)dim);
+		}
+		GdipResetClip(ui.gx);
+		GdipDeletePath(p);
+		layer_end();
 	}
-	GdipResetClip(ui.gx);
-	GdipDeletePath(p);
+	layer_draw();
+	if(lit > 0 && lit < 1)
+		fill_round(x, y, w, h, 26, COLOR((int)(135 * (1 - lit)), 16, 17, 22));
 	stroke_round(x + 1, y + 1, w - 2, h - 2, 25, 1 + lit, mix(WHITE(26), C_GREEN, lit));
 
 	dot(x + 26, y + 22, 56, on ? WHITE(38) : WHITE(18));
@@ -994,11 +1065,17 @@ static void status_bar(void)
 	}
 	else if(g.update_ready)
 	{
+		bool one_click = update_available_here();
 		wchar_t label[64];
-		swprintf(label, 64, tr(L"Yeni sürüm: %hs"), g.update_tag);
+		swprintf(label, 64, tr(one_click ? L"Güncelle: %hs" : L"Yeni sürüm: %hs"), g.update_tag);
 		tw -= 190;
-		if(pill_button(UI_UPDATE_NOW, label, x + w - 184, y + 7, 174, 34, true, true))
-			ShellExecuteW(NULL, L"open", RELEASES_URL, NULL, NULL, SW_SHOWNORMAL);
+		if(pill_button(UI_UPDATE_NOW, g.update_busy ? L"Güncelleniyor..." : label, x + w - 184, y + 7, 174, 34, true, !g.update_busy))
+		{
+			if(one_click)
+				update_begin();
+			else
+				ShellExecuteW(NULL, L"open", RELEASES_URL, NULL, NULL, SW_SHOWNORMAL);
+		}
 	}
 	else if(ui.page == PAGE_PLAY)
 	{
@@ -1009,7 +1086,10 @@ static void status_bar(void)
 			config_set_int("details", ui.details);
 		}
 	}
-	text(ui.tip ? ui.tip : status, ui.body, x + 46, y, tw, h, C_TEXT, 0, 1);
+	const wchar_t *shown = status;
+	if(g.update_note && GetTickCount() - g.update_note_at < 8000 && !g.update_busy)
+		shown = g.update_note;
+	text(ui.tip ? ui.tip : shown, ui.body, x + 46, y, tw, h, C_TEXT, 0, 1);
 }
 
 static void devices_load(void)
@@ -1063,6 +1143,21 @@ static void ui_frame(void)
 	for(int i = 1; i < UI_MAX; i++)
 		if(ui.rect_set[i] && mouse_in(ui.rects[i].X, ui.rects[i].Y, ui.rects[i].Width, ui.rects[i].Height))
 			ui.hot_id = i;
+#ifdef PSSTREAM_TEST
+	{
+		static int frames;
+		static double spent, window_start;
+		frames++;
+		spent += now_ms() - frame_at;
+		if(frame_at - window_start > 5000)
+		{
+			CHIAKI_LOGI(&g.log, "UI frames: %d in 5 s, %.1f ms each, animating=%d", frames, spent / frames, ui.animating);
+			frames = 0;
+			spent = 0;
+			window_start = frame_at;
+		}
+	}
+#endif
 	// Fast frames only while something moves, so the audio-only mode stays cheap
 	if(ui.animating)
 		SetTimer(g.hwnd, 2, 15, NULL);
@@ -1198,9 +1293,9 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 				ui_frame();
 				return 0;
 			}
-			// Live numbers and the blinking dot; nothing to draw while hidden or on the other pages.
-			// Once connected only the seconds change, so twice a second isn't needed.
-			if(IsWindowVisible(hwnd) && !IsIconic(hwnd) && ui.page == PAGE_PLAY && (g.want_audio || g.want_video) && (!g.connected || ++ui.timer_ticks % 2 == 0))
+			// The blinking dot and the live numbers. Nothing else changes by itself, so an open
+			// window costs no CPU while connected with the details hidden.
+			if(IsWindowVisible(hwnd) && !IsIconic(hwnd) && ui.page == PAGE_PLAY && (g.want_audio || g.want_video) && (!g.connected || (ui.details && ++ui.timer_ticks % 2 == 0)))
 				ui_frame();
 			return 0;
 		case WM_SETCURSOR:
@@ -1410,6 +1505,25 @@ static GpFont *font_make(const wchar_t *family, float size)
 	return font;
 }
 
+static HBITMAP surface_create(HDC dc, GpGraphics **gx)
+{
+	BITMAPINFO info = { 0 };
+	info.bmiHeader.biSize = sizeof(info.bmiHeader);
+	info.bmiHeader.biWidth = S(UI_W);
+	info.bmiHeader.biHeight = -S(UI_H);
+	info.bmiHeader.biPlanes = 1;
+	info.bmiHeader.biBitCount = 32;
+	info.bmiHeader.biCompression = BI_RGB;
+	void *bits;
+	HBITMAP bmp = CreateDIBSection(dc, &info, DIB_RGB_COLORS, &bits, NULL, 0);
+	SelectObject(dc, bmp);
+	GpBitmap *image;
+	GdipCreateBitmapFromScan0(S(UI_W), S(UI_H), S(UI_W) * 4, PixelFormat32bppPARGB, bits, &image);
+	GdipGetImageGraphicsContext((GpImage *)image, gx);
+	GdipSetSmoothingMode(*gx, SmoothingModeAntiAlias);
+	return bmp;
+}
+
 static void ui_create(HINSTANCE inst)
 {
 	ULONG_PTR gdiplus_token;
@@ -1448,22 +1562,17 @@ static void ui_create(HINSTANCE inst)
 	if(saved.x != 99999 && saved.y != 99999 && MonitorFromPoint(corner, MONITOR_DEFAULTTONULL))
 		SetWindowPos(g.hwnd, NULL, saved.x, saved.y, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
 
+	// GDI+ blends in plain memory many times faster than on a bitmap owned by the display driver
 	HDC screen = GetDC(g.hwnd);
 	ui.back_dc = CreateCompatibleDC(screen);
-	ui.back_bmp = CreateCompatibleBitmap(screen, S(UI_W), S(UI_H));
-	SelectObject(ui.back_dc, ui.back_bmp);
 	ui.bg_dc = CreateCompatibleDC(screen);
-	SelectObject(ui.bg_dc, CreateCompatibleBitmap(screen, S(UI_W), S(UI_H)));
 	ReleaseDC(g.hwnd, screen);
-
 	GpGraphics *bg;
-	GdipCreateFromHDC(ui.bg_dc, &bg);
-	GdipSetSmoothingMode(bg, SmoothingModeAntiAlias);
+	ui.back_bmp = surface_create(ui.back_dc, &ui.gx);
+	surface_create(ui.bg_dc, &bg);
 	background_paint(bg);
 	GdipDeleteGraphics(bg);
 
-	GdipCreateFromHDC(ui.back_dc, &ui.gx);
-	GdipSetSmoothingMode(ui.gx, SmoothingModeAntiAlias);
 	GdipSetTextRenderingHint(ui.gx, TextRenderingHintAntiAliasGridFit);
 
 	wchar_t host_w[256];
@@ -1675,10 +1784,23 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmd, int show)
 	int argc = 0;
 	wchar_t **argv = CommandLineToArgvW(GetCommandLineW(), &argc);
 	bool start_in_tray = argc == 2 && wcscmp(argv[1], L"--tray") == 0;
+	g.relaunched = argc == 2 && wcscmp(argv[1], L"--updated") == 0;
+	if(argc == 2 && wcscmp(argv[1], L"--update-failed") == 0)
+	{
+		g.update_failed = 1;
+		g.update_note = L"Güncelleme uygulanamadı, eski sürüm çalışıyor";
+		g.update_note_at = GetTickCount();
+	}
+	if(g.relaunched)
+	{
+		g.update_note = L"Güncelleme tamamlandı";
+		g.update_note_at = GetTickCount();
+	}
 	// A second copy would fight the first one for the PS5 and the hotkeys, so show the first instead
 	if(argc < 3)
 	{
 		HANDLE single = CreateMutexW(NULL, FALSE, L"PSStreamSingleInstance");
+		g.single_instance = single;
 		if(single && GetLastError() == ERROR_ALREADY_EXISTS)
 		{
 			HWND first = FindWindowW(L"PSStreamWindow", NULL);
@@ -1733,6 +1855,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmd, int show)
 		find_ps5();
 	if(g.settings.update_check)
 		CloseHandle(CreateThread(NULL, 0, update_check_main, NULL, 0, NULL));
+	CloseHandle(CreateThread(NULL, 0, update_cleanup_main, NULL, 0, NULL));
 
 	LPTHREAD_START_ROUTINE thread_main = worker_main;
 	void *thread_arg = NULL;
@@ -1769,6 +1892,17 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmd, int show)
 		else
 			ShowWindow(g.hwnd, show);
 	}
+	// The window is up, so the version that started this one can go
+	if(g.relaunched)
+	{
+		HANDLE updated = OpenEventW(EVENT_MODIFY_STATE, FALSE, L"PSStreamUpdated");
+		if(updated)
+		{
+			SetEvent(updated);
+			CloseHandle(updated);
+		}
+		SetForegroundWindow(g.hwnd);
+	}
 	MSG msg;
 	while(GetMessageW(&msg, NULL, 0, 0) > 0)
 	{
@@ -1783,9 +1917,15 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmd, int show)
 	SetEvent(g.wake);
 	// Stopping tells the PS5 we left. If that hangs, leave anyway instead of tearing SDL down under it
 	if(WaitForSingleObject(worker, 10000) != WAIT_OBJECT_0)
+	{
+		if(g.update_restart)
+			update_finish();
 		ExitProcess(0);
+	}
 	SDL_Quit();
 	curl_global_cleanup();
+	if(g.update_restart)
+		update_finish();
 	if(g.log_file)
 		fclose(g.log_file);
 	return 0;
