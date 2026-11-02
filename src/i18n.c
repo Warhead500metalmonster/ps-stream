@@ -117,6 +117,12 @@ static const wchar_t *const english[][2] = {
 	{ L"PS5'e ulaşılamıyor. Açık mı? Denemeye devam ediyorum", L"Can't reach your PS5. Is it on? Still trying" },
 	{ L"Vazgeç", L"Cancel" },
 	{ L"Eski eşleştirme kullanılmaya devam ediyor", L"Your existing pairing stays in use" },
+	{ L"PS5'i uyandır", L"Wake PS5" },
+	{ L"Bağlanırken PS5 uykudaysa açılsın", L"Turn the PS5 on from rest mode when connecting" },
+	{ L"PS5 uyanıyor...", L"PS5 is waking up..." },
+	{ L"PS5 bu kodu kabul etmedi. PS5'teki Cihazı Bağla ekranından yeni kod alıp yaz", L"The PS5 refused this code. Get a new one from Link Device on the PS5 and type it" },
+	{ L"PS5'e ulaşılmaya çalışılıyor...", L"Trying to reach your PS5..." },
+	{ L"PS5'e ulaşılamadı. PS5 açık mı, IP doğru mu? Kod duruyor, Eşleştir'e basabilirsin", L"Couldn't reach your PS5. Is it on, and is the IP right? Your code is kept, so you can press Pair" },
 	{ L"KISAYOLLAR", L"HOTKEYS" },
 	{ L"Tıkla, sonra tuş kombinasyonuna bas. Esc iptal eder, Delete kaldırır.", L"Click, then press a key combination. Esc cancels, Delete clears." },
 	{ L"Tuşa bas...", L"Press keys..." },
@@ -171,7 +177,6 @@ static const wchar_t *const english[][2] = {
 	{ L"Önce PSN ile giriş yap", L"Sign in with PSN first" },
 	{ L"PS5'teki 8 haneli kodu gir", L"Enter the 8-digit code from your PS5" },
 	{ L"Eşleştirme başlatılamadı", L"Couldn't start pairing" },
-	{ L"Eşleştirme olmadı. Kodu ve IP'yi kontrol et", L"Pairing failed. Check the code and IP" },
 	{ L"Eşleştirildi. Ses veya Görüntü'ye basabilirsin", L"Paired. You can turn on Audio or Video now" },
 };
 

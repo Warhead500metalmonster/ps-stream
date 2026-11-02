@@ -27,7 +27,7 @@ If you play on a TV and use Discord on your PC, the usual way to get game audio 
 - **Built for Wi-Fi.** Pauses Windows' background Wi-Fi scans while connected, uses an audio buffer that adapts to jitter, and keeps your PC awake.
 - **Audio controls.** Choose the output device and maximum delay, and change the volume right on the Play page.
 - **Live connection numbers.** Press **Details** to see connection time, ping, audio dropouts, video frame rate and lost frames.
-- **Stays connected.** Keeps trying when the PS5 turns off, and finds the console again if the router gives it a new address.
+- **Connects by itself.** Checks for the PS5 about once a second and connects as soon as it answers. If the PS5 is in rest mode, the app sends it a wake-up signal. You can turn that off with **Wake PS5** in Settings. It also finds the console again if the router gives it a new address.
 - **Runs in the background.** Minimizes to the tray, can start with Windows, remembers where its windows were, and opening it a second time shows the running copy.
 - **Global hotkeys.** `Ctrl+Alt+F9` for audio and `Ctrl+Alt+F10` for video. You can change them.
 - **Turkish and English interface.**
@@ -73,7 +73,7 @@ When you press it, the app downloads the release from GitHub, checks it against 
 ## Known limitations
 
 - Windows only.
-- **Wake PS5** appears when the console is in rest mode. It needs the PS5's option to turn on over the network, and hasn't been tested on a real console yet.
+- Waking the PS5 needs the console's option to turn on over the network, and hasn't been tested on a real console yet.
 - Local network only.
 - No controller input from the PC. The app is for audio and video.
 - The PS5 sends some video even in audio-only mode, so the network use doesn't reach zero.

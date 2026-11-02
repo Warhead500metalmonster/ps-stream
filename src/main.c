@@ -44,7 +44,7 @@
 
 // Below this rate we are outside what chiaki-ng offers, so a console that refuses to start
 // gets a second try with it.
-#define APP_VERSION "0.1.7"
+#define APP_VERSION "0.1.8"
 #define UPDATE_DOWNLOAD_PREFIX "https://github.com/Warhead500metalmonster/ps-stream/releases/download/"
 #define RELEASES_URL L"https://github.com/Warhead500metalmonster/ps-stream/releases/latest"
 #define REPO_URL L"https://github.com/Warhead500metalmonster/ps-stream"
@@ -53,6 +53,16 @@
 #define RETRY_MAX_MS 15000
 #define RETRY_FAST_MS 2000
 #define RETRY_FAST_WINDOW_MS 60000
+#define PROBE_DELAY_MS 200
+#define PROBE_SLOW_DELAY_MS 5000
+#define PROBE_SLOW_AFTER_MS 300000
+#define PROBES_PER_SWEEP 15
+#define PROBES_PER_SESSION_TRY 20
+#define WAKE_REPEAT_MS 30000
+#define WAKE_MAX_TRIES 3
+#define REGIST_TRIES 6
+#define REGIST_RETRY_MS 1000
+#define TIMER_REGIST_RETRY 3
 #define STATS_LOG_EVERY 15
 #define SAFE_KBPS 2000
 #define RES_MIN 1
@@ -99,7 +109,7 @@ static const Resolution resolutions[] = {
 typedef struct {
 	int res, fps, kbps, h265, hw;
 	int ao_res, ao_kbps;
-	int volume, buffer_ms, loss_pct, reconnect, no_controller, wifi_opt, autostart_audio, win_start, tray, update_check;
+	int volume, buffer_ms, loss_pct, reconnect, no_controller, wifi_opt, autostart_audio, win_start, tray, update_check, auto_wake;
 	int hotkey_audio, hotkey_video; // HKM_GETHOTKEY format
 	char device[256]; // empty is the system default
 } Settings;
@@ -156,7 +166,8 @@ static struct {
 	DWORD audio_last_dropout, connected_at;
 	volatile LONG audio_dropouts, video_fps10, video_lost_total, ps5_standby;
 	char update_tag[32];
-	volatile LONG network_changed;
+	volatile LONG network_changed, regist_rejected;
+	int regist_tries;
 	volatile LONG update_ready, update_busy, update_failed, update_restart;
 	char update_url[512], update_digest[72];
 	bool relaunched;
@@ -194,6 +205,10 @@ static void set_status(const wchar_t *text)
 
 static void log_cb(ChiakiLogLevel level, const char *msg, void *user)
 {
+	// The library only reports that pairing failed. An answer from the PS5 means the code was
+	// refused, and anything else means a packet got lost and trying again can work.
+	if(strstr(msg, "Regist received HTTP code"))
+		g.regist_rejected = 1;
 	(void)level;
 	(void)user;
 	static long written;
@@ -780,13 +795,13 @@ static void wifi_tune(bool on)
 
 // Asks for the console on the known address first, then on the whole network, so a PS5 that got a
 // new address from the router is found again. Returns false if no PS5 answered.
-static bool ps5_search(const char *prefer, int rounds, char *ip, size_t ip_size, bool *standby)
+static bool ps5_search(const char *prefer, int rounds, bool sweep, char *ip, size_t ip_size, bool *standby)
 {
 	SOCKET s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
 	if(s == INVALID_SOCKET)
 		return false;
 	BOOL on = TRUE;
-	DWORD timeout = 700;
+	DWORD timeout = 400;
 	setsockopt(s, SOL_SOCKET, SO_BROADCAST, (char *)&on, sizeof(on));
 	setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (char *)&timeout, sizeof(timeout));
 
@@ -815,6 +830,24 @@ static bool ps5_search(const char *prefer, int rounds, char *ip, size_t ip_size,
 			to.sin_port = htons(9302);
 			to.sin_addr.s_addr = targets[i];
 			sendto(s, msg, sizeof(msg) - 1, 0, (struct sockaddr *)&to, sizeof(to));
+		}
+		// Many routers drop broadcasts between Wi-Fi devices, but pass a message sent to one address
+		if(sweep && round % 5 == 0)
+		{
+			for(DWORD i = 0; i < table->dwNumEntries; i++)
+			{
+				uint32_t addr = ntohl(table->table[i].dwAddr);
+				if(!addr || (addr >> 24) == 127 || (addr >> 16) == 0xA9FE)
+					continue;
+				for(uint32_t host_part = 1; host_part < 255; host_part++)
+				{
+					struct sockaddr_in to = { 0 };
+					to.sin_family = AF_INET;
+					to.sin_port = htons(9302);
+					to.sin_addr.s_addr = htonl((addr & 0xFFFFFF00) | host_part);
+					sendto(s, msg, sizeof(msg) - 1, 0, (struct sockaddr *)&to, sizeof(to));
+				}
+			}
 		}
 		// Read every answer of this round, so a second PS5 at home can't win over the known one
 		while(true)
@@ -847,7 +880,7 @@ static bool ps5_search(const char *prefer, int rounds, char *ip, size_t ip_size,
 
 // Discovery answers get lost while Wi-Fi or Windows' firewall are still settling after startup,
 // but the console's Remote Play port answers or it doesn't.
-static bool ps5_port_open(const char *host)
+static bool ps5_port_open(const char *host, long timeout_ms)
 {
 	struct sockaddr_in to = { 0 };
 	to.sin_family = AF_INET;
@@ -866,7 +899,7 @@ static bool ps5_port_open(const char *host)
 	FD_ZERO(&failed);
 	FD_SET(s, &writable);
 	FD_SET(s, &failed);
-	struct timeval timeout = { 2, 0 };
+	struct timeval timeout = { timeout_ms / 1000, (timeout_ms % 1000) * 1000 };
 	bool open = select(0, NULL, &writable, &failed, &timeout) > 0 && FD_ISSET(s, &writable);
 	closesocket(s);
 	return open;
@@ -884,6 +917,8 @@ static DWORD WINAPI network_watch_main(void *arg)
 	return 0;
 }
 
+static bool ps5_wake_send(void);
+
 static bool stream_changed(const Settings *a, const Settings *b, bool video)
 {
 	if(a->loss_pct != b->loss_pct || a->no_controller != b->no_controller)
@@ -900,7 +935,8 @@ static DWORD WINAPI worker_main(void *arg)
 	bool running = false, run_video = false, safe = false, waiting = false, hold_status = false;
 	int fails = 0;
 	Settings run = { 0 };
-	DWORD retry_at = 0, trying_since = 0;
+	DWORD retry_at = 0, trying_since = 0, wake_at = 0;
+	int probes = 0, wake_tries = 0;
 	CloseHandle(CreateThread(NULL, 0, network_watch_main, NULL, 0, NULL));
 	while(true)
 	{
@@ -930,6 +966,8 @@ static DWORD WINAPI worker_main(void *arg)
 		{
 			fails = 0;
 			trying_since = 0;
+			probes = 0;
+			wake_tries = 0;
 			g.ps5_standby = 0;
 		}
 
@@ -997,6 +1035,8 @@ static DWORD WINAPI worker_main(void *arg)
 			safe = false;
 			fails = 0;
 			trying_since = 0;
+			probes = 0;
+			wake_tries = 0;
 			g.ps5_standby = 0;
 			continue;
 		}
@@ -1004,30 +1044,52 @@ static DWORD WINAPI worker_main(void *arg)
 		if(!running && (!waiting || (LONG)(retry_at - GetTickCount()) <= 0))
 		{
 			waiting = false;
-			if(fails > 0)
+			if(!trying_since)
+				trying_since = GetTickCount();
 			{
 				char host[256], ip[64] = "";
 				bool standby = false;
 				host_get(host, sizeof(host));
-				bool answered = ps5_search(host, 3, ip, sizeof(ip), &standby);
-				g.ps5_standby = answered && standby;
-				CHIAKI_LOGI(&g.log, "PS5 search before retry: %s", !answered ? "no answer" : standby ? "rest mode" : "on");
-				if(answered && strcmp(ip, host) != 0)
+				// A full attempt takes 5 s to give up on a PS5 that's away. This takes a moment, so
+				// connecting can begin the moment the console is back.
+				probes++;
+				bool open = ps5_port_open(host, 800);
+				if(!open)
 				{
-					CHIAKI_LOGI(&g.log, "PS5 moved to a new address");
-					host_set(ip);
-					PostMessageW(g.hwnd, WM_APP_HOST_CHANGED, 0, 0);
+					bool answered = ps5_search(host, 1, probes % PROBES_PER_SWEEP == 1, ip, sizeof(ip), &standby);
+					g.ps5_standby = answered && standby;
+					if(answered && strcmp(ip, host) != 0)
+					{
+						CHIAKI_LOGI(&g.log, "PS5 moved to a new address");
+						host_set(ip);
+						PostMessageW(g.hwnd, WM_APP_HOST_CHANGED, 0, 0);
+						open = !standby;
+					}
+					// A resting PS5 may not answer the search at all, so try waking it either way
+					if(s.auto_wake && g.paired && wake_tries < WAKE_MAX_TRIES && (LONG)(GetTickCount() - wake_at) >= 0)
+					{
+						wake_tries++;
+						wake_at = GetTickCount() + WAKE_REPEAT_MS;
+						ps5_wake_send();
+					}
+					if(probes % 30 == 1)
+						CHIAKI_LOGI(&g.log, "PS5 check %d: port closed, search %s", probes, !answered ? "no answer" : standby ? "rest mode" : "on");
 				}
-				// No answer proves nothing, since discovery gets lost easily. Only a console that says
-				// it's resting can't take a session, and even that's worth checking now and then.
-				if(answered && standby && fails % 3 != 0)
+				// In case the check itself is what's being blocked, a real attempt now and then
+				if(!open && probes % PROBES_PER_SESSION_TRY != 0)
 				{
-					set_status(L"PS5 uyku modunda. Uyandırabilir veya PS5'i açabilirsin");
-					fails++;
+					DWORD waited = GetTickCount() - trying_since;
+					if(g.ps5_standby)
+						set_status(s.auto_wake ? L"PS5 uyanıyor..." : L"PS5 uyku modunda. Uyandırabilir veya PS5'i açabilirsin");
+					else
+						set_status(waited < RETRY_FAST_WINDOW_MS ? L"PS5'e bağlanılıyor..." : L"PS5'e ulaşılamıyor. Açık mı? Denemeye devam ediyorum");
 					waiting = true;
-					retry_at = GetTickCount() + RETRY_MAX_MS;
+					retry_at = GetTickCount() + (waited < PROBE_SLOW_AFTER_MS ? PROBE_DELAY_MS : PROBE_SLOW_DELAY_MS);
 					continue;
 				}
+				if(open)
+					CHIAKI_LOGI(&g.log, "PS5 port open after %d checks", probes);
+				g.ps5_standby = 0;
 			}
 			set_status(L"Bağlanıyor...");
 			if(session_start(want_video, &s, safe))
@@ -1171,6 +1233,7 @@ static void config_load(void)
 	s->win_start = win_start_get();
 	s->tray = config_int("tray", 1, 0, 1);
 	s->update_check = config_int("update_check", 1, 0, 1);
+	s->auto_wake = config_int("auto_wake", 1, 0, 1);
 	s->hotkey_audio = hotkey_load("hotkey_audio", MAKEWORD(VK_F9, HOTKEYF_CONTROL | HOTKEYF_ALT));
 	s->hotkey_video = hotkey_load("hotkey_video", MAKEWORD(VK_F10, HOTKEYF_CONTROL | HOTKEYF_ALT));
 	char device_hex[sizeof(s->device) * 2 + 1];
@@ -1199,6 +1262,7 @@ static void config_save_settings(const Settings *s)
 	config_set_int("autostart_audio", s->autostart_audio);
 	config_set_int("tray", s->tray);
 	config_set_int("update_check", s->update_check);
+	config_set_int("auto_wake", s->auto_wake);
 	config_set_int("hotkey_audio", s->hotkey_audio);
 	config_set_int("hotkey_video", s->hotkey_video);
 	// Device names can hold any language, and an old INI file only stores its own code page
@@ -1229,13 +1293,13 @@ static DWORD WINAPI find_ps5_thread(void *arg)
 	get_text(ID_HOST, typed, sizeof(typed));
 	set_status(L"PS5 aranıyor...");
 	bool found = false;
-	if(typed[0] && ps5_port_open(typed))
+	if(typed[0] && ps5_port_open(typed, 1500))
 	{
 		found = true;
 		snprintf(ip, sizeof(ip), "%s", typed);
 	}
 	else
-		found = ps5_search(typed, 30, ip, sizeof(ip), &standby);
+		found = ps5_search(typed, 50, true, ip, sizeof(ip), &standby);
 	if(found)
 	{
 		SetDlgItemTextA(g.hwnd, ID_HOST, ip);
@@ -1250,16 +1314,21 @@ static DWORD WINAPI find_ps5_thread(void *arg)
 }
 
 // Needs the console's rest mode to allow turning on over the network.
-static DWORD WINAPI ps5_wake_thread(void *arg)
+static bool ps5_wake_send(void)
 {
-	(void)arg;
 	char key[CHIAKI_SESSION_AUTH_SIZE + 1], host[256];
 	memcpy(key, g.regist_key, CHIAKI_SESSION_AUTH_SIZE);
 	key[CHIAKI_SESSION_AUTH_SIZE] = 0;
 	host_get(host, sizeof(host));
 	ChiakiErrorCode err = chiaki_discovery_wakeup(&g.log, NULL, host, strtoull(key, NULL, 16), true);
 	CHIAKI_LOGI(&g.log, "PS5 wake-up sent: %s", chiaki_error_string(err));
-	set_status(err == CHIAKI_ERR_SUCCESS ? L"Uyandırma sinyali gönderildi, PS5 açılıyor olabilir" : L"Uyandırma sinyali gönderilemedi");
+	return err == CHIAKI_ERR_SUCCESS;
+}
+
+static DWORD WINAPI ps5_wake_thread(void *arg)
+{
+	(void)arg;
+	set_status(ps5_wake_send() ? L"Uyandırma sinyali gönderildi, PS5 açılıyor olabilir" : L"Uyandırma sinyali gönderilemedi");
 	return 0;
 }
 
@@ -2045,6 +2114,7 @@ static void pair_start(void)
 	info.target = CHIAKI_TARGET_PS5_1;
 	info.host = g.host;
 	info.pin = (uint32_t)strtoul(pin, NULL, 10);
+	g.regist_rejected = 0;
 	if(chiaki_regist_start(&g.regist, &g.log, &info, regist_cb, NULL) != CHIAKI_ERR_SUCCESS)
 	{
 		set_status(L"Eşleştirme başlatılamadı");
@@ -2062,10 +2132,28 @@ static void pair_finished(void)
 	g.pairing = false;
 	if(!g.regist_ok)
 	{
-		set_status(L"Eşleştirme olmadı. Kodu ve IP'yi kontrol et");
-		SetDlgItemTextW(g.hwnd, ID_PIN, L"");
+		if(g.regist_rejected)
+		{
+			g.regist_tries = 0;
+			set_status(L"PS5 bu kodu kabul etmedi. PS5'teki Cihazı Bağla ekranından yeni kod alıp yaz");
+			SetDlgItemTextW(g.hwnd, ID_PIN, L"");
+			return;
+		}
+		// Pairing starts with one network message and no second try, so one lost packet ends it.
+		// The code is still good, and typing it again wouldn't help.
+		if(++g.regist_tries < REGIST_TRIES)
+		{
+			CHIAKI_LOGI(&g.log, "Pairing attempt %d got no answer, trying again", g.regist_tries);
+			g.pairing = true;
+			set_status(L"PS5'e ulaşılmaya çalışılıyor...");
+			SetTimer(g.hwnd, TIMER_REGIST_RETRY, REGIST_RETRY_MS, NULL);
+			return;
+		}
+		g.regist_tries = 0;
+		set_status(L"PS5'e ulaşılamadı. PS5 açık mı, IP doğru mu? Kod duruyor, Eşleştir'e basabilirsin");
 		return;
 	}
+	g.regist_tries = 0;
 	memcpy(g.regist_key, g.registered.rp_regist_key, sizeof(g.regist_key));
 	memcpy(g.morning, g.registered.rp_key, sizeof(g.morning));
 	g.paired = true;

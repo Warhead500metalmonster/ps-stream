@@ -41,7 +41,7 @@
 #define ICON_PLAY L""
 
 enum { UI_NONE, UI_NAV0, UI_NAV1, UI_NAV2, UI_AUDIO, UI_VIDEO, UI_DETAILS, UI_ADVANCED, UI_SIMPLE, UI_APPLY, UI_FIND, UI_LOGIN, UI_ACCOUNT_CLEAR, UI_PAIR, UI_REPAIR,
-	UI_DEVICE, UI_HK_AUDIO, UI_HK_VIDEO, UI_HW, UI_RECONNECT, UI_CONTROLLER, UI_WIFI, UI_AUTOSTART, UI_WINSTART, UI_TRAY, UI_UPDATES, UI_QUICK_VOLUME, UI_WAKE, UI_UPDATE_NOW, UI_OPEN_LOGS, UI_OPEN_REPO, UI_BITRATE, UI_AO_BITRATE, UI_VOLUME, UI_BUFFER, UI_LOSS,
+	UI_DEVICE, UI_HK_AUDIO, UI_HK_VIDEO, UI_HW, UI_RECONNECT, UI_CONTROLLER, UI_WIFI, UI_AUTOSTART, UI_AUTOWAKE, UI_WINSTART, UI_TRAY, UI_UPDATES, UI_QUICK_VOLUME, UI_WAKE, UI_UPDATE_NOW, UI_OPEN_LOGS, UI_OPEN_REPO, UI_BITRATE, UI_AO_BITRATE, UI_VOLUME, UI_BUFFER, UI_LOSS,
 	UI_PRESET0 = 46, UI_RES0 = 52, UI_FPS0 = 60, UI_CODEC0 = 65, UI_AORES0 = 70, UI_LANG0 = 80, UI_MAX = 96 };
 
 static struct {
@@ -694,7 +694,7 @@ static bool settings_dirty(const Settings *a, const Settings *b)
 	return a->res != b->res || a->fps != b->fps || a->kbps != b->kbps || a->h265 != b->h265 || a->hw != b->hw
 		|| a->ao_res != b->ao_res || a->ao_kbps != b->ao_kbps || a->loss_pct != b->loss_pct
 		|| a->no_controller != b->no_controller || a->wifi_opt != b->wifi_opt || a->autostart_audio != b->autostart_audio
-		|| a->win_start != b->win_start || a->tray != b->tray || a->update_check != b->update_check
+		|| a->win_start != b->win_start || a->tray != b->tray || a->update_check != b->update_check || a->auto_wake != b->auto_wake
 		|| a->reconnect != b->reconnect || a->hotkey_audio != b->hotkey_audio || a->hotkey_video != b->hotkey_video
 		|| strcmp(a->device, b->device) != 0;
 }
@@ -742,6 +742,8 @@ static void page_settings_simple(void)
 	text(t, ui.semi, x + w - 64, y + 32, 64, 28, C_TEXT, 2, 1);
 	y += 86;
 	plain_switch(UI_AUTOSTART, L"Açılışta ses", L"Uygulama açılınca ses başlasın", x, y, w, &d->autostart_audio);
+	y += 66;
+	plain_switch(UI_AUTOWAKE, L"PS5'i uyandır", L"Bağlanırken PS5 uykudaysa açılsın", x, y, w, &d->auto_wake);
 
 	x = rx + 24;
 	y = py + 20;
@@ -1309,6 +1311,14 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 				ui_frame();
 				return 0;
 			}
+			if(wp == TIMER_REGIST_RETRY)
+			{
+				KillTimer(hwnd, TIMER_REGIST_RETRY);
+				g.pairing = false;
+				pair_start();
+				ui_frame();
+				return 0;
+			}
 			// The blinking dot and the live numbers. Nothing else changes by itself, so an open
 			// window costs no CPU while connected with the details hidden.
 			if(IsWindowVisible(hwnd) && !IsIconic(hwnd) && ui.page == PAGE_PLAY && (g.want_audio || g.want_video) && (!g.connected || (ui.details && ++ui.timer_ticks % 2 == 0)))
@@ -1660,9 +1670,22 @@ static DWORD WINAPI ui_test_main(void *arg)
 			get_text(ID_ACCOUNT, saved, sizeof(saved));
 			CHIAKI_LOGI(&g.log, "Account field after delete: '%s'", saved);
 		}
-		for(int i = 0; i < 60 && finding; i++)
+		for(int i = 0; i < 150 && finding; i++)
 			Sleep(200);
 		test_log_status("search finished");
+		wchar_t test_pin[16];
+		if(GetEnvironmentVariableW(L"PSSTREAM_TEST_PIN", test_pin, 16))
+		{
+			SetDlgItemTextW(g.hwnd, ID_HOST, L"127.0.0.1");
+			SetDlgItemTextW(g.hwnd, ID_ACCOUNT, L"AAAAAAAAAAA=");
+			SetDlgItemTextW(g.hwnd, ID_PIN, test_pin);
+			Sleep(300);
+			for(int i = 0; i < 120 && g.pairing; i++)
+				Sleep(100);
+			test_log_status("pairing finished");
+			get_text(ID_PIN, saved, sizeof(saved));
+			CHIAKI_LOGI(&g.log, "PIN field after pairing: '%s', paired=%d", saved, g.paired);
+		}
 		test_shot(dir, L"pair_found");
 		if(GetEnvironmentVariableW(L"PSSTREAM_TEST_LOGIN_URL", NULL, 0))
 		{
