@@ -23,7 +23,7 @@ If you play on a TV and use Discord on your PC, the usual way to get game audio 
 
 - **Audio-only mode.** Video isn't decoded, and the PS5 is asked for the smallest stream.
 - **Video on demand.** Turn video on when you want to stream to Discord, and pick the "PS Stream - Video" window there. Press `F11` in that window for full screen. Turning video on or off reconnects, which takes a few seconds.
-- **Simple by default.** Two big buttons, and five quality presets from 360p at 0.5 Mbps to 1080p 60 FPS at 50 Mbps. To set resolution, frame rate, bitrate and codec yourself, use **Custom** or **Advanced settings**.
+- **Simple by default.** Two big buttons, an **Audio only** choice, and five quality presets from 360p at 0.5 Mbps to 1080p 60 FPS at 50 Mbps. To set resolution, frame rate, bitrate and codec yourself, use **Custom** or **Advanced settings**.
 - **Built for Wi-Fi.** Pauses Windows' background Wi-Fi scans while connected, uses an audio buffer that adapts to jitter, and keeps your PC awake.
 - **Audio controls.** Choose the output device and maximum delay, and change the volume right on the Play page.
 - **Live connection numbers.** Press **Details** to see connection time, ping, audio dropouts, video frame rate and lost frames.

@@ -51,7 +51,7 @@
 #define ICON_PLAY L""
 
 enum { UI_NONE, UI_NAV0, UI_NAV1, UI_NAV2, UI_AUDIO, UI_VIDEO, UI_MUTE, UI_LOWER, UI_HK_MUTE, UI_DETAILS, UI_ADVANCED, UI_SIMPLE, UI_APPLY, UI_FIND, UI_LOGIN, UI_ACCOUNT_CLEAR, UI_PAIR, UI_REPAIR,
-	UI_DEVICE, UI_HK_AUDIO, UI_HK_VIDEO, UI_HW, UI_RECONNECT, UI_CONTROLLER, UI_WIFI, UI_AUTOSTART, UI_AUTOWAKE, UI_GAMEPAD, UI_WINSTART, UI_TRAY, UI_UPDATES, UI_QUICK_VOLUME, UI_WAKE, UI_UPDATE_NOW, UI_OPEN_LOGS, UI_OPEN_REPO, UI_BITRATE, UI_AO_BITRATE, UI_VOLUME, UI_BUFFER, UI_LOSS,
+	UI_DEVICE, UI_HK_AUDIO, UI_HK_VIDEO, UI_HW, UI_RECONNECT, UI_CONTROLLER, UI_WIFI, UI_AUTOSTART, UI_AUTOWAKE, UI_GAMEPAD, UI_WINSTART, UI_TRAY, UI_UPDATES, UI_QUICK_VOLUME, UI_WAKE, UI_UPDATE_NOW, UI_OPEN_LOGS, UI_OPEN_REPO, UI_BITRATE, UI_AO_BITRATE, UI_VOLUME, UI_BUFFER, UI_LOSS, UI_AUDIO_ONLY,
 	UI_PRESET0 = 46, UI_RES0 = 52, UI_FPS0 = 60, UI_CODEC0 = 65, UI_AORES0 = 70, UI_LANG0 = 80, UI_MAX = 96 };
 
 static struct {
@@ -670,33 +670,45 @@ static void page_play(void)
 
 	static const wchar_t *const names[] = { L"En düşük", L"Düşük", L"Dengeli", L"Yüksek", L"En yüksek" };
 	static const wchar_t *const subs[] = { L"360p, 0,5 Mbps", L"360p, 2 Mbps", L"720p, 6 Mbps", L"1080p 60, 20 Mbps", L"1080p 60, 50 Mbps" };
-	int current = preset_match(&s);
-	float gap = 10, w = (UI_W - 48 - gap * 5) / 6, y = 420 + extra, h = 74;
-	for(int i = 0; i <= PRESET_COUNT; i++)
+	bool audio_only = g.want_audio && !g.want_video;
+	int current = audio_only ? -1 : preset_match(&s);
+	float gap = 8, w = (UI_W - 48 - gap * 6) / 7, y = 420 + extra, h = 74;
+	for(int i = -1; i <= PRESET_COUNT; i++) // -1 is audio only, which sits below every video quality
 	{
-		float x = 24 + i * (w + gap);
-		bool selected = i == current;
-		Hit b = hit(UI_PRESET0 + i, x, y, w, h);
-		float on = anim(UI_PRESET0 + i + UI_MAX, selected ? 1.0f : 0);
-		fill_round(x, y, w, h, 16, mix(mix(WHITE(18), WHITE(40), anim(UI_PRESET0 + i, b.hot ? 1.0f : 0)), C_ACCENT, on));
+		float x = 24 + (i + 1) * (w + gap);
+		bool selected = i == current, is_preset = i >= 0 && i < PRESET_COUNT;
+		int id = i < 0 ? UI_AUDIO_ONLY : UI_PRESET0 + i;
+		Hit b = hit(id, x, y, w, h);
+		float on = anim(id + UI_MAX, selected ? 1.0f : 0);
+		fill_round(x, y, w, h, 16, mix(mix(WHITE(18), WHITE(40), anim(id, b.hot ? 1.0f : 0)), C_ACCENT, on));
 		if(on < 1)
 			stroke_round(x, y, w, h, 16, 1, mix(WHITE(16), C_ACCENT, on));
 		// Five rising bars show the level at a glance
 		float bars_x = x + w / 2 - 19;
-		for(int bar = 0; bar < 5 && i < PRESET_COUNT; bar++)
+		for(int bar = 0; bar < 5 && is_preset; bar++)
 		{
 			float bh = 3 + bar * 2.5f;
 			fill_round(bars_x + bar * 8, y + 19 - bh, 5, bh, 1.5f, bar <= i ? (selected ? WHITE(255) : WHITE(190)) : WHITE(selected ? 70 : 34));
 		}
-		if(i == PRESET_COUNT)
-			text(ICON_GEAR, ui.icon, x, y + 2, w, 20, selected ? C_TEXT : C_MUTED, 1, 1);
-		text(i < PRESET_COUNT ? names[i] : L"Özel", ui.semi, x, y + 22, w, 24, C_TEXT, 1, 1);
-		text(i < PRESET_COUNT ? subs[i] : L"Ayarlardan seç", ui.small, x, y + 46, w, 20, selected ? WHITE(225) : C_MUTED, 1, 1);
+		if(!is_preset)
+			text(i < 0 ? ICON_VOLUME : ICON_GEAR, ui.icon, x, y + 2, w, 20, selected ? C_TEXT : C_MUTED, 1, 1);
+		text(is_preset ? names[i] : i < 0 ? L"Sadece ses" : L"Özel", ui.semi, x, y + 22, w, 24, C_TEXT, 1, 1);
+		text(is_preset ? subs[i] : i < 0 ? L"Görüntü yok" : L"Ayarlardan seç", ui.small, x, y + 46, w, 20, selected ? WHITE(225) : C_MUTED, 1, 1);
 		if(mouse_in(x, y, w, h))
-			ui.tip = L"Görüntü kalitesi. Sadece ses modunu etkilemez.";
+			ui.tip = i < 0 ? L"Görüntüyü kapatır, sadece oyunun sesi gelir." : is_preset ? L"Görüntü kalitesi. Sadece ses açıkken basarsan görüntü de açılır." : L"Görüntü kalitesini kendin seç.";
 		if(b.click)
 		{
-			if(i == PRESET_COUNT)
+			if(i < 0)
+			{
+				if(!g.want_audio)
+					toggle(UI_AUDIO);
+				if(g.want_audio && g.want_video)
+				{
+					g.want_video = 0;
+					SetEvent(g.wake);
+				}
+			}
+			else if(i == PRESET_COUNT)
 			{
 				ui.advanced = true;
 				show_page(PAGE_SETTINGS);
@@ -708,6 +720,8 @@ static void page_play(void)
 				s.kbps = presets[i].kbps;
 				s.h265 = presets[i].h265;
 				settings_commit(&s);
+				if(audio_only)
+					toggle(UI_VIDEO);
 			}
 		}
 	}
@@ -1931,6 +1945,15 @@ static DWORD WINAPI ui_test_main(void *arg)
 	Sleep(2600);
 	test_log_status("video on");
 	test_shot(dir, L"play_both");
+	test_click(UI_AUDIO_ONLY);
+	CHIAKI_LOGI(&g.log, "[audio only tile] audio=%ld video=%ld", (long)g.want_audio, (long)g.want_video);
+	Sleep(2600);
+	test_log_status("audio only");
+	test_shot(dir, L"play_audio_only");
+	test_click(UI_PRESET0 + 1);
+	CHIAKI_LOGI(&g.log, "[preset during audio only] audio=%ld video=%ld kbps=%d", (long)g.want_audio, (long)g.want_video, settings_get().kbps);
+	Sleep(2600);
+	test_log_status("video back on");
 	if(GetEnvironmentVariableW(L"PSSTREAM_TEST_WEAK", NULL, 0))
 	{
 		Sleep(800);
