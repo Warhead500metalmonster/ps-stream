@@ -499,6 +499,17 @@ static void toggle(int which)
 	SetEvent(g.wake);
 }
 
+static void audio_only_select(void)
+{
+	if(!g.want_audio)
+		toggle(UI_AUDIO);
+	if(g.want_audio && g.want_video)
+	{
+		g.want_video = 0;
+		SetEvent(g.wake);
+	}
+}
+
 static void mute_toggle(void)
 {
 	g.muted = !g.muted;
@@ -699,15 +710,7 @@ static void page_play(void)
 		if(b.click)
 		{
 			if(i < 0)
-			{
-				if(!g.want_audio)
-					toggle(UI_AUDIO);
-				if(g.want_audio && g.want_video)
-				{
-					g.want_video = 0;
-					SetEvent(g.wake);
-				}
-			}
+				audio_only_select();
 			else if(i == PRESET_COUNT)
 			{
 				ui.advanced = true;
@@ -1199,18 +1202,24 @@ static void status_bar(void)
 		if(pill_button(UI_WAKE, L"PS5'i uyandır", x + w - 164, y + 7, 154, 34, true, true))
 			CloseHandle(CreateThread(NULL, 0, ps5_wake_thread, NULL, 0, NULL));
 	}
-	else if(ui.weak && g.want_video && preset_lower(&current) >= 0)
+	else if(ui.weak && g.want_video)
 	{
 		tw -= 170;
-		if(pill_button(UI_LOWER, L"Kaliteyi düşür", x + w - 164, y + 7, 154, 34, true, true))
+		int lower = preset_lower(&current); // Below the lowest quality, only dropping the video is left
+		if(pill_button(UI_LOWER, lower >= 0 ? L"Kaliteyi düşür" : L"Sadece ses", x + w - 164, y + 7, 154, 34, true, true))
 		{
-			const Preset *p = &presets[preset_lower(&current)];
-			current.res = p->res;
-			current.fps = p->fps;
-			current.kbps = p->kbps;
-			current.h265 = p->h265;
 			ui.weak = false;
-			settings_commit(&current);
+			if(lower < 0)
+				audio_only_select();
+			else
+			{
+				const Preset *p = &presets[lower];
+				current.res = p->res;
+				current.fps = p->fps;
+				current.kbps = p->kbps;
+				current.h265 = p->h265;
+				settings_commit(&current);
+			}
 		}
 	}
 	else if(g.update_ready)
@@ -1966,6 +1975,15 @@ static DWORD WINAPI ui_test_main(void *arg)
 		test_click(UI_LOWER);
 		Settings after = settings_get();
 		CHIAKI_LOGI(&g.log, "[lower quality] kbps %d to %d, weak=%d", before.kbps, after.kbps, ui.weak);
+		Sleep(2600);
+		ui.weak = true; // Now at the lowest quality, so the button offers audio only
+		Sleep(100);
+		test_shot(dir, L"play_weak_lowest");
+		test_click(UI_LOWER);
+		Sleep(200);
+		CHIAKI_LOGI(&g.log, "[weak at lowest] audio=%ld video=%ld weak=%d kbps=%d", (long)g.want_audio, (long)g.want_video, ui.weak, settings_get().kbps);
+		Sleep(2600);
+		test_click(UI_VIDEO);
 		Sleep(2600);
 	}
 	test_click(UI_PRESET0 + 3);
