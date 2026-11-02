@@ -44,6 +44,7 @@
 #define ICON_INFO L"\uE946"
 #define ICON_VOLUME L"\uE995"
 #define ICON_MUTED L"\uE74F"
+#define ICON_GAMEPAD L"\uE7FC"
 #define ICON_STEP_FIND L"\uE721"
 #define ICON_STEP_ACCOUNT L"\uE77B"
 #define ICON_STEP_CODE L"\uE8D7"
@@ -849,7 +850,9 @@ static void page_settings_simple(void)
 	y += 58;
 	swprintf(t, 64, L"PS Stream v%hs", APP_VERSION);
 	text(t, ui.semi, x, y, 150, 34, C_MUTED, 0, 1);
-	if(pill_button(UI_OPEN_REPO, L"GitHub", x + w - 114, y, 114, 34, false, true))
+	if(pill_button(UI_OPEN_LOGS, L"Kayıtları aç", x + w - 228, y, 110, 34, false, true))
+		data_folder_open();
+	if(pill_button(UI_OPEN_REPO, L"GitHub", x + w - 110, y, 110, 34, false, true))
 		ShellExecuteW(NULL, L"open", REPO_URL, NULL, NULL, SW_SHOWNORMAL);
 
 	// Nothing here reconnects the stream, so there's no reason to ask for an Apply press
@@ -1139,6 +1142,16 @@ static void top_bar(void)
 		ui.tip = address_tip;
 	}
 	text(host, ui.body, px + 34, y, pw - 44, h, C_TEXT, 0, 1);
+	bool pad_on;
+	EnterCriticalSection(&g.lock);
+	pad_on = g.pad_name[0] != 0;
+	LeaveCriticalSection(&g.lock);
+	if(pad_on)
+	{
+		text(ICON_GAMEPAD, ui.icon, px + pw - 40, y, 28, h, C_GREEN, 1, 1);
+		if(mouse_in(px + pw - 40, y, 28, h))
+			ui.tip = L"Gamepad bağlı";
+	}
 }
 
 static void status_bar(void)
@@ -1568,7 +1581,11 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 				if(ui.rect_set[i] && mouse_in(ui.rects[i].X, ui.rects[i].Y, ui.rects[i].Width, ui.rects[i].Height))
 					hot = i;
 			// Settings tips follow the mouse between rows, so that page always redraws
-			if(hot != ui.hot_id || ui.active || ui.page == PAGE_SETTINGS)
+			static DWORD last_tip_frame;
+			bool tip_due = ui.page == PAGE_SETTINGS && GetTickCount() - last_tip_frame >= 33;
+			if(tip_due)
+				last_tip_frame = GetTickCount();
+			if(hot != ui.hot_id || ui.active || tip_due)
 				ui_frame();
 			return 0;
 		}
@@ -2037,10 +2054,18 @@ static DWORD WINAPI demo_main(void *arg)
 }
 #endif
 
+// A crash leaves no trace otherwise, and the log is the first thing to look at
+static LONG WINAPI crash_log(EXCEPTION_POINTERS *info)
+{
+	CHIAKI_LOGE(&g.log, "Crash: code %#lx at %p", info->ExceptionRecord->ExceptionCode, info->ExceptionRecord->ExceptionAddress);
+	return EXCEPTION_CONTINUE_SEARCH;
+}
+
 int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmd, int show)
 {
 	(void)prev;
 	(void)cmd;
+	SetUnhandledExceptionFilter(crash_log);
 	InitializeCriticalSection(&g.lock);
 	InitializeCriticalSection(&g.pad_lock);
 	InitializeCriticalSection(&g.sdl_lock);
