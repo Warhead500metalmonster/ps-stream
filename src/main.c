@@ -44,7 +44,8 @@
 
 // Below this rate we are outside what chiaki-ng offers, so a console that refuses to start
 // gets a second try with it.
-#define APP_VERSION "0.1.10"
+#define APP_VERSION "0.1.11"
+#define UPDATE_RECHECK_MS (6 * 60 * 60 * 1000)
 #define UPDATE_DOWNLOAD_PREFIX "https://github.com/Warhead500metalmonster/ps-stream/releases/download/"
 #define RELEASES_URL L"https://github.com/Warhead500metalmonster/ps-stream/releases/latest"
 #define REPO_URL L"https://github.com/Warhead500metalmonster/ps-stream"
@@ -119,16 +120,15 @@ typedef struct {
 } Settings;
 
 typedef struct {
-	const wchar_t *name;
 	int res, fps, kbps, h265;
 } Preset;
 
 static const Preset presets[] = {
-	{ L"En düşük - 360p 30 FPS, 0,5 Mbps", 1, 30, 500, 0 },
-	{ L"Düşük - 360p 30 FPS, 2 Mbps", 1, 30, 2000, 0 },
-	{ L"Dengeli - 720p 30 FPS, 6 Mbps", 3, 30, 6000, 0 },
-	{ L"Yüksek - 1080p 60 FPS, 20 Mbps", 4, 60, 20000, 0 },
-	{ L"En yüksek - 1080p 60 FPS, H.265, 50 Mbps", 4, 60, 50000, 1 },
+	{ 1, 30, 500, 0 },
+	{ 1, 30, 2000, 0 },
+	{ 3, 30, 6000, 0 },
+	{ 4, 60, 20000, 0 },
+	{ 4, 60, 50000, 1 },
 };
 #define PRESET_COUNT ((int)(sizeof(presets) / sizeof(presets[0])))
 #define PRESET_DEFAULT 2
@@ -212,6 +212,18 @@ static void set_status(const wchar_t *text)
 		PostMessageW(g.hwnd, WM_APP_STATUS, 0, 0);
 }
 
+// A healthy connection repeats these every second, which fills the log until the moment that matters
+// no longer fits, and the session ID doesn't belong in a file people send around.
+static bool log_is_noise(const char *msg)
+{
+	static const char *const noise[] = { "CTRL RECEIVED", "CTRL SEND", "offset 0  1", "Ctrl received Heartbeat", "Senkusha sending Ping", "Senkusha received Pong", "Ctrl received valid Session Id" };
+	for(size_t i = 0; i < sizeof(noise) / sizeof(noise[0]); i++)
+		if(strstr(msg, noise[i]))
+			return true;
+	// The rows of a hex dump: an offset, then bytes
+	return msg[0] == ' ' && strspn(msg, " 0123456789abcdef") >= 8;
+}
+
 static void log_cb(ChiakiLogLevel level, const char *msg, void *user)
 {
 	// The library only reports that pairing failed. An answer from the PS5 means the code was
@@ -221,7 +233,7 @@ static void log_cb(ChiakiLogLevel level, const char *msg, void *user)
 	(void)level;
 	(void)user;
 	static long written;
-	if(!g.log_file || written > LOG_MAX_BYTES)
+	if(!g.log_file || written > LOG_MAX_BYTES || log_is_noise(msg))
 		return;
 	SYSTEMTIME t;
 	GetLocalTime(&t);
@@ -360,7 +372,7 @@ static void audio_frame_cb(int16_t *buf, size_t samples_count, void *user)
 			buf = g.volume_buf;
 		}
 		for(size_t frame = 0; frame < samples_count && g.audio_fade_pos < fade_frames; frame++, g.audio_fade_pos++)
-			for(int c = 0; c < g.audio_channels; c++)
+			for(uint32_t c = 0; c < g.audio_channels; c++)
 				buf[frame * g.audio_channels + c] = (int16_t)(buf[frame * g.audio_channels + c] * g.audio_fade_pos / fade_frames);
 	}
 	SDL_QueueAudio(g.audio_dev, buf, (Uint32)(count * sizeof(int16_t)));

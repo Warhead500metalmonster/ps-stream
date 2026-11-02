@@ -11,6 +11,7 @@
 
 #define UI_W 920
 #define WEAK_WINDOW_MS 30000
+#define TIMER_UPDATE_RECHECK 4
 #define WEAK_LOST_FRAMES 30
 #define WEAK_DROPOUTS 3
 #define WEAK_REPEAT_MS 300000
@@ -60,7 +61,7 @@ static struct {
 	bool anim_set[UI_MAX * 2], animating;
 	double anim_last;
 	int timer_ticks;
-	bool details, advanced, was_live, weak;
+	bool details, advanced, was_live, weak, volume_unsaved;
 	int weak_lost, weak_drops;
 	DWORD weak_checked_at, weak_shown_at;
 	HICON logo;
@@ -466,7 +467,7 @@ static void volume_set(int volume)
 	g.settings.volume = volume;
 	LeaveCriticalSection(&g.lock);
 	ui.draft.volume = volume;
-	config_set_int("volume", volume);
+	ui.volume_unsaved = true; // Dragging changes it many times a second, so it's saved on release
 }
 
 static void toggle(int which)
@@ -867,7 +868,7 @@ static void page_settings(void)
 	switch_row(UI_WINSTART, L"Windows ile başlat", L"Bilgisayar açılınca uygulama saatin yanında küçük olarak başlar.", x, y, col, &d->win_start);
 	switch_row(UI_TRAY, L"Tepsiye küçült", L"Küçültünce görev çubuğunda yer kaplamaz, saatin yanındaki simgede durur.", x2, y, col, &d->tray);
 	y += 40;
-	switch_row(UI_UPDATES, L"Güncelleme denetle", L"Açılışta GitHub'dan son sürüm numarasını sorar. Hakkında bilgi göndermez, kendisi indirmez.", x, y, col, &d->update_check);
+	switch_row(UI_UPDATES, L"Güncelleme denetle", L"Açılışta GitHub'dan son sürüm numarasını sorar. Sen Güncelle'ye basmadan hiçbir şey indirmez.", x, y, col, &d->update_check);
 
 	x = rx + 20;
 	cx = rx + 150;
@@ -1421,6 +1422,12 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 				tray_menu();
 			return 0;
 		case WM_TIMER:
+			if(wp == TIMER_UPDATE_RECHECK)
+			{
+				if(settings_get().update_check && !g.update_ready)
+					CloseHandle(CreateThread(NULL, 0, update_check_main, NULL, 0, NULL));
+				return 0;
+			}
 			if(wp == 1)
 				connection_watch();
 			if(wp == 2)
@@ -1525,6 +1532,11 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 			ui_frame();
 			return 0;
 		case WM_LBUTTONUP:
+			if(ui.volume_unsaved)
+			{
+				ui.volume_unsaved = false;
+				config_set_int("volume", settings_get().volume);
+			}
 			ui.mx = (float)(short)LOWORD(lp);
 			ui.my = (float)(short)HIWORD(lp);
 			ReleaseCapture();
@@ -1617,7 +1629,7 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 #endif
 		case WM_DESTROY:
 		{
-			WINDOWPLACEMENT place = { sizeof(place) };
+			WINDOWPLACEMENT place = { .length = sizeof(place) };
 			if(GetWindowPlacement(hwnd, &place))
 			{
 				config_set_int("win_x", place.rcNormalPosition.left);
@@ -1738,6 +1750,7 @@ static void ui_create(HINSTANCE inst)
 	ui.draft = g.settings;
 	ui.mx = ui.my = -1;
 	SetTimer(g.hwnd, 1, 500, NULL);
+	SetTimer(g.hwnd, TIMER_UPDATE_RECHECK, UPDATE_RECHECK_MS, NULL);
 }
 
 #ifdef PSSTREAM_TEST
@@ -1826,6 +1839,13 @@ static DWORD WINAPI ui_test_main(void *arg)
 	Sleep(800);
 	test_log_status("audio on");
 	test_shot(dir, L"play_audio");
+	CHIAKI_LOGI(&g.log, "CTRL RECEIVED");
+	CHIAKI_LOGI(&g.log, "offset 0  1  2  3  4  5  6  7  8  9  a  b  c  d  e  f  0123456789abcdef");
+	CHIAKI_LOGI(&g.log, "     0 00 00 00 01 00 05 00 00 4d                      ........M       ");
+	CHIAKI_LOGI(&g.log, "Ctrl received Heartbeat, sending reply");
+	CHIAKI_LOGI(&g.log, "Ctrl received valid Session Id: SECRETTEST");
+	CHIAKI_LOGI(&g.log, "[log check] a normal line stays");
+	CHIAKI_LOGI(&g.log, "[dpi] %d, window %d x %d", g.dpi, S(UI_W), S(UI_H));
 	test_click(UI_MUTE);
 	CHIAKI_LOGI(&g.log, "[mute] muted=%d", (int)g.muted);
 	test_shot(dir, L"play_muted");
@@ -2026,6 +2046,21 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmd, int show)
 	lang_english = strcmp(lang, "en") == 0;
 
 	g.dpi = GetDpiForSystem();
+#ifdef PSSTREAM_TEST
+	wchar_t test_dpi[8];
+	if(GetEnvironmentVariableW(L"PSSTREAM_TEST_DPI", test_dpi, 8))
+		g.dpi = wcstol(test_dpi, NULL, 10);
+#endif
+	// A small laptop at high scaling can't fit the window, and buttons below the screen can't be pressed
+	RECT work, frame = { 0, 0, 100, 100 };
+	SystemParametersInfoW(SPI_GETWORKAREA, 0, &work, 0);
+	AdjustWindowRect(&frame, WS_OVERLAPPED | WS_CAPTION, FALSE);
+	int room_w = (work.right - work.left) - ((frame.right - frame.left) - 100);
+	int room_h = (work.bottom - work.top) - ((frame.bottom - frame.top) - 100);
+	if(S(UI_H) > room_h)
+		g.dpi = MulDiv(g.dpi, room_h, S(UI_H));
+	if(S(UI_W) > room_w)
+		g.dpi = MulDiv(g.dpi, room_w, S(UI_W));
 	g.wake = CreateEventW(NULL, FALSE, FALSE, NULL);
 	g.video_ready = CreateEventW(NULL, TRUE, FALSE, NULL);
 	wcscpy(g.status, g.paired ? L"Kapalı. Başlamak için Ses veya Görüntü'de Aç'a bas" : L"Başlamadan önce PS5'i bir kere eşleştirmen gerekiyor");
