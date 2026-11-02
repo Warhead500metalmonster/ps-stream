@@ -133,6 +133,8 @@ static const wchar_t *const english[][2] = {
 	{ L"Wi-Fi zayıf, ses kesiliyor. Modeme yaklaşmak veya 5 GHz'e geçmek iyi gelir", L"Weak Wi-Fi: audio is cutting out. Moving closer to the router or using 5 GHz helps" },
 	{ L"PS5'e bağlandı", L"Connected to your PS5" },
 	{ L"PS5 bağlantısı koptu, yeniden deneniyor", L"Lost the PS5 connection, trying again" },
+	{ L"Çıkış: %ls", L"Output: %ls" },
+	{ L"Oyun sesinin çıkacağı aygıtı seç", L"Choose where game audio plays" },
 	{ L"KISAYOLLAR", L"HOTKEYS" },
 	{ L"Tıkla, sonra tuş kombinasyonuna bas. Esc iptal eder, Delete kaldırır.", L"Click, then press a key combination. Esc cancels, Delete clears." },
 	{ L"Tuşa bas...", L"Press keys..." },

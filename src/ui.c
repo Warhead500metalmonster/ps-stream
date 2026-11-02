@@ -44,6 +44,9 @@
 #define ICON_INFO L"\uE946"
 #define ICON_VOLUME L"\uE995"
 #define ICON_MUTED L"\uE74F"
+#define ICON_STEP_FIND L"\uE721"
+#define ICON_STEP_ACCOUNT L"\uE77B"
+#define ICON_STEP_CODE L"\uE8D7"
 #define ICON_PLAY L""
 
 enum { UI_NONE, UI_NAV0, UI_NAV1, UI_NAV2, UI_AUDIO, UI_VIDEO, UI_MUTE, UI_LOWER, UI_HK_MUTE, UI_DETAILS, UI_ADVANCED, UI_SIMPLE, UI_APPLY, UI_FIND, UI_LOGIN, UI_ACCOUNT_CLEAR, UI_PAIR, UI_REPAIR,
@@ -52,7 +55,8 @@ enum { UI_NONE, UI_NAV0, UI_NAV1, UI_NAV2, UI_AUDIO, UI_VIDEO, UI_MUTE, UI_LOWER
 
 static struct {
 	GpGraphics *gx;
-	GpFont *small, *body, *semi, *title, *big, *icon, *icon_big;
+	GpFont *small, *body, *semi, *title, *big, *icon, *icon_big, *icon_large, *icon_huge;
+	ARGB slider_fill;
 	GpStringFormat *fmt;
 	HDC back_dc, bg_dc;
 	HBITMAP back_bmp;
@@ -295,7 +299,7 @@ static bool slider(int id, float x, float y, float w, int *value, int min, int m
 	}
 	float t = (float)(*value - min) / (max - min);
 	fill_round(x, y + 12, w, 4, 2, WHITE(45));
-	fill_round(x, y + 12, w * t, 4, 2, C_ACCENT);
+	fill_round(x, y + 12, w * t, 4, 2, ui.slider_fill);
 	float grow = anim(id, b.held || b.hot ? 1.0f : 0) * 2;
 	dot(x + w * t - 8 - grow / 2, y + 6 - grow / 2, 16 + grow, mix(WHITE(230), WHITE(255), grow / 2));
 	return *value != old;
@@ -556,6 +560,7 @@ static void card(int id, float x, float y, float w, float h, ARGB c1, ARGB c2, c
 		GdipSetClipPath(ui.gx, p, CombineModeReplace);
 		wave(ui.gx, dx, dy, dw, dh, 0.38f, 0.12f, 0.70f, 0.30f, WHITE(18));
 		wave(ui.gx, dx, dy, dw, dh, 0.60f, 0.84f, 0.32f, 0.52f, WHITE(20));
+		text(icon, ui.icon_huge, x + w - 200, y + 26, 190, 190, WHITE(30), 1, 1);
 		if(lit == 0)
 		{
 			GpSolidFill *dim;
@@ -580,10 +585,19 @@ static void card(int id, float x, float y, float w, float h, ARGB c1, ARGB c2, c
 	bool connecting = on && !g.connected;
 	bool blink = connecting && (GetTickCount() / 500) % 2;
 	float py = y + h - 76;
-	dot(x + 28, py + 20, 12, !on ? WHITE(110) : connecting ? (blink ? COLOR(110, 251, 191, 36) : C_AMBER) : C_GREEN);
-	text(!on ? L"Kapalı" : connecting ? L"Bağlanıyor" : L"Açık", ui.title, x + 48, py, w - 200, 52, !on ? WHITE(190) : connecting ? C_AMBER : C_GREEN, 0, 1);
-	if(pill_button(id, on ? L"Kapat" : L"Aç", x + w - 146, py, 124, 52, true, true))
+	// On a dark pill, since green and amber are hard to read directly on the coloured card
+	fill_round(x + 20, py + 6, 152, 40, 20, COLOR(95, 0, 0, 0));
+	dot(x + 34, py + 20, 12, !on ? WHITE(110) : connecting ? (blink ? COLOR(110, 251, 191, 36) : C_AMBER) : C_GREEN);
+	text(!on ? L"Kapalı" : connecting ? L"Bağlanıyor" : L"Açık", ui.title, x + 54, py, 116, 52, !on ? WHITE(210) : connecting ? C_AMBER : C_GREEN, 0, 1);
+	// The button to start stands out; the one to stop doesn't need to
+	if(pill_button(id, on ? L"Kapat" : L"Aç", x + w - 146, py, 124, 52, !on, true))
 		toggle(id);
+}
+
+static void card_info(float x, float y, float w, const wchar_t *label, ARGB fill)
+{
+	fill_round(x, y, w, 30, 15, fill);
+	text(label, ui.small, x + 14, y, w - 28, 30, WHITE(235), 0, 1);
 }
 
 static void stat_tile(float x, float y, float w, float h, const wchar_t *label, const wchar_t *value, ARGB color)
@@ -597,12 +611,31 @@ static void stat_tile(float x, float y, float w, float h, const wchar_t *label, 
 static void page_play(void)
 {
 	Settings s = settings_get();
+	// The output device can also be chosen from this page, where there's no Apply to press
+	if(strcmp(ui.draft.device, s.device) != 0)
+	{
+		snprintf(s.device, sizeof(s.device), "%s", ui.draft.device);
+		settings_commit(&s);
+	}
 
 	// Without the details row, the cards take its room
 	float extra = anim(UI_NONE + UI_MAX, ui.details ? 0 : 70);
 	float cw = (UI_W - 48 - 16) / 2.0f, cy = 78, ch = 330 + extra;
 	card(UI_AUDIO, 24, cy, cw, ch, COLOR(255, 214, 134, 46), COLOR(255, 110, 58, 24), ICON_AUDIO,
 			L"Ses", L"Oyunun sesini bilgisayardan duy.", g.want_audio != 0);
+
+	wchar_t info[128], device_w[64];
+	wcscpy(device_w, tr(L"Windows varsayılanı"));
+	if(s.device[0])
+		MultiByteToWideChar(CP_UTF8, 0, s.device, -1, device_w, 63);
+	device_w[63] = 0;
+	swprintf(info, 128, tr(L"Çıkış: %ls"), device_w);
+	Hit output = hit(UI_DEVICE, 46, cy + 146, cw - 44, 30);
+	card_info(46, cy + 146, cw - 44, info, COLOR((int)(95 + 45 * anim(UI_DEVICE, output.hot ? 1.0f : 0)), 0, 0, 0));
+	if(output.click)
+		ui.open_device_menu = true;
+	if(mouse_in(46, cy + 146, cw - 44, 30))
+		ui.tip = L"Oyun sesinin çıkacağı aygıtı seç";
 
 	// Volume right on the card, since it's the control people reach for most
 	float vy = cy + ch - 124;
@@ -614,8 +647,10 @@ static void page_play(void)
 	if(mouse_in(40, vy - 2, 32, 32))
 		ui.tip = L"Sesi kısar, bağlantı açık kalır. Kısayol: Gelişmiş ayarlar";
 	int volume = s.volume;
+	ui.slider_fill = WHITE(240); // Blue fights with the orange card
 	if(slider(UI_QUICK_VOLUME, 80, vy, cw - 150, &volume, 0, 200))
 		volume_set(volume);
+	ui.slider_fill = C_ACCENT;
 	wchar_t pct[16];
 	swprintf(pct, 16, tr(L"%%%d"), volume);
 	text(g.muted ? L"Kısık" : pct, ui.semi, cw - 50, vy, 58, 28, g.muted ? C_AMBER : C_TEXT, 2, 1);
@@ -627,6 +662,10 @@ static void page_play(void)
 			L"Görüntü", L"Oyunu bilgisayarda gör.\nDiscord'da \"PS Stream - Görüntü\" penceresini seç.", g.want_video != 0);
 	if(mouse_in(vx, cy, cw, ch - 80))
 		ui.tip = L"Görüntü penceresinde F11 tam ekran yapar.";
+	wchar_t rate[32];
+	bitrate_text(rate, 32, s.kbps);
+	swprintf(info, 128, L"%dp  ·  %d FPS  ·  %ls  ·  %ls", resolutions[s.res].height, s.fps, rate, s.h265 ? L"H.265" : L"H.264");
+	card_info(vx + 22, cy + 146, cw - 44, info, COLOR(95, 0, 0, 0));
 
 	static const wchar_t *const names[] = { L"En düşük", L"Düşük", L"Dengeli", L"Yüksek", L"En yüksek" };
 	static const wchar_t *const subs[] = { L"360p, 0,5 Mbps", L"360p, 2 Mbps", L"720p, 6 Mbps", L"1080p 60, 20 Mbps", L"1080p 60, 50 Mbps" };
@@ -969,6 +1008,10 @@ static void page_pair(void)
 			text(nums[i], ui.title, x + 20, y + 20, 36, 36, C_TEXT, 1, 1);
 		text(titles[i], ui.title, x + 66, y + 20, w - 80, 36, C_TEXT, 0, 1);
 		bool done = i == 2 && paired_view;
+		static const wchar_t *const step_icons[] = { ICON_STEP_FIND, ICON_STEP_ACCOUNT, ICON_STEP_CODE };
+		// The third step's space holds the Cancel button while pairing again
+		if(i != 2 || !g.paired || paired_view)
+			text(done ? ICON_CHECK : step_icons[i], ui.icon_large, x, y + 262, w, 100, steps_done[i] ? COLOR(46, 74, 222, 128) : WHITE(next_step == i ? 46 : 22), 1, 1);
 		text(done ? L"PS5 eşleşti. Bir daha kod girmen gerekmez.\n\nOynat sayfasından Ses veya Görüntü'yü aç, yeterli.\n\nKodu sadece başka bir hesap bağlamak istersen girersin." : bodies[i], ui.body, x + 20, y + 74, w - 40, 284, WHITE(205), 0, 0);
 		if(!done)
 		{
@@ -1014,7 +1057,7 @@ static void page_pair(void)
 	else
 	{
 		// The old pairing keeps working until a new one replaces it, so this can always be undone
-		if(g.paired && pill_button(UI_REPAIR, L"Vazgeç", x2 + 20, by - 56, bw, 46, false, true))
+		if(g.paired && pill_button(UI_REPAIR, L"Vazgeç", x2 + 20, field_y - 56, bw, 46, false, true))
 		{
 			ui.repairing = false;
 			ui.again = true;
@@ -1697,6 +1740,9 @@ static void ui_create(HINSTANCE inst)
 	ui.big = font_make(L"Segoe UI Semibold", 28);
 	ui.icon = font_make(L"Segoe MDL2 Assets", 18);
 	ui.icon_big = font_make(L"Segoe MDL2 Assets", 30);
+	ui.icon_large = font_make(L"Segoe MDL2 Assets", 64);
+	ui.icon_huge = font_make(L"Segoe MDL2 Assets", 120);
+	ui.slider_fill = C_ACCENT;
 	GdipCreateStringFormat(0, LANG_NEUTRAL, &ui.fmt);
 	ui.field_brush = CreateSolidBrush(RGB(43, 45, 51));
 
