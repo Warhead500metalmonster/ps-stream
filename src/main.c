@@ -14,6 +14,7 @@
 
 #include <chiaki/base64.h>
 #include <chiaki/common.h>
+#include <chiaki/controller.h>
 #include <chiaki/discovery.h>
 #include <chiaki/ffmpegdecoder.h>
 #include <chiaki/log.h>
@@ -44,7 +45,7 @@
 
 // Below this rate we are outside what chiaki-ng offers, so a console that refuses to start
 // gets a second try with it.
-#define APP_VERSION "0.1.12"
+#define APP_VERSION "0.1.13"
 #define UPDATE_RECHECK_MS (6 * 60 * 60 * 1000)
 #define UPDATE_DOWNLOAD_PREFIX "https://github.com/Warhead500metalmonster/ps-stream/releases/download/"
 #define RELEASES_URL L"https://github.com/Warhead500metalmonster/ps-stream/releases/latest"
@@ -114,7 +115,7 @@ static const Resolution resolutions[] = {
 typedef struct {
 	int res, fps, kbps, h265, hw;
 	int ao_res, ao_kbps;
-	int volume, buffer_ms, loss_pct, reconnect, no_controller, wifi_opt, autostart_audio, win_start, tray, update_check, auto_wake;
+	int volume, buffer_ms, loss_pct, reconnect, no_controller, wifi_opt, autostart_audio, win_start, tray, update_check, auto_wake, gamepad;
 	int hotkey_audio, hotkey_video, hotkey_mute; // HKM_GETHOTKEY format
 	char device[256]; // empty is the system default
 } Settings;
@@ -170,7 +171,9 @@ static struct {
 	DWORD audio_last_dropout, connected_at;
 	volatile LONG audio_dropouts, video_fps10, video_lost_total, ps5_standby;
 	char update_tag[32];
-	volatile LONG network_changed, regist_rejected, muted;
+	volatile LONG network_changed, regist_rejected, muted, session_live, rumble_new, rumble_left, rumble_right;
+	CRITICAL_SECTION pad_lock, sdl_lock;
+	wchar_t pad_name[64];
 	int regist_tries;
 	volatile LONG update_ready, update_busy, update_failed, update_restart;
 	char update_url[512], update_digest[72];
@@ -412,7 +415,10 @@ static double now_ms(void)
 static DWORD WINAPI video_thread_main(void *arg)
 {
 	(void)arg;
-	if(SDL_InitSubSystem(SDL_INIT_VIDEO) != 0)
+	EnterCriticalSection(&g.sdl_lock);
+	bool video_ok = SDL_InitSubSystem(SDL_INIT_VIDEO) == 0;
+	LeaveCriticalSection(&g.sdl_lock);
+	if(!video_ok)
 	{
 		CHIAKI_LOGE(&g.log, "SDL video failed: %s", SDL_GetError());
 		SetEvent(g.video_ready);
@@ -573,7 +579,9 @@ static DWORD WINAPI video_thread_main(void *arg)
 		}
 		SDL_DestroyWindow(window);
 	}
+	EnterCriticalSection(&g.sdl_lock);
 	SDL_QuitSubSystem(SDL_INIT_VIDEO);
+	LeaveCriticalSection(&g.sdl_lock);
 	return 0;
 }
 
@@ -604,6 +612,304 @@ static void video_stop(void)
 	chiaki_ffmpeg_decoder_fini(&g.decoder);
 }
 
+// ---------- gamepad ----------
+
+#define PAD_MAX 8
+#define PAD_POLL_MS 4
+#define PAD_IDLE_POLL_MS 100
+#define PAD_CHORD_DELAY_MS 120
+#define PAD_RUMBLE_MS 1000
+#define PAD_MAX_NAME 64
+
+// Pads without a known mapping, mostly older DirectInput ones, usually follow this common layout.
+static void pad_add_generic_mapping(int index)
+{
+	char guid[33], mapping[512];
+	SDL_JoystickGetGUIDString(SDL_JoystickGetDeviceGUID(index), guid, sizeof(guid));
+	const char *name = SDL_JoystickNameForIndex(index);
+	snprintf(mapping, sizeof(mapping), "%s,%s,a:b0,b:b1,x:b2,y:b3,leftshoulder:b4,rightshoulder:b5,back:b6,start:b7,leftstick:b8,rightstick:b9,"
+			"dpup:h0.1,dpright:h0.2,dpdown:h0.4,dpleft:h0.8,leftx:a0,lefty:a1,rightx:a2,righty:a3,", guid, name ? name : "Gamepad");
+	SDL_GameControllerAddMapping(mapping);
+	CHIAKI_LOGI(&g.log, "Gamepad with no known mapping, using the common layout");
+}
+
+static void pad_set_name(const char *name)
+{
+	wchar_t wide[PAD_MAX_NAME];
+	if(!MultiByteToWideChar(CP_UTF8, 0, name, -1, wide, PAD_MAX_NAME))
+		wide[0] = 0;
+	wide[PAD_MAX_NAME - 1] = 0;
+	EnterCriticalSection(&g.lock);
+	bool changed = wcscmp(g.pad_name, wide) != 0;
+	wcscpy(g.pad_name, wide);
+	LeaveCriticalSection(&g.lock);
+	if(!changed)
+		return;
+	CHIAKI_LOGI(&g.log, "Gamepad: %s", name[0] ? name : "none");
+	if(wide[0])
+	{
+		wchar_t text[128];
+		swprintf(text, 128, tr(L"Gamepad bağlandı: %ls"), wide);
+		set_status(text);
+	}
+	else
+		PostMessageW(g.hwnd, WM_APP_STATUS, 0, 0);
+}
+
+static void pad_map_buttons(SDL_GameController *pad, uint32_t *buttons)
+{
+	static const struct { SDL_GameControllerButton from; uint32_t to; } map[] = {
+		// By position on the pad, so Xbox A is the PlayStation cross
+		{ SDL_CONTROLLER_BUTTON_A, CHIAKI_CONTROLLER_BUTTON_CROSS },
+		{ SDL_CONTROLLER_BUTTON_B, CHIAKI_CONTROLLER_BUTTON_MOON },
+		{ SDL_CONTROLLER_BUTTON_X, CHIAKI_CONTROLLER_BUTTON_BOX },
+		{ SDL_CONTROLLER_BUTTON_Y, CHIAKI_CONTROLLER_BUTTON_PYRAMID },
+		{ SDL_CONTROLLER_BUTTON_DPAD_LEFT, CHIAKI_CONTROLLER_BUTTON_DPAD_LEFT },
+		{ SDL_CONTROLLER_BUTTON_DPAD_RIGHT, CHIAKI_CONTROLLER_BUTTON_DPAD_RIGHT },
+		{ SDL_CONTROLLER_BUTTON_DPAD_UP, CHIAKI_CONTROLLER_BUTTON_DPAD_UP },
+		{ SDL_CONTROLLER_BUTTON_DPAD_DOWN, CHIAKI_CONTROLLER_BUTTON_DPAD_DOWN },
+		{ SDL_CONTROLLER_BUTTON_LEFTSHOULDER, CHIAKI_CONTROLLER_BUTTON_L1 },
+		{ SDL_CONTROLLER_BUTTON_RIGHTSHOULDER, CHIAKI_CONTROLLER_BUTTON_R1 },
+		{ SDL_CONTROLLER_BUTTON_LEFTSTICK, CHIAKI_CONTROLLER_BUTTON_L3 },
+		{ SDL_CONTROLLER_BUTTON_RIGHTSTICK, CHIAKI_CONTROLLER_BUTTON_R3 },
+		{ SDL_CONTROLLER_BUTTON_START, CHIAKI_CONTROLLER_BUTTON_OPTIONS },
+		{ SDL_CONTROLLER_BUTTON_BACK, CHIAKI_CONTROLLER_BUTTON_SHARE },
+		{ SDL_CONTROLLER_BUTTON_GUIDE, CHIAKI_CONTROLLER_BUTTON_PS },
+		{ SDL_CONTROLLER_BUTTON_TOUCHPAD, CHIAKI_CONTROLLER_BUTTON_TOUCHPAD },
+		{ SDL_CONTROLLER_BUTTON_MISC1, CHIAKI_CONTROLLER_BUTTON_SHARE },
+	};
+	for(size_t i = 0; i < sizeof(map) / sizeof(map[0]); i++)
+		if(SDL_GameControllerGetButton(pad, map[i].from))
+			*buttons |= map[i].to;
+}
+
+static int16_t pad_stronger(int16_t a, int b)
+{
+	if(b > 32767)
+		b = 32767;
+	if(b < -32767)
+		b = -32767;
+	return abs(b) > abs(a) ? (int16_t)b : a;
+}
+
+// Xbox pads hide their guide button from programs, and most have no touchpad, so button pairs stand in:
+// Back + Start is the PS button, and Back + Y is the touchpad. The pair's single buttons wait a moment,
+// so pressing a pair doesn't also press Share or Options.
+static void pad_apply_chords(uint32_t *buttons)
+{
+	static DWORD held_since;
+	static bool held;
+	const uint32_t back = CHIAKI_CONTROLLER_BUTTON_SHARE, start = CHIAKI_CONTROLLER_BUTTON_OPTIONS, y = CHIAKI_CONTROLLER_BUTTON_PYRAMID;
+	if((*buttons & back) && (*buttons & start))
+	{
+		*buttons = (*buttons & ~(back | start)) | CHIAKI_CONTROLLER_BUTTON_PS;
+		held = false;
+		return;
+	}
+	if((*buttons & back) && (*buttons & y))
+	{
+		*buttons = (*buttons & ~(back | y)) | CHIAKI_CONTROLLER_BUTTON_TOUCHPAD;
+		held = false;
+		return;
+	}
+	if(!(*buttons & (back | start)))
+	{
+		held = false;
+		return;
+	}
+	if(!held)
+	{
+		held = true;
+		held_since = GetTickCount();
+	}
+	if(GetTickCount() - held_since < PAD_CHORD_DELAY_MS)
+		*buttons &= ~(back | start);
+}
+
+#ifdef PSSTREAM_TEST
+// Plays a fixed set of inputs on a virtual pad, so all of this runs without one plugged in.
+static void pad_test_script(void)
+{
+	static SDL_Joystick *virtual_pad;
+	static DWORD started;
+	static int step;
+	char kind[16];
+	if(!GetEnvironmentVariableA("PSSTREAM_TEST_PAD", kind, sizeof(kind)) || step > 6)
+		return;
+	bool generic = strcmp(kind, "generic") == 0;
+	if(!virtual_pad && !started)
+	{
+		int index = SDL_JoystickAttachVirtual(generic ? SDL_JOYSTICK_TYPE_UNKNOWN : SDL_JOYSTICK_TYPE_GAMECONTROLLER, 6, 15, 1);
+		CHIAKI_LOGI(&g.log, "[pad test] virtual pad index %d: %s", index, index < 0 ? SDL_GetError() : "ok");
+		started = GetTickCount();
+		return;
+	}
+	if(!virtual_pad)
+	{
+		if(GetTickCount() - started < 800)
+			return;
+		for(int i = 0; i < SDL_NumJoysticks() && !virtual_pad; i++)
+			if(SDL_JoystickIsVirtual(i))
+				virtual_pad = SDL_JoystickFromInstanceID(SDL_JoystickGetDeviceInstanceID(i));
+		started = GetTickCount();
+		return;
+	}
+	if(GetTickCount() - started < 500u * (step + 1) || !g.connected)
+		return;
+	CHIAKI_LOGI(&g.log, "[pad test] step %d", step);
+	// Buttons in a virtual pad follow SDL's order: 0 A, 4 back, 6 start, 3 Y; axes 0 left x, 4 left trigger
+	bool common = generic;
+	int a = 0, back = common ? 6 : 4, start = common ? 7 : 6;
+	if(step == 0)
+		SDL_JoystickSetVirtualButton(virtual_pad, a, 1);
+	if(step == 1)
+	{
+		SDL_JoystickSetVirtualButton(virtual_pad, a, 0);
+		SDL_JoystickSetVirtualAxis(virtual_pad, 0, 20000);
+		if(!common)
+			SDL_JoystickSetVirtualAxis(virtual_pad, 4, 32767);
+	}
+	if(step == 2)
+	{
+		SDL_JoystickSetVirtualAxis(virtual_pad, 0, 0);
+		if(!common)
+			SDL_JoystickSetVirtualAxis(virtual_pad, 4, -32768);
+		SDL_JoystickSetVirtualButton(virtual_pad, back, 1);
+		SDL_JoystickSetVirtualButton(virtual_pad, start, 1);
+	}
+	if(step == 3)
+	{
+		SDL_JoystickSetVirtualButton(virtual_pad, back, 0);
+		SDL_JoystickSetVirtualButton(virtual_pad, start, 0);
+	}
+	if(step == 4)
+		SDL_JoystickSetVirtualButton(virtual_pad, start, 1);
+	if(step == 5)
+		SDL_JoystickSetVirtualButton(virtual_pad, start, 0);
+	step++;
+}
+#endif
+
+static DWORD WINAPI gamepad_main(void *arg)
+{
+	(void)arg;
+	SDL_GameController *pads[PAD_MAX] = { 0 };
+	bool sdl_on = false;
+	while(!g.quit)
+	{
+		if(!settings_get().gamepad)
+		{
+			if(sdl_on)
+			{
+				for(int i = 0; i < PAD_MAX; i++)
+					if(pads[i])
+						SDL_GameControllerClose(pads[i]);
+				memset(pads, 0, sizeof(pads));
+				EnterCriticalSection(&g.sdl_lock);
+				SDL_QuitSubSystem(SDL_INIT_GAMECONTROLLER);
+				LeaveCriticalSection(&g.sdl_lock);
+				sdl_on = false;
+				pad_set_name("");
+			}
+			Sleep(250);
+			continue;
+		}
+		if(!sdl_on)
+		{
+			// Without this, the pad stops reporting whenever another window has focus, like the game on the TV
+			SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");
+			// XInput, DirectInput and HIDAPI cover every pad. This one adds about 150 MB and nothing else
+			SDL_SetHint(SDL_HINT_JOYSTICK_WGI, "0");
+			EnterCriticalSection(&g.sdl_lock);
+			bool ok = SDL_InitSubSystem(SDL_INIT_GAMECONTROLLER) == 0;
+			LeaveCriticalSection(&g.sdl_lock);
+			if(!ok)
+			{
+				CHIAKI_LOGE(&g.log, "SDL gamepad failed: %s", SDL_GetError());
+				Sleep(2000);
+				continue;
+			}
+			// State is read directly, so nothing would ever empty the event queue
+			SDL_JoystickEventState(SDL_IGNORE);
+			SDL_GameControllerEventState(SDL_IGNORE);
+			sdl_on = true;
+		}
+		SDL_GameControllerUpdate();
+#ifdef PSSTREAM_TEST
+		pad_test_script();
+#endif
+
+		for(int i = 0; i < PAD_MAX; i++)
+			if(pads[i] && !SDL_GameControllerGetAttached(pads[i]))
+			{
+				SDL_GameControllerClose(pads[i]);
+				pads[i] = NULL;
+			}
+		for(int index = 0; index < SDL_NumJoysticks(); index++)
+		{
+			SDL_JoystickID id = SDL_JoystickGetDeviceInstanceID(index);
+			bool known = false;
+			for(int i = 0; i < PAD_MAX; i++)
+				known = known || (pads[i] && SDL_JoystickInstanceID(SDL_GameControllerGetJoystick(pads[i])) == id);
+			if(known)
+				continue;
+			if(!SDL_IsGameController(index))
+				pad_add_generic_mapping(index);
+			for(int i = 0; i < PAD_MAX; i++)
+				if(!pads[i])
+				{
+					pads[i] = SDL_GameControllerOpen(index);
+					break;
+				}
+		}
+
+		// Everything plugged in acts as one controller. A pad can show up twice through remapping
+		// tools like DS4Windows, and this way it doesn't matter which copy answers.
+		ChiakiControllerState state;
+		chiaki_controller_state_set_idle(&state);
+		const char *name = "";
+		for(int i = 0; i < PAD_MAX; i++)
+		{
+			SDL_GameController *pad = pads[i];
+			if(!pad)
+				continue;
+			if(!name[0])
+				name = SDL_GameControllerName(pad) ? SDL_GameControllerName(pad) : "Gamepad";
+			pad_map_buttons(pad, &state.buttons);
+			int l2 = SDL_GameControllerGetAxis(pad, SDL_CONTROLLER_AXIS_TRIGGERLEFT) >> 7;
+			int r2 = SDL_GameControllerGetAxis(pad, SDL_CONTROLLER_AXIS_TRIGGERRIGHT) >> 7;
+			state.l2_state = l2 > state.l2_state ? (uint8_t)l2 : state.l2_state;
+			state.r2_state = r2 > state.r2_state ? (uint8_t)r2 : state.r2_state;
+			state.left_x = pad_stronger(state.left_x, SDL_GameControllerGetAxis(pad, SDL_CONTROLLER_AXIS_LEFTX));
+			state.left_y = pad_stronger(state.left_y, SDL_GameControllerGetAxis(pad, SDL_CONTROLLER_AXIS_LEFTY));
+			state.right_x = pad_stronger(state.right_x, SDL_GameControllerGetAxis(pad, SDL_CONTROLLER_AXIS_RIGHTX));
+			state.right_y = pad_stronger(state.right_y, SDL_GameControllerGetAxis(pad, SDL_CONTROLLER_AXIS_RIGHTY));
+		}
+		pad_apply_chords(&state.buttons);
+		pad_set_name(name);
+
+		if(InterlockedExchange(&g.rumble_new, 0))
+			for(int i = 0; i < PAD_MAX; i++)
+				if(pads[i])
+					SDL_GameControllerRumble(pads[i], (Uint16)(g.rumble_left * 257), (Uint16)(g.rumble_right * 257), PAD_RUMBLE_MS);
+
+		// The session can end at any moment, and the library rejects a repeat of the same state itself
+		bool live = false;
+		EnterCriticalSection(&g.pad_lock);
+		if(g.session_live && g.connected)
+		{
+			chiaki_session_set_controller_state(&g.session, &state);
+			live = true;
+		}
+		LeaveCriticalSection(&g.pad_lock);
+		SDL_Delay(live ? PAD_POLL_MS : PAD_IDLE_POLL_MS);
+	}
+	for(int i = 0; i < PAD_MAX; i++)
+		if(pads[i])
+			SDL_GameControllerClose(pads[i]);
+	return 0;
+}
+
 // ---------- session ----------
 
 static void session_event_cb(ChiakiEvent *event, void *user)
@@ -622,6 +928,11 @@ static void session_event_cb(ChiakiEvent *event, void *user)
 			set_status(L"PS5'te Remote Play giriş şifresi açık, kapatıp tekrar dene");
 			g.ended = 1;
 			SetEvent(g.wake);
+			break;
+		case CHIAKI_EVENT_RUMBLE:
+			g.rumble_left = event->rumble.left;
+			g.rumble_right = event->rumble.right;
+			g.rumble_new = 1;
 			break;
 		case CHIAKI_EVENT_QUIT:
 			g.quit_reason = event->quit.reason;
@@ -675,7 +986,8 @@ static bool session_start(bool video, const Settings *s, bool safe)
 	info.video_profile_auto_downgrade = true;
 	info.packet_loss_max = s->loss_pct / 100.0;
 	info.enable_idr_on_fec_failure = true;
-	info.disable_controller = s->no_controller != 0;
+	// A gamepad on the PC needs the virtual controller the DualSense setting hides
+	info.disable_controller = s->no_controller && !s->gamepad;
 	info.audio_video_disabled = video ? 0 : CHIAKI_VIDEO_DISABLED;
 
 	chiaki_opus_decoder_init(&g.opus, &g.log);
@@ -717,9 +1029,10 @@ static bool session_start(bool video, const Settings *s, bool safe)
 		chiaki_session_fini(&g.session);
 		goto error;
 	}
+	InterlockedExchange(&g.session_live, 1);
 	CHIAKI_LOGI(&g.log, "Session started: %ux%u@%u %u kbps, video %s, controller %s",
 			g.session.connect_info.video_profile.width, g.session.connect_info.video_profile.height,
-			g.session.connect_info.video_profile.max_fps, g.session.connect_info.video_profile.bitrate, video ? "on" : "off", s->no_controller ? "hidden" : "announced");
+			g.session.connect_info.video_profile.max_fps, g.session.connect_info.video_profile.bitrate, video ? "on" : "off", info.disable_controller ? "hidden" : "announced");
 	return true;
 
 error:
@@ -731,6 +1044,9 @@ error:
 
 static void session_stop(bool video)
 {
+	EnterCriticalSection(&g.pad_lock);
+	g.session_live = 0;
+	LeaveCriticalSection(&g.pad_lock);
 	chiaki_session_stop(&g.session);
 	chiaki_session_join(&g.session);
 	chiaki_session_fini(&g.session);
@@ -970,7 +1286,7 @@ static void config_set(const char *key, const char *value);
 
 static bool stream_changed(const Settings *a, const Settings *b, bool video)
 {
-	if(a->loss_pct != b->loss_pct || a->no_controller != b->no_controller)
+	if(a->loss_pct != b->loss_pct || a->no_controller != b->no_controller || a->gamepad != b->gamepad)
 		return true;
 	if(!video)
 		return a->ao_res != b->ao_res || a->ao_kbps != b->ao_kbps;
@@ -1320,6 +1636,7 @@ static void config_load(void)
 	s->loss_pct = config_int("loss_pct", 5, 1, 20);
 	s->reconnect = config_int("reconnect", 1, 0, 1);
 	s->no_controller = config_int("no_controller", 1, 0, 1);
+	s->gamepad = config_int("gamepad", 0, 0, 1);
 	s->wifi_opt = config_int("wifi_opt", 1, 0, 1);
 	s->autostart_audio = config_int("autostart_audio", 1, 0, 1);
 	s->win_start = win_start_get();
@@ -1351,6 +1668,7 @@ static void config_save_settings(const Settings *s)
 	config_set_int("loss_pct", s->loss_pct);
 	config_set_int("reconnect", s->reconnect);
 	config_set_int("no_controller", s->no_controller);
+	config_set_int("gamepad", s->gamepad);
 	config_set_int("wifi_opt", s->wifi_opt);
 	config_set_int("autostart_audio", s->autostart_audio);
 	config_set_int("tray", s->tray);

@@ -30,6 +30,7 @@ If you play on a TV and use Discord on your PC, the usual way to get game audio 
 - **Connects by itself.** Checks for the PS5 about once a second and connects as soon as it answers. If the PS5 is in rest mode, the app sends it a wake-up signal. You can turn that off with **Wake PS5** in Settings. It also finds the console again if the router gives it a new address.
 - **Runs in the background.** Minimizes to the tray, can start with Windows, remembers where its windows were, and opening it a second time shows the running copy.
 - **Global hotkeys.** `Ctrl+Alt+F9` for audio, `Ctrl+Alt+F10` for video and `Ctrl+Alt+F8` to mute. You can change them.
+- **Play with any gamepad on your PC.** Turn on **Gamepad on PC** in Settings to play with an Xbox, DirectInput or other pad plugged into your PC. Pads SDL doesn't recognize use a common layout, so some buttons may differ. Back + Start is the PS button, and Back + Y is the touchpad.
 - **Instant mute.** Mute with the speaker icon or the hotkey. The connection stays open, so sound comes right back.
 - **Connection warnings.** The app tells you when Wi-Fi can't keep up and offers to lower the video quality. In the tray, it notifies you when the connection drops or returns.
 - **Turkish and English interface.**
@@ -77,7 +78,7 @@ When you press it, the app downloads the release from GitHub, checks it against 
 - Windows only.
 - Waking the PS5 needs the console's option to turn on over the network, and hasn't been tested on a real console yet.
 - Local network only.
-- No controller input from the PC. The app is for audio and video.
+- Gamepad support is off by default and hasn't been tested on a real console yet. Turning it on announces a controller to the PS5, which can drop a DualSense connected to it. Gyro and the rest of the touchpad aren't supported.
 - The PS5 sends some video even in audio-only mode, so the network use doesn't reach zero.
 - 360p is the lowest resolution. A PS5 refused 144p when tested.
 - Rates below 2 Mbps are outside what chiaki-ng offers. If the console refuses one, the app falls back to 2 Mbps.

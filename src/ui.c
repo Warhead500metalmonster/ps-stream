@@ -50,7 +50,7 @@
 #define ICON_PLAY L""
 
 enum { UI_NONE, UI_NAV0, UI_NAV1, UI_NAV2, UI_AUDIO, UI_VIDEO, UI_MUTE, UI_LOWER, UI_HK_MUTE, UI_DETAILS, UI_ADVANCED, UI_SIMPLE, UI_APPLY, UI_FIND, UI_LOGIN, UI_ACCOUNT_CLEAR, UI_PAIR, UI_REPAIR,
-	UI_DEVICE, UI_HK_AUDIO, UI_HK_VIDEO, UI_HW, UI_RECONNECT, UI_CONTROLLER, UI_WIFI, UI_AUTOSTART, UI_AUTOWAKE, UI_WINSTART, UI_TRAY, UI_UPDATES, UI_QUICK_VOLUME, UI_WAKE, UI_UPDATE_NOW, UI_OPEN_LOGS, UI_OPEN_REPO, UI_BITRATE, UI_AO_BITRATE, UI_VOLUME, UI_BUFFER, UI_LOSS,
+	UI_DEVICE, UI_HK_AUDIO, UI_HK_VIDEO, UI_HW, UI_RECONNECT, UI_CONTROLLER, UI_WIFI, UI_AUTOSTART, UI_AUTOWAKE, UI_GAMEPAD, UI_WINSTART, UI_TRAY, UI_UPDATES, UI_QUICK_VOLUME, UI_WAKE, UI_UPDATE_NOW, UI_OPEN_LOGS, UI_OPEN_REPO, UI_BITRATE, UI_AO_BITRATE, UI_VOLUME, UI_BUFFER, UI_LOSS,
 	UI_PRESET0 = 46, UI_RES0 = 52, UI_FPS0 = 60, UI_CODEC0 = 65, UI_AORES0 = 70, UI_LANG0 = 80, UI_MAX = 96 };
 
 static struct {
@@ -766,7 +766,7 @@ static bool settings_dirty(const Settings *a, const Settings *b)
 	return a->res != b->res || a->fps != b->fps || a->kbps != b->kbps || a->h265 != b->h265 || a->hw != b->hw
 		|| a->ao_res != b->ao_res || a->ao_kbps != b->ao_kbps || a->loss_pct != b->loss_pct
 		|| a->no_controller != b->no_controller || a->wifi_opt != b->wifi_opt || a->autostart_audio != b->autostart_audio
-		|| a->win_start != b->win_start || a->tray != b->tray || a->update_check != b->update_check || a->auto_wake != b->auto_wake
+		|| a->win_start != b->win_start || a->tray != b->tray || a->update_check != b->update_check || a->auto_wake != b->auto_wake || a->gamepad != b->gamepad
 		|| a->reconnect != b->reconnect || a->hotkey_audio != b->hotkey_audio || a->hotkey_video != b->hotkey_video || a->hotkey_mute != b->hotkey_mute
 		|| strcmp(a->device, b->device) != 0;
 }
@@ -814,6 +814,19 @@ static void page_settings_simple(void)
 	text(t, ui.semi, x + w - 64, y + 32, 64, 28, C_TEXT, 2, 1);
 	y += 86;
 	plain_switch(UI_AUTOSTART, L"Açılışta ses", L"Uygulama açılınca ses başlasın", x, y, w, &d->autostart_audio);
+	y += 66;
+	wchar_t pad_hint[96];
+	EnterCriticalSection(&g.lock);
+	if(!d->gamepad)
+		wcscpy(pad_hint, tr(L"Xbox veya başka bir kolla PS5'i oyna"));
+	else if(g.pad_name[0])
+		swprintf(pad_hint, 96, tr(L"Bağlı: %ls"), g.pad_name);
+	else
+		wcscpy(pad_hint, tr(L"Kol bulunamadı, kolu bilgisayara tak"));
+	LeaveCriticalSection(&g.lock);
+	plain_switch(UI_GAMEPAD, L"PC'deki gamepad", pad_hint, x, y, w, &d->gamepad);
+	if(mouse_in(x, y, w, 50))
+		ui.tip = L"Açılınca PS5'e kumanda bildirilir, DualSense'in düşebilir. Back+Start PS tuşu, Back+Y dokunmatik yüzeydir";
 	y += 66;
 	plain_switch(UI_AUTOWAKE, L"PS5'i uyandır", L"Bağlanırken PS5 uykudaysa açılsın", x, y, w, &d->auto_wake);
 
@@ -2029,6 +2042,8 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmd, int show)
 	(void)prev;
 	(void)cmd;
 	InitializeCriticalSection(&g.lock);
+	InitializeCriticalSection(&g.pad_lock);
+	InitializeCriticalSection(&g.sdl_lock);
 	SetPriorityClass(GetCurrentProcess(), ABOVE_NORMAL_PRIORITY_CLASS);
 
 	int argc = 0;
@@ -2140,6 +2155,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmd, int show)
 #endif
 	(void)test_thread;
 	HANDLE worker = CreateThread(NULL, 0, thread_main, thread_arg, 0, NULL);
+	HANDLE gamepad_thread = CreateThread(NULL, 0, gamepad_main, NULL, 0, NULL);
 	bool autostart = !g.test_hidden;
 #ifdef PSSTREAM_TEST
 	autostart = autostart || GetEnvironmentVariableW(L"PSSTREAM_TEST_AUTOSTART", NULL, 0) != 0;
@@ -2187,6 +2203,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmd, int show)
 			update_finish();
 		ExitProcess(0);
 	}
+	WaitForSingleObject(gamepad_thread, 2000);
 	SDL_Quit();
 	curl_global_cleanup();
 	if(g.update_restart)
