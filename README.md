@@ -23,7 +23,7 @@ If you play on a TV and use Discord on your PC, the usual way to get game audio 
 
 - **Audio-only mode.** Video isn't decoded, and the PS5 is asked for the smallest stream.
 - **Video on demand.** Turn video on when you want to stream to Discord, and pick the "PS Stream - Video" window there. Press `F11` in that window for full screen. Turning video on or off reconnects, which takes a few seconds.
-- **Simple by default.** Two big buttons and three quality choices: Low, Medium and High. Everything else, from resolution and frame rate to bitrate and codec, is under **Advanced settings**.
+- **Simple by default.** Two big buttons, and five quality presets from 360p at 0.5 Mbps to 1080p 60 FPS at 50 Mbps. To set resolution, frame rate, bitrate and codec yourself, use **Custom** or **Advanced settings**.
 - **Built for Wi-Fi.** Pauses Windows' background Wi-Fi scans while connected, uses an audio buffer that adapts to jitter, and keeps your PC awake.
 - **Audio controls.** Choose the output device and maximum delay, and change the volume right on the Play page.
 - **Live connection numbers.** Press **Details** to see connection time, ping, audio dropouts, video frame rate and lost frames.
@@ -62,7 +62,7 @@ The **DualSense on PS5** setting under **Advanced settings** stops the app from 
 
 The PS5 address and account ID stay saved until you delete them. To use another account, press **Delete** on the Pairing page, sign in again and pair. Settings, pairing data and a log are stored in `%APPDATA%\PSStream`. The log (`log.txt`) is the first place to look if something goes wrong, and **Open logs** in Settings takes you there.
 
-For the best results on Wi-Fi, connect the PS5 to your router with a cable, or use 5 GHz. If the picture breaks up, lower the quality to **Medium** or **Low**.
+For the best results on Wi-Fi, connect the PS5 to your router with a cable, or use 5 GHz. If the picture breaks up, lower the quality to **Balanced** or **Low**.
 
 ## Updates
 

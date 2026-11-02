@@ -44,7 +44,7 @@
 
 // Below this rate we are outside what chiaki-ng offers, so a console that refuses to start
 // gets a second try with it.
-#define APP_VERSION "0.1.5"
+#define APP_VERSION "0.1.6"
 #define UPDATE_DOWNLOAD_PREFIX "https://github.com/Warhead500metalmonster/ps-stream/releases/download/"
 #define RELEASES_URL L"https://github.com/Warhead500metalmonster/ps-stream/releases/latest"
 #define REPO_URL L"https://github.com/Warhead500metalmonster/ps-stream"

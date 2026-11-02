@@ -587,48 +587,45 @@ static void page_play(void)
 	if(mouse_in(vx, cy, cw, ch - 80))
 		ui.tip = L"Görüntü penceresinde F11 tam ekran yapar.";
 
-	static const wchar_t *const names[] = { L"Düşük", L"Orta", L"Yüksek", L"Özel" };
-	static const wchar_t *const subs[] = { L"İnternet kötüyse", L"Çoğu zaman için", L"İnternet iyiyse", L"Kendin ayarla" };
-	static const int tile_preset[] = { 0, 2, 3 };
-	static const int tile_bars[] = { 1, 3, 5 };
+	static const wchar_t *const names[] = { L"En düşük", L"Düşük", L"Dengeli", L"Yüksek", L"En yüksek" };
+	static const wchar_t *const subs[] = { L"360p, 0,5 Mbps", L"360p, 2 Mbps", L"720p, 6 Mbps", L"1080p 60, 20 Mbps", L"1080p 60, 50 Mbps" };
 	int current = preset_match(&s);
-	float gap = 10, w = (UI_W - 48 - gap * 3) / 4, y = 420 + extra, h = 74;
-	for(int i = 0; i < 4; i++)
+	float gap = 10, w = (UI_W - 48 - gap * 5) / 6, y = 420 + extra, h = 74;
+	for(int i = 0; i <= PRESET_COUNT; i++)
 	{
 		float x = 24 + i * (w + gap);
-		bool selected = i < 3 ? tile_preset[i] == current : current != 0 && current != 2 && current != 3;
+		bool selected = i == current;
 		Hit b = hit(UI_PRESET0 + i, x, y, w, h);
 		float on = anim(UI_PRESET0 + i + UI_MAX, selected ? 1.0f : 0);
 		fill_round(x, y, w, h, 16, mix(mix(WHITE(18), WHITE(40), anim(UI_PRESET0 + i, b.hot ? 1.0f : 0)), C_ACCENT, on));
 		if(on < 1)
 			stroke_round(x, y, w, h, 16, 1, mix(WHITE(16), C_ACCENT, on));
-		// Rising bars show the level at a glance
-		float bars_x = x + 16;
-		for(int bar = 0; bar < 5 && i < 3; bar++)
+		// Five rising bars show the level at a glance
+		float bars_x = x + w / 2 - 19;
+		for(int bar = 0; bar < 5 && i < PRESET_COUNT; bar++)
 		{
-			float bh = 8 + bar * 5.0f;
-			fill_round(bars_x + bar * 9, y + 54 - bh, 6, bh, 2, bar < tile_bars[i] ? (selected ? WHITE(255) : WHITE(190)) : WHITE(selected ? 70 : 34));
+			float bh = 3 + bar * 2.5f;
+			fill_round(bars_x + bar * 8, y + 19 - bh, 5, bh, 1.5f, bar <= i ? (selected ? WHITE(255) : WHITE(190)) : WHITE(selected ? 70 : 34));
 		}
-		if(i == 3)
-			text(ICON_GEAR, ui.icon_big, x + 10, y + 13, 50, 50, selected ? C_TEXT : C_MUTED, 1, 1);
-		text(names[i], ui.title, x + 72, y + 10, w - 76, 30, C_TEXT, 0, 1);
-		text(subs[i], ui.small, x + 72, y + 40, w - 76, 22, selected ? WHITE(225) : C_MUTED, 0, 1);
+		if(i == PRESET_COUNT)
+			text(ICON_GEAR, ui.icon, x, y + 2, w, 20, selected ? C_TEXT : C_MUTED, 1, 1);
+		text(i < PRESET_COUNT ? names[i] : L"Özel", ui.semi, x, y + 22, w, 24, C_TEXT, 1, 1);
+		text(i < PRESET_COUNT ? subs[i] : L"Ayarlardan seç", ui.small, x, y + 46, w, 20, selected ? WHITE(225) : C_MUTED, 1, 1);
 		if(mouse_in(x, y, w, h))
 			ui.tip = L"Görüntü kalitesi. Sadece ses modunu etkilemez.";
 		if(b.click)
 		{
-			if(i == 3)
+			if(i == PRESET_COUNT)
 			{
 				ui.advanced = true;
 				show_page(PAGE_SETTINGS);
 			}
 			else
 			{
-				const int p = tile_preset[i];
-				s.res = presets[p].res;
-				s.fps = presets[p].fps;
-				s.kbps = presets[p].kbps;
-				s.h265 = presets[p].h265;
+				s.res = presets[i].res;
+				s.fps = presets[i].fps;
+				s.kbps = presets[i].kbps;
+				s.h265 = presets[i].h265;
 				settings_commit(&s);
 			}
 		}
@@ -1671,7 +1668,7 @@ static DWORD WINAPI ui_test_main(void *arg)
 	Sleep(2600);
 	test_log_status("video on");
 	test_shot(dir, L"play_both");
-	test_click(UI_PRESET0 + 2);
+	test_click(UI_PRESET0 + 3);
 	Sleep(2600);
 	test_log_status("preset high");
 	test_click(UI_VIDEO);
