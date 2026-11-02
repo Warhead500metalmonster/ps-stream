@@ -29,7 +29,9 @@ If you play on a TV and use Discord on your PC, the usual way to get game audio 
 - **Live connection numbers.** Press **Details** to see connection time, ping, audio dropouts, video frame rate and lost frames.
 - **Connects by itself.** Checks for the PS5 about once a second and connects as soon as it answers. If the PS5 is in rest mode, the app sends it a wake-up signal. You can turn that off with **Wake PS5** in Settings. It also finds the console again if the router gives it a new address.
 - **Runs in the background.** Minimizes to the tray, can start with Windows, remembers where its windows were, and opening it a second time shows the running copy.
-- **Global hotkeys.** `Ctrl+Alt+F9` for audio and `Ctrl+Alt+F10` for video. You can change them.
+- **Global hotkeys.** `Ctrl+Alt+F9` for audio, `Ctrl+Alt+F10` for video and `Ctrl+Alt+F8` to mute. You can change them.
+- **Instant mute.** Mute with the speaker icon or the hotkey. The connection stays open, so sound comes right back.
+- **Connection warnings.** The app tells you when Wi-Fi can't keep up and offers to lower the video quality. In the tray, it notifies you when the connection drops or returns.
 - **Turkish and English interface.**
 
 ## Getting started

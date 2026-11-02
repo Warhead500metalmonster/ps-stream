@@ -10,6 +10,10 @@
 #include "i18n.c"
 
 #define UI_W 920
+#define WEAK_WINDOW_MS 30000
+#define WEAK_LOST_FRAMES 30
+#define WEAK_DROPOUTS 3
+#define WEAK_REPEAT_MS 300000
 // A test copy must never find, or be stopped by, the copy someone is using
 #ifdef PSSTREAM_TEST
 #define WINDOW_CLASS L"PSStreamTestWindow"
@@ -38,9 +42,10 @@
 #define ICON_SYNC L"\uE895"
 #define ICON_INFO L"\uE946"
 #define ICON_VOLUME L"\uE995"
+#define ICON_MUTED L"\uE74F"
 #define ICON_PLAY L""
 
-enum { UI_NONE, UI_NAV0, UI_NAV1, UI_NAV2, UI_AUDIO, UI_VIDEO, UI_DETAILS, UI_ADVANCED, UI_SIMPLE, UI_APPLY, UI_FIND, UI_LOGIN, UI_ACCOUNT_CLEAR, UI_PAIR, UI_REPAIR,
+enum { UI_NONE, UI_NAV0, UI_NAV1, UI_NAV2, UI_AUDIO, UI_VIDEO, UI_MUTE, UI_LOWER, UI_HK_MUTE, UI_DETAILS, UI_ADVANCED, UI_SIMPLE, UI_APPLY, UI_FIND, UI_LOGIN, UI_ACCOUNT_CLEAR, UI_PAIR, UI_REPAIR,
 	UI_DEVICE, UI_HK_AUDIO, UI_HK_VIDEO, UI_HW, UI_RECONNECT, UI_CONTROLLER, UI_WIFI, UI_AUTOSTART, UI_AUTOWAKE, UI_WINSTART, UI_TRAY, UI_UPDATES, UI_QUICK_VOLUME, UI_WAKE, UI_UPDATE_NOW, UI_OPEN_LOGS, UI_OPEN_REPO, UI_BITRATE, UI_AO_BITRATE, UI_VOLUME, UI_BUFFER, UI_LOSS,
 	UI_PRESET0 = 46, UI_RES0 = 52, UI_FPS0 = 60, UI_CODEC0 = 65, UI_AORES0 = 70, UI_LANG0 = 80, UI_MAX = 96 };
 
@@ -55,7 +60,9 @@ static struct {
 	bool anim_set[UI_MAX * 2], animating;
 	double anim_last;
 	int timer_ticks;
-	bool details, advanced;
+	bool details, advanced, was_live, weak;
+	int weak_lost, weak_drops;
+	DWORD weak_checked_at, weak_shown_at;
 	HICON logo;
 	UINT taskbar_created;
 	bool in_tray;
@@ -413,11 +420,14 @@ static bool hotkeys_register(const Settings *s)
 {
 	UnregisterHotKey(g.hwnd, HOTKEY_AUDIO);
 	UnregisterHotKey(g.hwnd, HOTKEY_VIDEO);
+	UnregisterHotKey(g.hwnd, HOTKEY_MUTE);
 	bool ok = true;
 	if(LOBYTE(s->hotkey_audio))
 		ok = RegisterHotKey(g.hwnd, HOTKEY_AUDIO, hotkey_mods(s->hotkey_audio), LOBYTE(s->hotkey_audio)) && ok;
 	if(LOBYTE(s->hotkey_video))
 		ok = RegisterHotKey(g.hwnd, HOTKEY_VIDEO, hotkey_mods(s->hotkey_video), LOBYTE(s->hotkey_video)) && ok;
+	if(LOBYTE(s->hotkey_mute))
+		ok = RegisterHotKey(g.hwnd, HOTKEY_MUTE, hotkey_mods(s->hotkey_mute), LOBYTE(s->hotkey_mute)) && ok;
 	return ok;
 }
 
@@ -481,6 +491,22 @@ static void toggle(int which)
 	else
 		g.want_video = !g.want_video;
 	SetEvent(g.wake);
+}
+
+static void mute_toggle(void)
+{
+	g.muted = !g.muted;
+	set_status(g.muted ? L"Ses kısıldı. Bağlantı açık, açınca hemen geri gelir" : L"Ses geri açıldı");
+}
+
+// The next step down for someone whose Wi-Fi can't keep up. Returns -1 at the bottom.
+static int preset_lower(const Settings *s)
+{
+	int best = -1;
+	for(int i = 0; i < PRESET_COUNT; i++)
+		if(presets[i].kbps < s->kbps)
+			best = i;
+	return best;
 }
 
 static void edit_cues(void)
@@ -579,14 +605,20 @@ static void page_play(void)
 
 	// Volume right on the card, since it's the control people reach for most
 	float vy = cy + ch - 124;
-	text(ICON_VOLUME, ui.icon, 42, vy, 28, 28, WHITE(220), 1, 1);
+	Hit mute = hit(UI_MUTE, 40, vy - 2, 32, 32);
+	dot(40, vy - 2, 32, COLOR((int)(60 * anim(UI_MUTE, mute.hot ? 1.0f : 0)), 255, 255, 255));
+	text(g.muted ? ICON_MUTED : ICON_VOLUME, ui.icon, 42, vy, 28, 28, g.muted ? C_AMBER : WHITE(220), 1, 1);
+	if(mute.click)
+		mute_toggle();
+	if(mouse_in(40, vy - 2, 32, 32))
+		ui.tip = L"Sesi kısar, bağlantı açık kalır. Kısayol: Gelişmiş ayarlar";
 	int volume = s.volume;
 	if(slider(UI_QUICK_VOLUME, 80, vy, cw - 150, &volume, 0, 200))
 		volume_set(volume);
 	wchar_t pct[16];
 	swprintf(pct, 16, tr(L"%%%d"), volume);
-	text(pct, ui.semi, cw - 50, vy, 58, 28, C_TEXT, 2, 1);
-	if(mouse_in(42, vy, cw - 30, 28))
+	text(g.muted ? L"Kısık" : pct, ui.semi, cw - 50, vy, 58, 28, g.muted ? C_AMBER : C_TEXT, 2, 1);
+	if(mouse_in(80, vy, cw - 70, 28))
 		ui.tip = L"Oyun sesinin seviyesi. %100 üstü sesi yükseltir.";
 
 	float vx = 24 + cw + 16;
@@ -695,7 +727,7 @@ static bool settings_dirty(const Settings *a, const Settings *b)
 		|| a->ao_res != b->ao_res || a->ao_kbps != b->ao_kbps || a->loss_pct != b->loss_pct
 		|| a->no_controller != b->no_controller || a->wifi_opt != b->wifi_opt || a->autostart_audio != b->autostart_audio
 		|| a->win_start != b->win_start || a->tray != b->tray || a->update_check != b->update_check || a->auto_wake != b->auto_wake
-		|| a->reconnect != b->reconnect || a->hotkey_audio != b->hotkey_audio || a->hotkey_video != b->hotkey_video
+		|| a->reconnect != b->reconnect || a->hotkey_audio != b->hotkey_audio || a->hotkey_video != b->hotkey_video || a->hotkey_mute != b->hotkey_mute
 		|| strcmp(a->device, b->device) != 0;
 }
 
@@ -883,11 +915,13 @@ static void page_settings(void)
 	y += 46;
 	heading(L"KISAYOLLAR", x, y);
 	y += 28;
-	for(int i = 0; i < 2; i++)
+	for(int i = 0; i < 3; i++)
 	{
-		int id = i ? UI_HK_VIDEO : UI_HK_AUDIO;
-		row_label(i ? L"Görüntü" : L"Ses", L"Tıkla, sonra tuş kombinasyonuna bas. Esc iptal eder, Delete kaldırır.", x, y, pw - 40);
-		hotkey_name(i ? d->hotkey_video : d->hotkey_audio, t, 64);
+		static const int ids[] = { UI_HK_AUDIO, UI_HK_VIDEO, UI_HK_MUTE };
+		static const wchar_t *const labels[] = { L"Ses", L"Görüntü", L"Sesi kıs" };
+		int id = ids[i];
+		row_label(labels[i], L"Tıkla, sonra tuş kombinasyonuna bas. Esc iptal eder, Delete kaldırır.", x, y, pw - 40);
+		hotkey_name(i == 0 ? d->hotkey_audio : i == 1 ? d->hotkey_video : d->hotkey_mute, t, 64);
 		if(chip(id, ui.capturing == id ? L"Tuşa bas..." : t, cx, y, cw, 30, ui.capturing == id))
 		{
 			ui.capturing = id;
@@ -1081,6 +1115,20 @@ static void status_bar(void)
 		if(pill_button(UI_WAKE, L"PS5'i uyandır", x + w - 164, y + 7, 154, 34, true, true))
 			CloseHandle(CreateThread(NULL, 0, ps5_wake_thread, NULL, 0, NULL));
 	}
+	else if(ui.weak && g.want_video && preset_lower(&current) >= 0)
+	{
+		tw -= 170;
+		if(pill_button(UI_LOWER, L"Kaliteyi düşür", x + w - 164, y + 7, 154, 34, true, true))
+		{
+			const Preset *p = &presets[preset_lower(&current)];
+			current.res = p->res;
+			current.fps = p->fps;
+			current.kbps = p->kbps;
+			current.h265 = p->h265;
+			ui.weak = false;
+			settings_commit(&current);
+		}
+	}
 	else if(g.update_ready)
 	{
 		bool one_click = update_available_here();
@@ -1218,7 +1266,7 @@ static void capture_hotkey(int vk)
 {
 	if(vk == VK_SHIFT || vk == VK_CONTROL || vk == VK_MENU || vk == VK_LWIN || vk == VK_RWIN)
 		return;
-	int *target = ui.capturing == UI_HK_AUDIO ? &ui.draft.hotkey_audio : &ui.draft.hotkey_video;
+	int *target = ui.capturing == UI_HK_AUDIO ? &ui.draft.hotkey_audio : ui.capturing == UI_HK_VIDEO ? &ui.draft.hotkey_video : &ui.draft.hotkey_mute;
 	if(vk == VK_DELETE)
 		*target = 0;
 	else if(vk != VK_ESCAPE)
@@ -1245,8 +1293,64 @@ static bool tray_icon(DWORD action)
 	data.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
 	data.uCallbackMessage = WM_APP_TRAY;
 	data.hIcon = LoadIconW(GetModuleHandleW(NULL), MAKEINTRESOURCEW(1));
-	wcscpy(data.szTip, L"PS Stream");
+	bool on = g.want_audio || g.want_video;
+	swprintf(data.szTip, 128, L"PS Stream: %ls", tr(!on ? L"Kapalı" : g.connected ? L"PS5 bağlı" : L"Bağlanıyor"));
 	return Shell_NotifyIconW(action, &data) != 0;
+}
+
+// Someone with the window tucked away still needs to know the sound is gone, and why.
+static void tray_note(const wchar_t *text)
+{
+	NOTIFYICONDATAW data = { 0 };
+	data.cbSize = sizeof(data);
+	data.hWnd = g.hwnd;
+	data.uID = 1;
+	data.uFlags = NIF_INFO;
+	data.dwInfoFlags = NIIF_NONE | NIIF_NOSOUND;
+	wcsncpy(data.szInfo, tr(text), 255);
+	wcscpy(data.szInfoTitle, L"PS Stream");
+	bool shown = Shell_NotifyIconW(NIM_MODIFY, &data) != 0;
+	CHIAKI_LOGI(&g.log, "Tray note: %s", shown ? "shown" : "failed");
+}
+
+// Runs from the half-second timer, whether the window is showing or not.
+static void connection_watch(void)
+{
+	bool live = (g.want_audio || g.want_video) && g.connected;
+	if(live != ui.was_live)
+	{
+		ui.was_live = live;
+		if(ui.in_tray)
+		{
+			tray_icon(NIM_MODIFY);
+			if(live)
+				tray_note(L"PS5'e bağlandı");
+			else if(g.want_audio || g.want_video)
+				tray_note(L"PS5 bağlantısı koptu, yeniden deneniyor");
+		}
+		ui.weak = false;
+		ui.weak_lost = g.video_lost_total;
+		ui.weak_drops = g.audio_dropouts;
+		ui.weak_checked_at = GetTickCount();
+	}
+	DWORD now = GetTickCount();
+	if(!live || now - ui.weak_checked_at < WEAK_WINDOW_MS)
+		return;
+	int lost = g.video_lost_total - ui.weak_lost, drops = g.audio_dropouts - ui.weak_drops;
+	ui.weak_lost = g.video_lost_total;
+	ui.weak_drops = g.audio_dropouts;
+	ui.weak_checked_at = now;
+	bool was_weak = ui.weak;
+	ui.weak = false;
+	if((lost >= WEAK_LOST_FRAMES || drops >= WEAK_DROPOUTS) && (!ui.weak_shown_at || now - ui.weak_shown_at > WEAK_REPEAT_MS))
+	{
+		CHIAKI_LOGI(&g.log, "Weak connection: %d lost frames, %d audio dropouts in the last %d s", lost, drops, WEAK_WINDOW_MS / 1000);
+		ui.weak = true;
+		ui.weak_shown_at = now;
+		set_status(g.want_video ? L"Bağlantı zayıf, görüntü kare kaybediyor" : L"Wi-Fi zayıf, ses kesiliyor. Modeme yaklaşmak veya 5 GHz'e geçmek iyi gelir");
+	}
+	if(was_weak != ui.weak)
+		ui_frame();
 }
 
 static void tray_enter(void)
@@ -1274,6 +1378,7 @@ static void tray_menu(void)
 	AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
 	AppendMenuW(menu, MF_STRING | (g.want_audio ? MF_CHECKED : 0), 2, tr(L"Ses"));
 	AppendMenuW(menu, MF_STRING | (g.want_video ? MF_CHECKED : 0), 3, tr(L"Görüntü"));
+	AppendMenuW(menu, MF_STRING | (g.muted ? MF_CHECKED : 0), 5, tr(L"Sesi kıs"));
 	AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
 	AppendMenuW(menu, MF_STRING, 4, tr(L"Çıkış"));
 	POINT pt;
@@ -1285,6 +1390,8 @@ static void tray_menu(void)
 		tray_leave();
 	else if(cmd == 2 || cmd == 3)
 		toggle(cmd == 2 ? UI_AUDIO : UI_VIDEO);
+	else if(cmd == 5)
+		mute_toggle();
 	else if(cmd == 4)
 		DestroyWindow(g.hwnd);
 }
@@ -1314,6 +1421,8 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 				tray_menu();
 			return 0;
 		case WM_TIMER:
+			if(wp == 1)
+				connection_watch();
 			if(wp == 2)
 			{
 				ui_frame();
@@ -1437,7 +1546,10 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 			SetBkColor((HDC)wp, RGB(43, 45, 51));
 			return (LRESULT)ui.field_brush;
 		case WM_HOTKEY:
-			toggle(wp == HOTKEY_AUDIO ? UI_AUDIO : UI_VIDEO);
+			if(wp == HOTKEY_MUTE)
+				mute_toggle();
+			else
+				toggle(wp == HOTKEY_AUDIO ? UI_AUDIO : UI_VIDEO);
 			ui_frame();
 			return 0;
 		case WM_APP_STATUS:
@@ -1714,10 +1826,29 @@ static DWORD WINAPI ui_test_main(void *arg)
 	Sleep(800);
 	test_log_status("audio on");
 	test_shot(dir, L"play_audio");
+	test_click(UI_MUTE);
+	CHIAKI_LOGI(&g.log, "[mute] muted=%d", (int)g.muted);
+	test_shot(dir, L"play_muted");
+	test_click(UI_MUTE);
+	CHIAKI_LOGI(&g.log, "[unmute] muted=%d", (int)g.muted);
 	test_click(UI_VIDEO);
 	Sleep(2600);
 	test_log_status("video on");
 	test_shot(dir, L"play_both");
+	if(GetEnvironmentVariableW(L"PSSTREAM_TEST_WEAK", NULL, 0))
+	{
+		Sleep(800);
+		ui.weak_checked_at -= WEAK_WINDOW_MS;
+		InterlockedExchangeAdd(&g.video_lost_total, 40);
+		Sleep(900);
+		test_log_status("weak connection");
+		test_shot(dir, L"play_weak");
+		Settings before = settings_get();
+		test_click(UI_LOWER);
+		Settings after = settings_get();
+		CHIAKI_LOGI(&g.log, "[lower quality] kbps %d to %d, weak=%d", before.kbps, after.kbps, ui.weak);
+		Sleep(2600);
+	}
 	test_click(UI_PRESET0 + 3);
 	Sleep(2600);
 	test_log_status("preset high");

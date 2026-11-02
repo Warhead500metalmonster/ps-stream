@@ -44,7 +44,7 @@
 
 // Below this rate we are outside what chiaki-ng offers, so a console that refuses to start
 // gets a second try with it.
-#define APP_VERSION "0.1.9"
+#define APP_VERSION "0.1.10"
 #define UPDATE_DOWNLOAD_PREFIX "https://github.com/Warhead500metalmonster/ps-stream/releases/download/"
 #define RELEASES_URL L"https://github.com/Warhead500metalmonster/ps-stream/releases/latest"
 #define REPO_URL L"https://github.com/Warhead500metalmonster/ps-stream"
@@ -90,7 +90,7 @@
 
 enum {
 	ID_HOST = 100, ID_ACCOUNT, ID_PIN,
-	HOTKEY_AUDIO = 1, HOTKEY_VIDEO,
+	HOTKEY_AUDIO = 1, HOTKEY_VIDEO, HOTKEY_MUTE,
 	WM_APP_STATUS = WM_APP + 1, WM_APP_VIDEO_CLOSED, WM_APP_PAIRED, WM_APP_ALL_OFF, WM_APP_TEST_SHOT, WM_APP_LOGIN, WM_APP_TRAY, WM_APP_HOST_CHANGED
 };
 
@@ -114,7 +114,7 @@ typedef struct {
 	int res, fps, kbps, h265, hw;
 	int ao_res, ao_kbps;
 	int volume, buffer_ms, loss_pct, reconnect, no_controller, wifi_opt, autostart_audio, win_start, tray, update_check, auto_wake;
-	int hotkey_audio, hotkey_video; // HKM_GETHOTKEY format
+	int hotkey_audio, hotkey_video, hotkey_mute; // HKM_GETHOTKEY format
 	char device[256]; // empty is the system default
 } Settings;
 
@@ -170,7 +170,7 @@ static struct {
 	DWORD audio_last_dropout, connected_at;
 	volatile LONG audio_dropouts, video_fps10, video_lost_total, ps5_standby;
 	char update_tag[32];
-	volatile LONG network_changed, regist_rejected;
+	volatile LONG network_changed, regist_rejected, muted;
 	int regist_tries;
 	volatile LONG update_ready, update_busy, update_failed, update_restart;
 	char update_url[512], update_digest[72];
@@ -292,7 +292,9 @@ static void audio_frame_cb(int16_t *buf, size_t samples_count, void *user)
 	}
 	Settings s = settings_get();
 	size_t count = samples_count * g.audio_channels;
-	if(s.volume != 100)
+	// Muting keeps the stream and the buffer running, so sound comes back instantly
+	int volume = g.muted ? 0 : s.volume;
+	if(volume != 100)
 	{
 		if(count > g.volume_buf_size)
 		{
@@ -304,7 +306,7 @@ static void audio_frame_cb(int16_t *buf, size_t samples_count, void *user)
 		}
 		for(size_t i = 0; i < count; i++)
 		{
-			int v = buf[i] * s.volume / 100;
+			int v = buf[i] * volume / 100;
 			g.volume_buf[i] = (int16_t)(v > 32767 ? 32767 : v < -32768 ? -32768 : v);
 		}
 		buf = g.volume_buf;
@@ -1314,6 +1316,7 @@ static void config_load(void)
 	s->auto_wake = config_int("auto_wake", 1, 0, 1);
 	s->hotkey_audio = hotkey_load("hotkey_audio", MAKEWORD(VK_F9, HOTKEYF_CONTROL | HOTKEYF_ALT));
 	s->hotkey_video = hotkey_load("hotkey_video", MAKEWORD(VK_F10, HOTKEYF_CONTROL | HOTKEYF_ALT));
+	s->hotkey_mute = hotkey_load("hotkey_mute", MAKEWORD(VK_F8, HOTKEYF_CONTROL | HOTKEYF_ALT));
 	char device_hex[sizeof(s->device) * 2 + 1];
 	config_read(L"settings", "device_hex", device_hex, sizeof(device_hex));
 	size_t device_len = strlen(device_hex) / 2;
@@ -1343,6 +1346,7 @@ static void config_save_settings(const Settings *s)
 	config_set_int("auto_wake", s->auto_wake);
 	config_set_int("hotkey_audio", s->hotkey_audio);
 	config_set_int("hotkey_video", s->hotkey_video);
+	config_set_int("hotkey_mute", s->hotkey_mute);
 	// Device names can hold any language, and an old INI file only stores its own code page
 	char device_hex[sizeof(s->device) * 2 + 1];
 	hex_encode((const uint8_t *)s->device, strlen(s->device), device_hex);
