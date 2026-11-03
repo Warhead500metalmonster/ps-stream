@@ -23,10 +23,14 @@
 #include <chiaki/session.h>
 
 #include <SDL.h>
+#include <SDL_syswm.h>
 #include <curl/curl.h>
 #include <json-c/json.h>
 #include <libavutil/frame.h>
 #include <libavutil/hwcontext.h>
+#include <libavutil/hwcontext_d3d11va.h>
+#include <d3d11_1.h>
+#include <dxgi.h>
 
 #include <windows.h>
 #include <bcrypt.h>
@@ -45,7 +49,7 @@
 
 // Below this rate we are outside what chiaki-ng offers, so a console that refuses to start
 // gets a second try with it.
-#define APP_VERSION "0.1.18"
+#define APP_VERSION "0.1.19"
 #define UPDATE_RECHECK_MS (6 * 60 * 60 * 1000)
 #define UPDATE_TRIES 6
 #define UPDATE_RETRY_MS 20000
@@ -404,6 +408,263 @@ static void frame_available_cb(ChiakiFfmpegDecoder *decoder, void *user)
 static int config_int(const char *key, int fallback, int min, int max);
 static void config_set_int(const char *key, int value);
 
+// Hardware-decoded frames stay on the graphics card: its video processor converts and scales them
+// straight into the window. Copying each frame down to memory and back up cost about 4.5 ms at 1080p.
+#define GPU_VIEWS 32
+
+typedef struct {
+	AVD3D11VADeviceContext *hw; // the decoder's device, with the lock that guards its context
+	ID3D11VideoDevice *vdev;
+	ID3D11VideoContext *vctx;
+	ID3D11VideoContext1 *vctx1; // newer drivers only follow the colour space given through this one
+	IDXGISwapChain *swap;
+	ID3D11VideoProcessorEnumerator *vpe;
+	ID3D11VideoProcessor *vp;
+	ID3D11VideoProcessorOutputView *out;
+	ID3D11VideoProcessorInputView *in[GPU_VIEWS];
+	ID3D11Texture2D *in_tex[GPU_VIEWS];
+	UINT in_slice[GPU_VIEWS];
+	int in_count, src_w, src_h, out_w, out_h;
+	HWND hwnd;
+} GpuView;
+
+static void gpu_views_clear(GpuView *v)
+{
+	for(int i = 0; i < v->in_count; i++)
+		ID3D11VideoProcessorInputView_Release(v->in[i]);
+	v->in_count = 0;
+}
+
+static void gpu_close(GpuView *v)
+{
+	gpu_views_clear(v);
+	if(v->out)
+		ID3D11VideoProcessorOutputView_Release(v->out);
+	if(v->vp)
+		ID3D11VideoProcessor_Release(v->vp);
+	if(v->vpe)
+		ID3D11VideoProcessorEnumerator_Release(v->vpe);
+	if(v->swap)
+		IDXGISwapChain_Release(v->swap);
+	if(v->vctx1)
+		ID3D11VideoContext1_Release(v->vctx1);
+	if(v->vctx)
+		ID3D11VideoContext_Release(v->vctx);
+	if(v->vdev)
+		ID3D11VideoDevice_Release(v->vdev);
+	memset(v, 0, sizeof(*v));
+}
+
+static bool gpu_open(GpuView *v, SDL_Window *window, AVBufferRef *device)
+{
+	memset(v, 0, sizeof(*v));
+	SDL_SysWMinfo info;
+	SDL_VERSION(&info.version);
+	if(!device || !SDL_GetWindowWMInfo(window, &info))
+		return false;
+	v->hwnd = info.info.win.window;
+	v->hw = ((AVHWDeviceContext *)device->data)->hwctx;
+	IDXGIDevice *dxgi = NULL;
+	IDXGIAdapter *adapter = NULL;
+	IDXGIFactory *factory = NULL;
+	bool ok = SUCCEEDED(ID3D11Device_QueryInterface(v->hw->device, &IID_ID3D11VideoDevice, (void **)&v->vdev))
+		&& SUCCEEDED(ID3D11DeviceContext_QueryInterface(v->hw->device_context, &IID_ID3D11VideoContext, (void **)&v->vctx))
+		&& SUCCEEDED(ID3D11Device_QueryInterface(v->hw->device, &IID_IDXGIDevice, (void **)&dxgi))
+		&& SUCCEEDED(IDXGIDevice_GetAdapter(dxgi, &adapter))
+		&& SUCCEEDED(IDXGIAdapter_GetParent(adapter, &IID_IDXGIFactory, (void **)&factory));
+	if(ok && FAILED(ID3D11VideoContext_QueryInterface(v->vctx, &IID_ID3D11VideoContext1, (void **)&v->vctx1)))
+		v->vctx1 = NULL;
+	if(ok)
+	{
+		// The blit model, like SDL's own drawing, so Discord can capture the window the same way
+		DXGI_SWAP_CHAIN_DESC desc = { 0 };
+		desc.BufferDesc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+		desc.SampleDesc.Count = 1;
+		desc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+		desc.BufferCount = 1;
+		desc.OutputWindow = v->hwnd;
+		desc.Windowed = TRUE;
+		desc.SwapEffect = DXGI_SWAP_EFFECT_DISCARD;
+		v->hw->lock(v->hw->lock_ctx);
+		ok = SUCCEEDED(IDXGIFactory_CreateSwapChain(factory, (IUnknown *)v->hw->device, &desc, &v->swap));
+		v->hw->unlock(v->hw->lock_ctx);
+		if(ok)
+			IDXGIFactory_MakeWindowAssociation(factory, v->hwnd, DXGI_MWA_NO_ALT_ENTER); // F11 stays SDL's
+	}
+	if(factory)
+		IDXGIFactory_Release(factory);
+	if(adapter)
+		IDXGIAdapter_Release(adapter);
+	if(dxgi)
+		IDXGIDevice_Release(dxgi);
+	if(!ok)
+		gpu_close(v);
+	return ok;
+}
+
+// Fits the picture into the window without stretching it, with black bars where it doesn't fill
+static RECT gpu_fit(int src_w, int src_h, int out_w, int out_h)
+{
+	RECT r = { 0, 0, out_w, out_h };
+	if((long long)out_w * src_h > (long long)out_h * src_w)
+	{
+		int w = (int)((long long)out_h * src_w / src_h);
+		r.left = (out_w - w) / 2;
+		r.right = r.left + w;
+	}
+	else
+	{
+		int h = (int)((long long)out_w * src_h / src_w);
+		r.top = (out_h - h) / 2;
+		r.bottom = r.top + h;
+	}
+	return r;
+}
+
+// Must be called with the device lock held
+static bool gpu_prepare(GpuView *v, const AVFrame *f, int out_w, int out_h)
+{
+	if(f->width != v->src_w || f->height != v->src_h || out_w != v->out_w || out_h != v->out_h || !v->vp)
+	{
+		if(v->vp)
+			ID3D11VideoProcessor_Release(v->vp);
+		if(v->vpe)
+			ID3D11VideoProcessorEnumerator_Release(v->vpe);
+		v->vp = NULL;
+		v->vpe = NULL;
+		gpu_views_clear(v); // views belong to the enumerator they were made with
+		if(v->out)
+			ID3D11VideoProcessorOutputView_Release(v->out);
+		v->out = NULL;
+		D3D11_VIDEO_PROCESSOR_CONTENT_DESC desc = { 0 };
+		desc.InputFrameFormat = D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE;
+		desc.InputWidth = f->width;
+		desc.InputHeight = f->height;
+		desc.OutputWidth = out_w;
+		desc.OutputHeight = out_h;
+		desc.Usage = D3D11_VIDEO_USAGE_PLAYBACK_NORMAL;
+		if(FAILED(ID3D11VideoDevice_CreateVideoProcessorEnumerator(v->vdev, &desc, &v->vpe))
+			|| FAILED(ID3D11VideoDevice_CreateVideoProcessor(v->vdev, v->vpe, 0, &v->vp)))
+			return false;
+		// Driver touch-ups like noise reduction cost time and aren't wanted on game footage
+		ID3D11VideoContext_VideoProcessorSetStreamAutoProcessingMode(v->vctx, v->vp, 0, FALSE);
+		ID3D11VideoContext_VideoProcessorSetStreamFrameFormat(v->vctx, v->vp, 0, D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE);
+		D3D11_VIDEO_COLOR black = { .RGBA = { 0, 0, 0, 1 } };
+		ID3D11VideoContext_VideoProcessorSetOutputBackgroundColor(v->vctx, v->vp, FALSE, &black);
+		D3D11_VIDEO_PROCESSOR_COLOR_SPACE rgb = { 0 }; // full range RGB out
+		ID3D11VideoContext_VideoProcessorSetOutputColorSpace(v->vctx, v->vp, &rgb);
+		if(v->vctx1)
+			ID3D11VideoContext1_VideoProcessorSetOutputColorSpace1(v->vctx1, v->vp, DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709);
+		RECT dest = gpu_fit(f->width, f->height, out_w, out_h);
+		ID3D11VideoContext_VideoProcessorSetStreamDestRect(v->vctx, v->vp, 0, TRUE, &dest);
+		v->src_w = f->width;
+		v->src_h = f->height;
+	}
+	if(!v->out)
+	{
+		if(FAILED(IDXGISwapChain_ResizeBuffers(v->swap, 0, out_w, out_h, DXGI_FORMAT_UNKNOWN, 0)))
+			return false;
+		ID3D11Texture2D *back = NULL;
+		if(FAILED(IDXGISwapChain_GetBuffer(v->swap, 0, &IID_ID3D11Texture2D, (void **)&back)))
+			return false;
+		D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC desc = { .ViewDimension = D3D11_VPOV_DIMENSION_TEXTURE2D };
+		HRESULT hr = ID3D11VideoDevice_CreateVideoProcessorOutputView(v->vdev, (ID3D11Resource *)back, v->vpe, &desc, &v->out);
+		ID3D11Texture2D_Release(back);
+		if(FAILED(hr))
+			return false;
+		v->out_w = out_w;
+		v->out_h = out_h;
+	}
+	// An untagged stream gets BT.601, SDL's default, so the picture looks the same on both paths
+	bool bt709 = f->colorspace == AVCOL_SPC_BT709;
+	D3D11_VIDEO_PROCESSOR_COLOR_SPACE yuv = { 0 };
+	yuv.YCbCr_Matrix = bt709;
+	yuv.Nominal_Range = f->color_range == AVCOL_RANGE_JPEG ? D3D11_VIDEO_PROCESSOR_NOMINAL_RANGE_0_255 : D3D11_VIDEO_PROCESSOR_NOMINAL_RANGE_16_235;
+	ID3D11VideoContext_VideoProcessorSetStreamColorSpace(v->vctx, v->vp, 0, &yuv);
+	if(v->vctx1)
+	{
+		bool full = f->color_range == AVCOL_RANGE_JPEG;
+		DXGI_COLOR_SPACE_TYPE cs = bt709 ? (full ? DXGI_COLOR_SPACE_YCBCR_FULL_G22_LEFT_P709 : DXGI_COLOR_SPACE_YCBCR_STUDIO_G22_LEFT_P709)
+			: (full ? DXGI_COLOR_SPACE_YCBCR_FULL_G22_LEFT_P601 : DXGI_COLOR_SPACE_YCBCR_STUDIO_G22_LEFT_P601);
+		ID3D11VideoContext1_VideoProcessorSetStreamColorSpace1(v->vctx1, v->vp, 0, cs);
+	}
+	return true;
+}
+
+// The decoder reuses a handful of texture slices, so their views are made once and kept
+static ID3D11VideoProcessorInputView *gpu_input(GpuView *v, ID3D11Texture2D *tex, UINT slice)
+{
+	for(int i = 0; i < v->in_count; i++)
+		if(v->in_tex[i] == tex && v->in_slice[i] == slice)
+			return v->in[i];
+	if(v->in_count == GPU_VIEWS)
+		gpu_views_clear(v);
+	D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC desc = { .ViewDimension = D3D11_VPIV_DIMENSION_TEXTURE2D };
+	desc.Texture2D.ArraySlice = slice;
+	ID3D11VideoProcessorInputView *view = NULL;
+	if(FAILED(ID3D11VideoDevice_CreateVideoProcessorInputView(v->vdev, (ID3D11Resource *)tex, v->vpe, &desc, &view)))
+		return NULL;
+	v->in[v->in_count] = view;
+	v->in_tex[v->in_count] = tex;
+	v->in_slice[v->in_count] = slice;
+	v->in_count++;
+	return view;
+}
+
+static bool gpu_draw(GpuView *v, const AVFrame *f)
+{
+#ifdef PSSTREAM_TEST
+	if(GetEnvironmentVariableW(L"PSSTREAM_TEST_GPU_FAIL", NULL, 0))
+		return false;
+#endif
+	RECT client;
+	GetClientRect(v->hwnd, &client);
+	if(client.right <= 0 || client.bottom <= 0)
+		return true; // minimized, nothing to draw into
+	v->hw->lock(v->hw->lock_ctx);
+	bool ok = gpu_prepare(v, f, client.right, client.bottom);
+	ID3D11VideoProcessorInputView *in = ok ? gpu_input(v, (ID3D11Texture2D *)f->data[0], (UINT)(intptr_t)f->data[1]) : NULL;
+	if(in)
+	{
+		D3D11_VIDEO_PROCESSOR_STREAM stream = { .Enable = TRUE, .pInputSurface = in };
+		ok = SUCCEEDED(ID3D11VideoContext_VideoProcessorBlt(v->vctx, v->vp, v->out, 0, 1, &stream))
+			&& SUCCEEDED(IDXGISwapChain_Present(v->swap, 0, 0));
+	}
+	v->hw->unlock(v->hw->lock_ctx);
+	return ok && in;
+}
+
+#ifdef PSSTREAM_TEST
+static void gpu_shot(GpuView *v, const char *path)
+{
+	ID3D11Texture2D *back = NULL, *copy = NULL;
+	if(FAILED(IDXGISwapChain_GetBuffer(v->swap, 0, &IID_ID3D11Texture2D, (void **)&back)))
+		return;
+	D3D11_TEXTURE2D_DESC desc;
+	ID3D11Texture2D_GetDesc(back, &desc);
+	desc.Usage = D3D11_USAGE_STAGING;
+	desc.BindFlags = 0;
+	desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+	desc.MiscFlags = 0;
+	D3D11_MAPPED_SUBRESOURCE map;
+	v->hw->lock(v->hw->lock_ctx);
+	if(SUCCEEDED(ID3D11Device_CreateTexture2D(v->hw->device, &desc, NULL, &copy)))
+	{
+		ID3D11DeviceContext_CopyResource(v->hw->device_context, (ID3D11Resource *)copy, (ID3D11Resource *)back);
+		if(SUCCEEDED(ID3D11DeviceContext_Map(v->hw->device_context, (ID3D11Resource *)copy, 0, D3D11_MAP_READ, 0, &map)))
+		{
+			SDL_Surface *s = SDL_CreateRGBSurfaceWithFormatFrom(map.pData, desc.Width, desc.Height, 32, map.RowPitch, SDL_PIXELFORMAT_ARGB8888);
+			SDL_SaveBMP(s, path);
+			SDL_FreeSurface(s);
+			ID3D11DeviceContext_Unmap(v->hw->device_context, (ID3D11Resource *)copy, 0);
+		}
+		ID3D11Texture2D_Release(copy);
+	}
+	v->hw->unlock(v->hw->lock_ctx);
+	ID3D11Texture2D_Release(back);
+}
+#endif
+
 static double now_ms(void)
 {
 	static LARGE_INTEGER freq;
@@ -436,8 +697,11 @@ static DWORD WINAPI video_thread_main(void *arg)
 		win_x = win_y = SDL_WINDOWPOS_CENTERED;
 	SDL_Window *window = SDL_CreateWindow(title, win_x, win_y, config_int("video_w", S(960), 320, 16384), config_int("video_h", S(540), 180, 16384),
 			SDL_WINDOW_RESIZABLE | (g.test_hidden ? SDL_WINDOW_HIDDEN : 0));
-	SDL_Renderer *renderer = window ? SDL_CreateRenderer(window, -1, 0) : NULL;
-	if(!renderer)
+	GpuView gpu;
+	bool on_gpu = window && gpu_open(&gpu, window, g.decoder.hw_device_ctx);
+	SDL_Renderer *renderer = window && !on_gpu ? SDL_CreateRenderer(window, -1, 0) : NULL;
+	AVFrame *last = NULL; // kept for redrawing the window between frames
+	if(!renderer && !on_gpu)
 	{
 		CHIAKI_LOGE(&g.log, "SDL window failed: %s", SDL_GetError());
 		set_status(L"Görüntü penceresi açılamadı, ses çalışmaya devam eder");
@@ -451,7 +715,7 @@ static DWORD WINAPI video_thread_main(void *arg)
 	double stat_pull = 0, stat_copy = 0, stat_upload = 0, stat_present = 0, stat_start = now_ms();
 	int stat_frames = 0, stat_lost = 0, stat_windows = 0;
 	bool fullscreen = false;
-	while(renderer && !g.video_stop)
+	while((renderer || on_gpu) && !g.video_stop)
 	{
 		SDL_Event e;
 		if(SDL_WaitEventTimeout(&e, 100))
@@ -486,7 +750,31 @@ static DWORD WINAPI video_thread_main(void *arg)
 			AVFrame *f = frame.frame;
 			stat_pull += now_ms() - t0;
 			stat_lost += lost;
-			if(f)
+			if(f && on_gpu && f->format != AV_PIX_FMT_D3D11)
+			{
+				// Not a frame the GPU path can take, so SDL draws from here on
+				CHIAKI_LOGW(&g.log, "Video frame not on the GPU, drawing it with SDL instead");
+				av_frame_free(&last);
+				gpu_close(&gpu);
+				on_gpu = false;
+				renderer = SDL_CreateRenderer(window, -1, 0);
+				if(!renderer)
+					av_frame_free(&f);
+			}
+			if(f && on_gpu)
+			{
+				if(f->width != tex_w || f->height != tex_h)
+				{
+					tex_w = f->width;
+					tex_h = f->height;
+					CHIAKI_LOGI(&g.log, "Video: %dx%d, hardware decoding, drawn on the GPU", tex_w, tex_h);
+				}
+				av_frame_free(&last);
+				last = f;
+				stat_frames++;
+				dirty = true;
+			}
+			else if(f)
 			{
 				AVFrame *show = f;
 				if(f->hw_frames_ctx)
@@ -522,7 +810,31 @@ static DWORD WINAPI video_thread_main(void *arg)
 				av_frame_free(&f);
 			}
 		}
-		if(dirty)
+		if(dirty && on_gpu)
+		{
+			double t0 = now_ms();
+			if(last && !gpu_draw(&gpu, last))
+			{
+				// Some drivers can't run the video processor; a black window would be worse than the copy
+				CHIAKI_LOGW(&g.log, "Drawing video on the GPU failed, drawing it with SDL instead");
+				av_frame_free(&last);
+				gpu_close(&gpu);
+				on_gpu = false;
+				renderer = SDL_CreateRenderer(window, -1, 0);
+				if(!renderer)
+					CHIAKI_LOGE(&g.log, "SDL window failed: %s", SDL_GetError());
+			}
+#ifdef PSSTREAM_TEST
+			if(g.test_video_shot && last)
+			{
+				gpu_shot(&gpu, g.test_video_shot);
+				g.test_video_shot = NULL;
+			}
+#endif
+			stat_present += now_ms() - t0;
+			dirty = false;
+		}
+		else if(dirty && renderer)
 		{
 			double t0 = now_ms();
 			SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255);
@@ -563,6 +875,9 @@ static DWORD WINAPI video_thread_main(void *arg)
 		}
 	}
 	av_frame_free(&sw_frame);
+	av_frame_free(&last);
+	if(on_gpu)
+		gpu_close(&gpu);
 	if(texture)
 		SDL_DestroyTexture(texture);
 	if(renderer)
@@ -799,6 +1114,8 @@ static DWORD WINAPI gamepad_main(void *arg)
 	(void)arg;
 	SDL_GameController *pads[PAD_MAX] = { 0 };
 	bool sdl_on = false;
+	int devices_logged = -1;
+	SDL_JoystickID open_failed = -1; // tried once, so the log isn't flooded every poll
 	while(!g.quit)
 	{
 		if(!settings_get().gamepad)
@@ -813,6 +1130,8 @@ static DWORD WINAPI gamepad_main(void *arg)
 				SDL_QuitSubSystem(SDL_INIT_GAMECONTROLLER);
 				LeaveCriticalSection(&g.sdl_lock);
 				sdl_on = false;
+				devices_logged = -1;
+				open_failed = -1;
 				pad_set_name("");
 			}
 			Sleep(250);
@@ -824,6 +1143,10 @@ static DWORD WINAPI gamepad_main(void *arg)
 			SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");
 			// XInput, DirectInput and HIDAPI cover every pad. This one adds about 150 MB and nothing else
 			SDL_SetHint(SDL_HINT_JOYSTICK_WGI, "0");
+			// Without this, SDL only looks for pads at the moment Windows reports a new device. An Xbox
+			// pad gets its XInput slot a moment later, so one plugged in or turned on while the app ran
+			// was never found. SDL's own thread checks the slots every second.
+			SDL_SetHint(SDL_HINT_JOYSTICK_THREAD, "1");
 			EnterCriticalSection(&g.sdl_lock);
 			bool ok = SDL_InitSubSystem(SDL_INIT_GAMECONTROLLER) == 0;
 			LeaveCriticalSection(&g.sdl_lock);
@@ -838,10 +1161,19 @@ static DWORD WINAPI gamepad_main(void *arg)
 			SDL_GameControllerEventState(SDL_IGNORE);
 			sdl_on = true;
 		}
+		// SDL's device windows made on this thread only hear about new pads through its messages
+		MSG msg;
+		while(PeekMessageW(&msg, NULL, 0, 0, PM_REMOVE))
+			DispatchMessageW(&msg);
 		SDL_GameControllerUpdate();
 #ifdef PSSTREAM_TEST
 		pad_test_script();
 #endif
+		if(SDL_NumJoysticks() != devices_logged)
+		{
+			devices_logged = SDL_NumJoysticks();
+			CHIAKI_LOGI(&g.log, "Gamepad devices found: %d", devices_logged);
+		}
 
 		for(int i = 0; i < PAD_MAX; i++)
 			if(pads[i] && !SDL_GameControllerGetAttached(pads[i]))
@@ -855,7 +1187,7 @@ static DWORD WINAPI gamepad_main(void *arg)
 			bool known = false;
 			for(int i = 0; i < PAD_MAX; i++)
 				known = known || (pads[i] && SDL_JoystickInstanceID(SDL_GameControllerGetJoystick(pads[i])) == id);
-			if(known)
+			if(known || id == open_failed)
 				continue;
 			if(!SDL_IsGameController(index))
 				pad_add_generic_mapping(index);
@@ -863,6 +1195,11 @@ static DWORD WINAPI gamepad_main(void *arg)
 				if(!pads[i])
 				{
 					pads[i] = SDL_GameControllerOpen(index);
+					if(!pads[i])
+					{
+						open_failed = id;
+						CHIAKI_LOGW(&g.log, "Gamepad %s couldn't be opened: %s", SDL_JoystickNameForIndex(index), SDL_GetError());
+					}
 					break;
 				}
 		}

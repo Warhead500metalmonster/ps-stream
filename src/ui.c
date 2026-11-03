@@ -2229,7 +2229,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmd, int show)
 #ifdef PSSTREAM_TEST
 	if(argc == 3 && wcscmp(argv[1], L"--demo") == 0)
 	{
-		g.test_hidden = true;
+		g.test_hidden = !GetEnvironmentVariableW(L"PSSTREAM_TEST_SHOW_VIDEO", NULL, 0);
 		thread_main = demo_main;
 		thread_arg = argv[2];
 	}
