@@ -135,6 +135,8 @@ static const wchar_t *const english[][2] = {
 	{ L"Sesi kısar, bağlantı açık kalır. Kısayol: Gelişmiş ayarlar", L"Mutes the sound and stays connected. Hotkey: Advanced settings" },
 	{ L"Kaliteyi düşür", L"Lower quality" },
 	{ L"Bağlantı zayıf, görüntü kare kaybediyor", L"Weak connection: video is losing frames" },
+	{ L"Görüntü takılıyor. Bilgisayar 2.4 GHz Wi-Fi'de, 5 GHz ağa geçmek çok iyi gelir", L"Video is stuttering. This PC is on 2.4 GHz Wi-Fi; 5 GHz helps a lot" },
+	{ L"Ses kesiliyor. Bilgisayar 2.4 GHz Wi-Fi'de, 5 GHz ağa geçmek çok iyi gelir", L"Sound is cutting out. This PC is on 2.4 GHz Wi-Fi; 5 GHz helps a lot" },
 	{ L"Wi-Fi zayıf, ses kesiliyor. Modeme yaklaşmak veya 5 GHz'e geçmek iyi gelir", L"Weak Wi-Fi: audio is cutting out. Moving closer to the router or using 5 GHz helps" },
 	{ L"PS5'e bağlandı", L"Connected to your PS5" },
 	{ L"PS5 bağlantısı koptu, yeniden deneniyor", L"Lost the PS5 connection, trying again" },

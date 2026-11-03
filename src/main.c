@@ -49,7 +49,7 @@
 
 // Below this rate we are outside what chiaki-ng offers, so a console that refuses to start
 // gets a second try with it.
-#define APP_VERSION "0.1.19"
+#define APP_VERSION "0.1.20"
 #define UPDATE_RECHECK_MS (6 * 60 * 60 * 1000)
 #define UPDATE_TRIES 6
 #define UPDATE_RETRY_MS 20000
@@ -165,6 +165,7 @@ static struct {
 
 	HANDLE wake;
 	volatile LONG want_audio, want_video, quit;
+	volatile LONG wifi_channel; // 0 when unknown or not on Wi-Fi
 	volatile LONG ended, connected, fatal, audio_reopen;
 	ChiakiQuitReason quit_reason;
 
@@ -335,7 +336,9 @@ static void audio_frame_cb(int16_t *buf, size_t samples_count, void *user)
 	Uint32 bytes_per_ms = g.audio_rate * g.audio_channels * sizeof(int16_t) / 1000;
 	Uint32 queued = SDL_GetQueuedAudioSize(g.audio_dev);
 	DWORD now = GetTickCount();
-	int target_max = s.buffer_ms / 2 < AUDIO_TARGET_MAX_MS ? s.buffer_ms / 2 : AUDIO_TARGET_MAX_MS;
+	// Two thirds leaves room for a burst before the backlog check below throws everything away.
+	// Real sessions on weak Wi-Fi kept dropping out at the old half.
+	int target_max = s.buffer_ms * 2 / 3 < AUDIO_TARGET_MAX_MS ? s.buffer_ms * 2 / 3 : AUDIO_TARGET_MAX_MS;
 	if(queued > (Uint32)s.buffer_ms * bytes_per_ms)
 	{
 		// Wi-Fi bursts pile up here; dropping the backlog keeps sound in sync with the TV
@@ -714,6 +717,7 @@ static DWORD WINAPI video_thread_main(void *arg)
 	bool dirty = true;
 	double stat_pull = 0, stat_copy = 0, stat_upload = 0, stat_present = 0, stat_start = now_ms();
 	int stat_frames = 0, stat_lost = 0, stat_windows = 0;
+	double stat_loss = 0; // highest packet loss chiaki measured in this window, which it reports to the PS5
 	bool fullscreen = false;
 	while((renderer || on_gpu) && !g.video_stop)
 	{
@@ -858,6 +862,9 @@ static DWORD WINAPI video_thread_main(void *arg)
 			stat_present += now_ms() - t0;
 			dirty = false;
 		}
+		double loss = g.session.stream_connection.congestion_control.packet_loss;
+		if(loss > stat_loss)
+			stat_loss = loss;
 		if(now_ms() - stat_start >= 2000 && stat_frames)
 		{
 			double fps = stat_frames * 1000.0 / (now_ms() - stat_start);
@@ -866,11 +873,13 @@ static DWORD WINAPI video_thread_main(void *arg)
 			if(stat_lost || ++stat_windows >= STATS_LOG_EVERY)
 			{
 				stat_windows = 0;
-				CHIAKI_LOGI(&g.log, "Video stats: %.1f fps, lost %d, per frame ms: pull %.1f, copy %.1f, upload %.1f, present %.1f",
-						fps, stat_lost, stat_pull / stat_frames, stat_copy / stat_frames, stat_upload / stat_frames, stat_present / stat_frames);
+				CHIAKI_LOGI(&g.log, "Video stats: %.1f fps, lost %d, packet loss peak %.0f%%, %.1f Mbps, per frame ms: pull %.1f, copy %.1f, upload %.1f, present %.1f",
+						fps, stat_lost, stat_loss * 100, g.session.stream_connection.measured_bitrate,
+						stat_pull / stat_frames, stat_copy / stat_frames, stat_upload / stat_frames, stat_present / stat_frames);
 			}
 			stat_pull = stat_copy = stat_upload = stat_present = 0;
 			stat_frames = stat_lost = 0;
+			stat_loss = 0;
 			stat_start = now_ms();
 		}
 	}
@@ -1480,6 +1489,7 @@ static void wifi_tune(bool on)
 		ULONG *channel = NULL;
 		bool have_link = WlanQueryInterface(g.wlan, id, wlan_intf_opcode_current_connection, NULL, &size, (void **)&link, NULL) == ERROR_SUCCESS && link;
 		bool have_channel = WlanQueryInterface(g.wlan, id, wlan_intf_opcode_channel_number, NULL, &size, (void **)&channel, NULL) == ERROR_SUCCESS && channel;
+		g.wifi_channel = have_channel ? (LONG)*channel : 0;
 		if(have_link)
 			CHIAKI_LOGI(&g.log, "Wi-Fi link: signal %lu%%, receive %lu Mbps, send %lu Mbps, channel %lu",
 					link->wlanAssociationAttributes.wlanSignalQuality, link->wlanAssociationAttributes.ulRxRate / 1000,

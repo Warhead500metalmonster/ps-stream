@@ -1447,7 +1447,12 @@ static void connection_watch(void)
 		CHIAKI_LOGI(&g.log, "Weak connection: %d lost frames, %d audio dropouts in the last %d s", lost, drops, WEAK_WINDOW_MS / 1000);
 		ui.weak = true;
 		ui.weak_shown_at = now;
-		set_status(g.want_video ? L"Bağlantı zayıf, görüntü kare kaybediyor" : L"Wi-Fi zayıf, ses kesiliyor. Modeme yaklaşmak veya 5 GHz'e geçmek iyi gelir");
+		// Channels 1 to 14 are 2.4 GHz, where neighbours and microwaves cause most of the loss
+		bool slow_band = g.wifi_channel >= 1 && g.wifi_channel <= 14;
+		if(g.want_video)
+			set_status(slow_band ? L"Görüntü takılıyor. Bilgisayar 2.4 GHz Wi-Fi'de, 5 GHz ağa geçmek çok iyi gelir" : L"Bağlantı zayıf, görüntü kare kaybediyor");
+		else
+			set_status(slow_band ? L"Ses kesiliyor. Bilgisayar 2.4 GHz Wi-Fi'de, 5 GHz ağa geçmek çok iyi gelir" : L"Wi-Fi zayıf, ses kesiliyor. Modeme yaklaşmak veya 5 GHz'e geçmek iyi gelir");
 	}
 	if(was_weak != ui.weak)
 		ui_frame();
@@ -1987,6 +1992,7 @@ static DWORD WINAPI ui_test_main(void *arg)
 	{
 		Sleep(800);
 		ui.weak_checked_at -= WEAK_WINDOW_MS;
+		g.wifi_channel = 6;
 		InterlockedExchangeAdd(&g.video_lost_total, 40);
 		Sleep(900);
 		test_log_status("weak connection");
@@ -2091,13 +2097,17 @@ static DWORD WINAPI demo_main(void *arg)
 	char fps_text[8] = "30";
 	GetEnvironmentVariableA("PSSTREAM_TEST_FPS", fps_text, sizeof(fps_text));
 	int fps = atoi(fps_text);
-	video_start(CHIAKI_CODEC_H264, fps, settings_get().hw != 0);
+	bool hevc = GetEnvironmentVariableW(L"PSSTREAM_TEST_HEVC", NULL, 0) != 0;
+	bool started = video_start(hevc ? CHIAKI_CODEC_H265 : CHIAKI_CODEC_H264, fps, settings_get().hw != 0);
+	CHIAKI_LOGI(&g.log, "Demo video %s: %s", hevc ? "H.265" : "H.264", started ? "started" : "failed to start");
 	long start = 0;
 	int count = 0;
 	char shot[MAX_PATH];
 	for(long i = 4; i <= size - 5 && !g.quit; i++)
 	{
-		if(i != size - 5 && !(data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 0 && data[i + 3] == 1 && (data[i + 4] & 0x1f) == 9))
+		bool aud = data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 0 && data[i + 3] == 1
+			&& (hevc ? (data[i + 4] >> 1 & 0x3f) == 35 : (data[i + 4] & 0x1f) == 9);
+		if(i != size - 5 && !aud)
 			continue;
 		chiaki_ffmpeg_decoder_video_sample_cb(data + start, i - start, 0, false, &g.decoder);
 		audio_frame_cb(silence, 480, NULL);
@@ -2118,7 +2128,19 @@ static DWORD WINAPI demo_main(void *arg)
 // A crash leaves no trace otherwise, and the log is the first thing to look at
 static LONG WINAPI crash_log(EXCEPTION_POINTERS *info)
 {
-	CHIAKI_LOGE(&g.log, "Crash: code %#lx at %p", info->ExceptionRecord->ExceptionCode, info->ExceptionRecord->ExceptionAddress);
+	// The file and offset say where it happened, which a bare address can't once the app is closed
+	HMODULE module = NULL;
+	char name[MAX_PATH] = "unknown";
+	void *at = info->ExceptionRecord->ExceptionAddress;
+	if(GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR)at, &module))
+	{
+		GetModuleFileNameA(module, name, sizeof(name));
+		const char *slash = strrchr(name, '\\');
+		if(slash)
+			memmove(name, slash + 1, strlen(slash));
+	}
+	CHIAKI_LOGE(&g.log, "Crash: code %#lx at %p (%s+%#llx, thread %lu)", info->ExceptionRecord->ExceptionCode, at, name,
+			(unsigned long long)((uintptr_t)at - (uintptr_t)module), GetCurrentThreadId());
 	return EXCEPTION_CONTINUE_SEARCH;
 }
 
