@@ -45,8 +45,10 @@
 
 // Below this rate we are outside what chiaki-ng offers, so a console that refuses to start
 // gets a second try with it.
-#define APP_VERSION "0.1.17"
+#define APP_VERSION "0.1.18"
 #define UPDATE_RECHECK_MS (6 * 60 * 60 * 1000)
+#define UPDATE_TRIES 6
+#define UPDATE_RETRY_MS 20000
 #define UPDATE_DOWNLOAD_PREFIX "https://github.com/Warhead500metalmonster/ps-stream/releases/download/"
 #define RELEASES_URL L"https://github.com/Warhead500metalmonster/ps-stream/releases/latest"
 #define REPO_URL L"https://github.com/Warhead500metalmonster/ps-stream"
@@ -2254,8 +2256,6 @@ static DWORD WINAPI update_check_main(void *arg)
 		current = test_version;
 #endif
 	static HttpBody body;
-	body.size = 0;
-	body.data[0] = 0;
 	CURL *curl = curl_easy_init();
 	if(!curl)
 		return 0;
@@ -2271,7 +2271,18 @@ static DWORD WINAPI update_check_main(void *arg)
 	curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, http_write);
 	curl_easy_setopt(curl, CURLOPT_WRITEDATA, &body);
 	curl_easy_setopt(curl, CURLOPT_TIMEOUT, 15L);
-	CURLcode res = curl_easy_perform(curl);
+	// Right after Windows starts, the network often isn't ready yet, and the next check is hours away
+	CURLcode res;
+	for(int attempt = 1;; attempt++)
+	{
+		body.size = 0;
+		body.data[0] = 0;
+		res = curl_easy_perform(curl);
+		if(res == CURLE_OK || attempt == UPDATE_TRIES || g.quit)
+			break;
+		CHIAKI_LOGI(&g.log, "Update check failed (%s), trying again", curl_easy_strerror(res));
+		Sleep(UPDATE_RETRY_MS * attempt);
+	}
 	curl_easy_cleanup(curl);
 	char tag[32] = "";
 	if(res == CURLE_OK && json_get(body.data, "tag_name", tag, sizeof(tag)) && version_number(tag) > version_number(current))
