@@ -45,7 +45,7 @@
 
 // Below this rate we are outside what chiaki-ng offers, so a console that refuses to start
 // gets a second try with it.
-#define APP_VERSION "0.1.16"
+#define APP_VERSION "0.1.17"
 #define UPDATE_RECHECK_MS (6 * 60 * 60 * 1000)
 #define UPDATE_DOWNLOAD_PREFIX "https://github.com/Warhead500metalmonster/ps-stream/releases/download/"
 #define RELEASES_URL L"https://github.com/Warhead500metalmonster/ps-stream/releases/latest"
@@ -635,9 +635,11 @@ static void pad_add_generic_mapping(int index)
 
 static void pad_set_name(const char *name)
 {
-	wchar_t wide[PAD_MAX_NAME];
-	if(!MultiByteToWideChar(CP_UTF8, 0, name, -1, wide, PAD_MAX_NAME))
-		wide[0] = 0;
+	// Converted whole and cut afterwards, since a name too long for the buffer fails to convert,
+	// and an empty name would read as no pad at all
+	wchar_t wide[512];
+	if(!MultiByteToWideChar(CP_UTF8, 0, name, -1, wide, 512))
+		wcscpy(wide, name[0] ? L"Gamepad" : L"");
 	wide[PAD_MAX_NAME - 1] = 0;
 	EnterCriticalSection(&g.lock);
 	bool changed = wcscmp(g.pad_name, wide) != 0;
@@ -874,7 +876,7 @@ static DWORD WINAPI gamepad_main(void *arg)
 			if(!pad)
 				continue;
 			if(!name[0])
-				name = SDL_GameControllerName(pad) ? SDL_GameControllerName(pad) : "Gamepad";
+				name = SDL_GameControllerName(pad) && SDL_GameControllerName(pad)[0] ? SDL_GameControllerName(pad) : "Gamepad";
 			pad_map_buttons(pad, &state.buttons);
 			int l2 = SDL_GameControllerGetAxis(pad, SDL_CONTROLLER_AXIS_TRIGGERLEFT) >> 7;
 			int r2 = SDL_GameControllerGetAxis(pad, SDL_CONTROLLER_AXIS_TRIGGERRIGHT) >> 7;

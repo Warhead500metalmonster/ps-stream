@@ -10,6 +10,7 @@ static const wchar_t *const english[][2] = {
 	{ L"Kapat", L"Turn off" },
 	{ L"Aç", L"Turn on" },
 	{ L"Ses", L"Audio" },
+	{ L"Kalite", L"Quality" },
 	{ L"Görüntü", L"Video" },
 	{ L"Düşük", L"Low" },
 	{ L"Yüksek", L"High" },

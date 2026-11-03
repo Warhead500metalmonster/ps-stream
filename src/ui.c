@@ -538,6 +538,22 @@ static void data_folder_open(void)
 	ShellExecuteW(NULL, L"open", g.data_dir, NULL, NULL, SW_SHOWNORMAL);
 }
 
+static const wchar_t *const preset_names[] = { L"En düşük", L"Düşük", L"Dengeli", L"Yüksek", L"En yüksek" };
+
+// During audio only, picking a video quality means the person wants to see the game
+static void preset_select(int i)
+{
+	bool audio_only = g.want_audio && !g.want_video;
+	Settings s = settings_get();
+	s.res = presets[i].res;
+	s.fps = presets[i].fps;
+	s.kbps = presets[i].kbps;
+	s.h265 = presets[i].h265;
+	settings_commit(&s);
+	if(audio_only)
+		toggle(UI_VIDEO);
+}
+
 static int preset_match(const Settings *s)
 {
 	for(int i = 0; i < PRESET_COUNT; i++)
@@ -679,7 +695,6 @@ static void page_play(void)
 	swprintf(info, 128, L"%dp  ·  %d FPS  ·  %ls  ·  %ls", resolutions[s.res].height, s.fps, rate, s.h265 ? L"H.265" : L"H.264");
 	card_info(vx + 22, cy + 146, cw - 44, info, COLOR(95, 0, 0, 0));
 
-	static const wchar_t *const names[] = { L"En düşük", L"Düşük", L"Dengeli", L"Yüksek", L"En yüksek" };
 	static const wchar_t *const subs[] = { L"360p, 0,5 Mbps", L"360p, 2 Mbps", L"720p, 6 Mbps", L"1080p 60, 20 Mbps", L"1080p 60, 50 Mbps" };
 	bool audio_only = g.want_audio && !g.want_video;
 	int current = audio_only ? -1 : preset_match(&s);
@@ -703,7 +718,7 @@ static void page_play(void)
 		}
 		if(!is_preset)
 			text(i < 0 ? ICON_VOLUME : ICON_GEAR, ui.icon, x, y + 2, w, 20, selected ? C_TEXT : C_MUTED, 1, 1);
-		text(is_preset ? names[i] : i < 0 ? L"Sadece ses" : L"Özel", ui.semi, x, y + 22, w, 24, C_TEXT, 1, 1);
+		text(is_preset ? preset_names[i] : i < 0 ? L"Sadece ses" : L"Özel", ui.semi, x, y + 22, w, 24, C_TEXT, 1, 1);
 		text(is_preset ? subs[i] : i < 0 ? L"Görüntü yok" : L"Ayarlardan seç", ui.small, x, y + 46, w, 20, selected ? WHITE(225) : C_MUTED, 1, 1);
 		if(mouse_in(x, y, w, h))
 			ui.tip = i < 0 ? L"Görüntüyü kapatır, sadece oyunun sesi gelir." : is_preset ? L"Görüntü kalitesi. Sadece ses açıkken basarsan görüntü de açılır." : L"Görüntü kalitesini kendin seç.";
@@ -717,15 +732,7 @@ static void page_play(void)
 				show_page(PAGE_SETTINGS);
 			}
 			else
-			{
-				s.res = presets[i].res;
-				s.fps = presets[i].fps;
-				s.kbps = presets[i].kbps;
-				s.h265 = presets[i].h265;
-				settings_commit(&s);
-				if(audio_only)
-					toggle(UI_VIDEO);
-			}
+				preset_select(i);
 		}
 	}
 	if(extra > 1)
@@ -1472,6 +1479,15 @@ static void tray_menu(void)
 	AppendMenuW(menu, MF_STRING | (g.want_audio ? MF_CHECKED : 0), 2, tr(L"Ses"));
 	AppendMenuW(menu, MF_STRING | (g.want_video ? MF_CHECKED : 0), 3, tr(L"Görüntü"));
 	AppendMenuW(menu, MF_STRING | (g.muted ? MF_CHECKED : 0), 5, tr(L"Sesi kıs"));
+	// The same choices as the row on the Play page, for someone who keeps the window in the tray
+	HMENU quality = CreatePopupMenu();
+	Settings s = settings_get();
+	int current = g.want_audio && !g.want_video ? -1 : preset_match(&s);
+	AppendMenuW(quality, MF_STRING | (current < 0 ? MF_CHECKED : 0), 10, tr(L"Sadece ses"));
+	AppendMenuW(quality, MF_SEPARATOR, 0, NULL);
+	for(int i = 0; i < PRESET_COUNT; i++)
+		AppendMenuW(quality, MF_STRING | (current == i ? MF_CHECKED : 0), 11 + i, tr(preset_names[i]));
+	AppendMenuW(menu, MF_POPUP, (UINT_PTR)quality, tr(L"Kalite"));
 	AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
 	AppendMenuW(menu, MF_STRING, 4, tr(L"Çıkış"));
 	POINT pt;
@@ -1485,6 +1501,10 @@ static void tray_menu(void)
 		toggle(cmd == 2 ? UI_AUDIO : UI_VIDEO);
 	else if(cmd == 5)
 		mute_toggle();
+	else if(cmd == 10)
+		audio_only_select();
+	else if(cmd >= 11 && cmd < 11 + PRESET_COUNT)
+		preset_select(cmd - 11);
 	else if(cmd == 4)
 		DestroyWindow(g.hwnd);
 }
