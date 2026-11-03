@@ -31,10 +31,28 @@ index 41c6bbf..9508442 100644
  	return CHIAKI_ERR_SUCCESS;
  
 diff --git a/lib/src/streamconnection.c b/lib/src/streamconnection.c
-index afa1a60..456b604 100644
+index afa1a60..0cfd598 100644
 --- a/lib/src/streamconnection.c
 +++ b/lib/src/streamconnection.c
-@@ -289,15 +289,18 @@ CHIAKI_EXPORT ChiakiErrorCode chiaki_stream_connection_run(ChiakiStreamConnectio
+@@ -31,6 +31,8 @@
+ #define STREAM_CONNECTION_PORT 9296
+ 
+ #define EXPECT_TIMEOUT_MS 5000
++// Room for the Takion handshake to resend on weak Wi-Fi (8 tries, a second each)
++#define TAKION_CONNECT_TIMEOUT_MS 10000
+ 
+ #define HEARTBEAT_INTERVAL_MS 1000
+ 
+@@ -226,7 +228,7 @@ CHIAKI_EXPORT ChiakiErrorCode chiaki_stream_connection_run(ChiakiStreamConnectio
+ 		goto close_takion;
+ 	}
+ 
+-	err = chiaki_cond_timedwait_pred(&stream_connection->state_cond, &stream_connection->state_mutex, EXPECT_TIMEOUT_MS, state_finished_cond_check, stream_connection);
++	err = chiaki_cond_timedwait_pred(&stream_connection->state_cond, &stream_connection->state_mutex, TAKION_CONNECT_TIMEOUT_MS, state_finished_cond_check, stream_connection);
+ 	assert(err == CHIAKI_ERR_SUCCESS || err == CHIAKI_ERR_TIMEOUT);
+ 	CHECK_STOP(close_takion);
+ 	if(err != CHIAKI_ERR_SUCCESS)
+@@ -289,15 +291,18 @@ CHIAKI_EXPORT ChiakiErrorCode chiaki_stream_connection_run(ChiakiStreamConnectio
  
  	err = chiaki_mutex_lock(&stream_connection->feedback_sender_mutex);
  	assert(err == CHIAKI_ERR_SUCCESS);
@@ -60,7 +78,7 @@ index afa1a60..456b604 100644
  	chiaki_mutex_unlock(&stream_connection->feedback_sender_mutex);
  
  	stream_connection->state = STATE_IDLE;
-@@ -326,8 +329,11 @@ CHIAKI_EXPORT ChiakiErrorCode chiaki_stream_connection_run(ChiakiStreamConnectio
+@@ -326,8 +331,11 @@ CHIAKI_EXPORT ChiakiErrorCode chiaki_stream_connection_run(ChiakiStreamConnectio
  
  	err = chiaki_mutex_lock(&stream_connection->feedback_sender_mutex);
  	assert(err == CHIAKI_ERR_SUCCESS);
@@ -74,7 +92,7 @@ index afa1a60..456b604 100644
  	chiaki_mutex_unlock(&stream_connection->feedback_sender_mutex);
  
  	err = CHIAKI_ERR_SUCCESS;
-@@ -959,7 +965,9 @@ static void stream_connection_takion_data_expect_streaminfo(ChiakiStreamConnecti
+@@ -959,7 +967,9 @@ static void stream_connection_takion_data_expect_streaminfo(ChiakiStreamConnecti
  
  	stream_connection_send_streaminfo_ack(stream_connection);
  	
@@ -86,10 +104,22 @@ index afa1a60..456b604 100644
  	{
  		CHIAKI_LOGE(stream_connection->log, "StreamConnection failed to send controller connection");
 diff --git a/lib/src/takion.c b/lib/src/takion.c
-index 38f9f5d..457b710 100644
+index 38f9f5d..8710c51 100644
 --- a/lib/src/takion.c
 +++ b/lib/src/takion.c
-@@ -257,7 +257,7 @@ CHIAKI_EXPORT ChiakiErrorCode chiaki_takion_connect(ChiakiTakion *takion, Chiaki
+@@ -55,7 +55,10 @@
+ 
+ #define TAKION_EXPECT_TIMEOUT_MS 5000
+ 
+-#define MAX_CONNECT_RESEND_TRIES 3
++// The handshake answer normally comes back within one round trip, so waiting a second before
++// asking again lets a lost packet on weak Wi-Fi be resent inside StreamConnection's wait
++#define MAX_CONNECT_RESEND_TRIES 8
++#define TAKION_CONNECT_RESEND_TIMEOUT_MS 1000
+ /**
+  * Base type of Takion packets. Lower nibble of the first byte in datagrams.
+  */
+@@ -257,7 +260,7 @@ CHIAKI_EXPORT ChiakiErrorCode chiaki_takion_connect(ChiakiTakion *takion, Chiaki
  			CHIAKI_LOGE(takion->log, "Takion had problem reading extra messages from socket using PSN Connection with error: " CHIAKI_SOCKET_ERROR_FMT, CHIAKI_SOCKET_ERROR_VALUE);
  			goto error_sock;
  		}
@@ -98,7 +128,7 @@ index 38f9f5d..457b710 100644
  		int r = setsockopt(takion->sock, SOL_SOCKET, SO_RCVBUF, (const CHIAKI_SOCKET_BUF_TYPE)&rcvbuf_val, sizeof(rcvbuf_val));
  		if(r < 0)
  		{
-@@ -345,7 +345,7 @@ CHIAKI_EXPORT ChiakiErrorCode chiaki_takion_connect(ChiakiTakion *takion, Chiaki
+@@ -345,7 +348,7 @@ CHIAKI_EXPORT ChiakiErrorCode chiaki_takion_connect(ChiakiTakion *takion, Chiaki
  			ret = CHIAKI_ERR_NETWORK;
  			goto error_pipe;
  		}
@@ -107,3 +137,47 @@ index 38f9f5d..457b710 100644
  		int r = setsockopt(takion->sock, SOL_SOCKET, SO_RCVBUF, (const CHIAKI_SOCKET_BUF_TYPE)&rcvbuf_val, sizeof(rcvbuf_val));
  		if(r < 0)
  		{
+@@ -851,7 +854,7 @@ static ChiakiErrorCode takion_handshake(ChiakiTakion *takion, uint32_t *seq_num_
+ 
+ 		// INIT_ACK <-
+ 		err = takion_recv_message_init_ack(takion, &init_ack_payload);
+-		if(err == CHIAKI_ERR_SUCCESS)
++		if(err == CHIAKI_ERR_SUCCESS || err == CHIAKI_ERR_CANCELED)
+ 			break;
+ 	}
+ 	if(err != CHIAKI_ERR_SUCCESS)
+@@ -897,7 +900,7 @@ static ChiakiErrorCode takion_handshake(ChiakiTakion *takion, uint32_t *seq_num_
+ 		// COOKIE_ACK <-
+ 
+ 		err = takion_recv_message_cookie_ack(takion);
+-		if(err == CHIAKI_ERR_SUCCESS)
++		if(err == CHIAKI_ERR_SUCCESS || err == CHIAKI_ERR_CANCELED)
+ 			break;
+ 	}
+ 	if(err != CHIAKI_ERR_SUCCESS)
+@@ -1538,7 +1541,7 @@ static ChiakiErrorCode takion_recv_message_init_ack(ChiakiTakion *takion, Takion
+ {
+ 	uint8_t message[1 + TAKION_MESSAGE_HEADER_SIZE + 0x10 + TAKION_COOKIE_SIZE];
+ 	size_t received_size = sizeof(message);
+-	ChiakiErrorCode err = takion_recv(takion, message, &received_size, TAKION_EXPECT_TIMEOUT_MS);
++	ChiakiErrorCode err = takion_recv(takion, message, &received_size, TAKION_CONNECT_RESEND_TIMEOUT_MS);
+ 	if(err != CHIAKI_ERR_SUCCESS)
+ 		return err;
+ 
+@@ -1585,14 +1588,14 @@ static ChiakiErrorCode takion_recv_message_cookie_ack(ChiakiTakion *takion)
+ {
+ 	uint8_t message[1 + TAKION_MESSAGE_HEADER_SIZE];
+ 	size_t received_size = sizeof(message);
+-	ChiakiErrorCode err = takion_recv(takion, message, &received_size, TAKION_EXPECT_TIMEOUT_MS);
++	ChiakiErrorCode err = takion_recv(takion, message, &received_size, TAKION_CONNECT_RESEND_TIMEOUT_MS);
+ 	if(err != CHIAKI_ERR_SUCCESS)
+ 		return err;
+ 
+ 	if(message[0xd] == TAKION_CHUNK_TYPE_INIT_ACK)
+ 	{
+ 		CHIAKI_LOGI(takion->log, "Received second init ack, looking for cookie ack in next message");
+-		err = takion_recv(takion, message, &received_size, TAKION_EXPECT_TIMEOUT_MS);
++		err = takion_recv(takion, message, &received_size, TAKION_CONNECT_RESEND_TIMEOUT_MS);
+ 		if(err != CHIAKI_ERR_SUCCESS)
+ 			return err;
+ 	}

@@ -68,6 +68,7 @@ static struct {
 	int timer_ticks;
 	bool details, advanced, was_live, weak, volume_unsaved;
 	int weak_lost, weak_drops;
+	double loss_peak; // highest packet loss seen in the current window, for the log
 	DWORD weak_checked_at, weak_shown_at;
 	HICON logo;
 	UINT taskbar_created;
@@ -1429,14 +1430,25 @@ static void connection_watch(void)
 				tray_note(L"PS5 bağlantısı koptu, yeniden deneniyor");
 		}
 		ui.weak = false;
+		ui.loss_peak = 0;
 		ui.weak_lost = g.video_lost_total;
 		ui.weak_drops = g.audio_dropouts;
 		ui.weak_checked_at = GetTickCount();
 	}
 	DWORD now = GetTickCount();
-	if(!live || now - ui.weak_checked_at < WEAK_WINDOW_MS)
+	if(!live)
+		return;
+	// Sampled here too, since in audio only there are no video stats to carry it
+	double loss = g.session.stream_connection.congestion_control.packet_loss;
+	if(loss > ui.loss_peak)
+		ui.loss_peak = loss;
+	if(now - ui.weak_checked_at < WEAK_WINDOW_MS)
 		return;
 	int lost = g.video_lost_total - ui.weak_lost, drops = g.audio_dropouts - ui.weak_drops;
+	if(lost || drops || ui.loss_peak > 0)
+		CHIAKI_LOGI(&g.log, "Connection in the last %d s: %d lost frames, %d audio dropouts, packet loss peak %.0f%%",
+				WEAK_WINDOW_MS / 1000, lost, drops, ui.loss_peak * 100);
+	ui.loss_peak = 0;
 	ui.weak_lost = g.video_lost_total;
 	ui.weak_drops = g.audio_dropouts;
 	ui.weak_checked_at = now;
@@ -1444,7 +1456,7 @@ static void connection_watch(void)
 	ui.weak = false;
 	if((lost >= WEAK_LOST_FRAMES || drops >= WEAK_DROPOUTS) && (!ui.weak_shown_at || now - ui.weak_shown_at > WEAK_REPEAT_MS))
 	{
-		CHIAKI_LOGI(&g.log, "Weak connection: %d lost frames, %d audio dropouts in the last %d s", lost, drops, WEAK_WINDOW_MS / 1000);
+		CHIAKI_LOGI(&g.log, "Weak connection warning shown");
 		ui.weak = true;
 		ui.weak_shown_at = now;
 		// Channels 1 to 14 are 2.4 GHz, where neighbours and microwaves cause most of the loss

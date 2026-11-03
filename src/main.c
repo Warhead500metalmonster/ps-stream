@@ -49,7 +49,7 @@
 
 // Below this rate we are outside what chiaki-ng offers, so a console that refuses to start
 // gets a second try with it.
-#define APP_VERSION "0.1.20"
+#define APP_VERSION "0.1.21"
 #define UPDATE_RECHECK_MS (6 * 60 * 60 * 1000)
 #define UPDATE_TRIES 6
 #define UPDATE_RETRY_MS 20000
@@ -1441,8 +1441,9 @@ static bool quit_reason_is_final(ChiakiQuitReason reason)
 // bitrate. A console that's off or still busy says nothing about it.
 static bool quit_reason_refused_stream(ChiakiQuitReason reason)
 {
-	return reason == CHIAKI_QUIT_REASON_STREAM_CONNECTION_UNKNOWN
-		|| reason == CHIAKI_QUIT_REASON_STREAM_CONNECTION_REMOTE_DISCONNECTED;
+	// Only a console that hangs up on purpose. An unknown stream error is usually the handshake
+	// lost on weak Wi-Fi, and raising the bitrate for that only made the next try heavier.
+	return reason == CHIAKI_QUIT_REASON_STREAM_CONNECTION_REMOTE_DISCONNECTED;
 }
 
 // Stops Windows' periodic Wi-Fi scans, which stall traffic for moments, and asks the driver for
@@ -1725,8 +1726,11 @@ static DWORD WINAPI worker_main(void *arg)
 					safe = false;
 				if(ended && want_any)
 				{
-					if(!was_connected && quit_reason_refused_stream(reason))
+					if(!was_connected && quit_reason_refused_stream(reason) && !safe)
+					{
 						safe = true;
+						CHIAKI_LOGI(&g.log, "The PS5 refused the stream, trying again with at least %d kbps", SAFE_KBPS);
+					}
 					if(g.fatal || quit_reason_is_final(reason) || !s.reconnect)
 					{
 						if(!g.fatal)
