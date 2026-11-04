@@ -52,7 +52,7 @@
 
 enum { UI_NONE, UI_NAV0, UI_NAV1, UI_NAV2, UI_AUDIO, UI_VIDEO, UI_MUTE, UI_LOWER, UI_HK_MUTE, UI_DETAILS, UI_ADVANCED, UI_SIMPLE, UI_APPLY, UI_FIND, UI_LOGIN, UI_ACCOUNT_CLEAR, UI_PAIR, UI_REPAIR,
 	UI_DEVICE, UI_HK_AUDIO, UI_HK_VIDEO, UI_HW, UI_RECONNECT, UI_CONTROLLER, UI_WIFI, UI_AUTOSTART, UI_AUTOWAKE, UI_GAMEPAD, UI_WINSTART, UI_TRAY, UI_QUICK_VOLUME, UI_WAKE, UI_UPDATE_NOW, UI_OPEN_LOGS, UI_OPEN_REPO, UI_BITRATE, UI_AO_BITRATE, UI_VOLUME, UI_BUFFER, UI_LOSS, UI_AUDIO_ONLY, UI_TOUR_SKIP, UI_TOUR_BACK, UI_TOUR_NEXT, UI_TOUR_AGAIN,
-	UI_PRESET0 = 46, UI_RES0 = 52, UI_FPS0 = 60, UI_CODEC0 = 65, UI_AORES0 = 70, UI_LANG0 = 80, UI_MAX = 96 };
+	UI_PRESET0 = 46, UI_RES0 = 52, UI_FPS0 = 60, UI_CODEC0 = 65, UI_LANG0 = 80, UI_MAX = 96 };
 
 static struct {
 	GpGraphics *gx;
@@ -796,7 +796,7 @@ static void switch_row(int id, const wchar_t *label, const wchar_t *tip, float x
 static bool settings_dirty(const Settings *a, const Settings *b)
 {
 	return a->res != b->res || a->fps != b->fps || a->kbps != b->kbps || a->h265 != b->h265 || a->hw != b->hw
-		|| a->ao_res != b->ao_res || a->ao_kbps != b->ao_kbps || a->loss_pct != b->loss_pct
+		|| a->ao_kbps != b->ao_kbps || a->loss_pct != b->loss_pct
 		|| a->no_controller != b->no_controller || a->wifi_opt != b->wifi_opt || a->autostart_audio != b->autostart_audio
 		|| a->win_start != b->win_start || a->tray != b->tray || a->auto_wake != b->auto_wake || a->gamepad != b->gamepad
 		|| a->reconnect != b->reconnect || a->hotkey_audio != b->hotkey_audio || a->hotkey_video != b->hotkey_video || a->hotkey_mute != b->hotkey_mute
@@ -869,23 +869,26 @@ static void page_settings_simple(void)
 	plain_switch(UI_WINSTART, L"Windows ile başlat", L"Bilgisayar açılınca uygulama da açılsın", x, y, w, &d->win_start);
 	y += 66;
 	plain_switch(UI_TRAY, L"Tepsiye küçült", L"Küçültünce saatin yanında dursun", x, y, w, &d->tray);
-	y += 66;
+	y += 76;
 
-	y = py + ph - 124;
+	heading(L"YARDIM", x, y);
+	y += 40;
+	float bw = (w - 20) / 3;
+	if(pill_button(UI_TOUR_AGAIN, L"Turu göster", x, y, bw, 40, false, true))
+		tour_start();
+	if(pill_button(UI_OPEN_LOGS, L"Kayıtları aç", x + bw + 10, y, bw, 40, false, true))
+		data_folder_open();
+	if(pill_button(UI_OPEN_REPO, L"GitHub", x + (bw + 10) * 2, y, bw, 40, false, true))
+		ShellExecuteW(NULL, L"open", REPO_URL, NULL, NULL, SW_SHOWNORMAL);
+
+	y = py + ph - 112;
 	if(pill_button(UI_ADVANCED, L"Gelişmiş ayarlar", x, y, w, 46, false, true))
 	{
 		ui.advanced = true;
 		ui.again = true;
 	}
-	y += 58;
 	swprintf(t, 64, L"PS Stream v%hs", APP_VERSION);
-	text(t, ui.semi, x, y, 150, 34, C_MUTED, 0, 1);
-	if(pill_button(UI_TOUR_AGAIN, L"Turu göster", x + w - 346, y, 110, 34, false, true))
-		tour_start();
-	if(pill_button(UI_OPEN_LOGS, L"Kayıtları aç", x + w - 228, y, 110, 34, false, true))
-		data_folder_open();
-	if(pill_button(UI_OPEN_REPO, L"GitHub", x + w - 110, y, 110, 34, false, true))
-		ShellExecuteW(NULL, L"open", REPO_URL, NULL, NULL, SW_SHOWNORMAL);
+	text(t, ui.small, x, y + 56, w, 30, C_MUTED, 1, 1);
 
 	// Nothing here reconnects the stream, so there's no reason to ask for an Apply press
 	Settings current = settings_get();
@@ -1329,19 +1332,15 @@ static bool tour_spot(int step, RectF *out)
 	return r.Width > 0;
 }
 
-static void tour_draw(void)
+// Darkens the whole window except an optional spotlight, for the tour and the update screen
+static void overlay_dim(const RectF *spot)
 {
-	int step = ui.tour - 1;
-	RectF spot;
-	bool has_spot = tour_spot(step, &spot);
-
-	// Everything but the spotlight goes dark, so it's clear where to look
 	GpPath *dark;
 	GdipCreatePath(FillModeAlternate, &dark);
 	GdipAddPathRectangle(dark, 0, 0, F(UI_W), F(UI_H));
-	if(has_spot)
+	if(spot)
 	{
-		GpPath *hole = path_round(F(spot.X), F(spot.Y), F(spot.Width), F(spot.Height), F(18));
+		GpPath *hole = path_round(F(spot->X), F(spot->Y), F(spot->Width), F(spot->Height), F(18));
 		GdipAddPathPath(dark, hole, FALSE);
 		GdipDeletePath(hole);
 	}
@@ -1350,8 +1349,50 @@ static void tour_draw(void)
 	GdipFillPath(ui.gx, (GpBrush *)shade, dark);
 	GdipDeleteBrush((GpBrush *)shade);
 	GdipDeletePath(dark);
-	if(has_spot)
-		stroke_round(spot.X, spot.Y, spot.Width, spot.Height, 18, 2.5f, C_ACCENT);
+	if(spot)
+		stroke_round(spot->X, spot->Y, spot->Width, spot->Height, 18, 2.5f, C_ACCENT);
+}
+
+static void overlay_card(float x, float y, float w, float h)
+{
+	shadow(x, y, w, h, 22);
+	fill_round(x, y, w, h, 22, COLOR(255, 33, 36, 44));
+	stroke_round(x, y, w, h, 22, 1, WHITE(34));
+}
+
+// Shown for the whole download, so nobody wonders why the app is about to close
+static void update_screen_draw(void)
+{
+	overlay_dim(NULL);
+	float w = 460, h = 222, x = (UI_W - w) / 2, y = (UI_H - h) / 2;
+	overlay_card(x, y, w, h);
+	dot(x + 26, y + 26, 48, COLOR(255, 10, 112, 230));
+	text(ICON_SYNC, ui.icon, x + 26, y + 26, 48, 48, C_TEXT, 1, 1);
+	text(L"Yeni sürüm geldi!", ui.title, x + 90, y + 26, w - 116, 48, C_TEXT, 0, 1);
+	wchar_t body[256];
+	swprintf(body, 256, tr(L"PS Stream %hs yükleniyor. Bitince uygulama kendiliğinden yeniden açılır, eşleştirmen ve ayarların aynen kalır."), g.update_tag);
+	text(body, ui.body, x + 26, y + 88, w - 52, 60, WHITE(215), 0, 0);
+	int percent = g.update_percent < 0 ? 0 : g.update_percent > 100 ? 100 : (int)g.update_percent;
+	float bx = x + 26, by = y + h - 40, bw = w - 52;
+	text(percent >= 100 ? L"Hazırlanıyor" : L"İndiriliyor", ui.semi, bx, by - 32, bw - 60, 26, C_MUTED, 0, 1);
+	if(percent < 100)
+	{
+		wchar_t pct[32];
+		swprintf(pct, 32, tr(L"%%%d"), percent);
+		text(pct, ui.semi, bx + bw - 60, by - 32, 60, 26, C_TEXT, 2, 1);
+	}
+	fill_round(bx, by, bw, 10, 5, WHITE(30));
+	if(percent > 0)
+		fill_round(bx, by, bw * percent / 100 < 10 ? 10 : bw * percent / 100, 10, 5, C_ACCENT);
+}
+
+static void tour_draw(void)
+{
+	int step = ui.tour - 1;
+	RectF spot;
+	bool has_spot = tour_spot(step, &spot);
+	// Everything but the spotlight goes dark, so it's clear where to look
+	overlay_dim(has_spot ? &spot : NULL);
 
 	// The card sits beside the spotlight: below, above, right or left, whichever fits first
 	float x = (UI_W - TOUR_W) / 2.0f, y = (UI_H - TOUR_H) / 2.0f;
@@ -1369,9 +1410,7 @@ static void tour_draw(void)
 		else if(spot.X - 12 - TOUR_W >= 8)
 			x = spot.X - 12 - TOUR_W, y = cy;
 	}
-	shadow(x, y, TOUR_W, TOUR_H, 22);
-	fill_round(x, y, TOUR_W, TOUR_H, 22, COLOR(255, 33, 36, 44));
-	stroke_round(x, y, TOUR_W, TOUR_H, 22, 1, WHITE(34));
+	overlay_card(x, y, TOUR_W, TOUR_H);
 
 	static const wchar_t *const titles[TOUR_STEPS] = {
 		L"PS Stream'e hoş geldin!", L"Önce PS5'i bir kez tanıt", L"Oyunun sesi bilgisayarda", L"Görüntü ve Discord",
@@ -1449,10 +1488,11 @@ static void ui_frame(void)
 		ui.again = false;
 		ui.tip = NULL;
 		memset(ui.rect_set, 0, sizeof(ui.rect_set));
-		// During the tour the page underneath is only a picture: it sees no mouse
+		// Under the tour or the update screen, the page is only a picture: it sees no mouse
+		bool modal = ui.tour || g.update_busy;
 		float mx = ui.mx, my = ui.my;
 		bool press = ui.press, release = ui.release;
-		if(ui.tour)
+		if(modal)
 		{
 			ui.mx = ui.my = -10000;
 			ui.press = ui.release = false;
@@ -1465,14 +1505,17 @@ static void ui_frame(void)
 		else
 			page_pair();
 		status_bar();
-		if(ui.tour)
+		if(modal)
 		{
 			ui.mx = mx;
 			ui.my = my;
 			ui.press = press;
 			ui.release = release;
 			ui.tip = NULL;
-			tour_draw();
+			if(g.update_busy)
+				update_screen_draw();
+			else
+				tour_draw();
 		}
 		ui.release = false;
 		ui.press = false;
@@ -1860,7 +1903,7 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 				capture_hotkey((int)wp);
 				return 0;
 			}
-			if(msg == WM_KEYDOWN && tour_key((int)wp))
+			if(g.update_busy || (msg == WM_KEYDOWN && tour_key((int)wp)))
 				return 0;
 			break;
 		case WM_CTLCOLOREDIT:
@@ -2103,6 +2146,27 @@ static DWORD WINAPI ui_test_main(void *arg)
 {
 	const wchar_t *dir = arg;
 	Sleep(300);
+	if(GetEnvironmentVariableW(L"PSSTREAM_TEST_UPDATE_SCREEN", NULL, 0))
+	{
+		snprintf(g.update_tag, sizeof(g.update_tag), "v0.1.24");
+		g.update_percent = 42;
+		g.update_busy = 1;
+		PostMessageW(g.hwnd, WM_APP_STATUS, 0, 0);
+		Sleep(400);
+		test_shot(dir, L"update_42");
+		test_click(UI_AUDIO);
+		CHIAKI_LOGI(&g.log, "[update screen] click under it turned audio %s", g.want_audio ? "on (wrong)" : "off");
+		g.update_percent = 100;
+		PostMessageW(g.hwnd, WM_APP_STATUS, 0, 0);
+		Sleep(400);
+		test_shot(dir, L"update_100");
+		g.update_busy = 0;
+		PostMessageW(g.hwnd, WM_APP_STATUS, 0, 0);
+		Sleep(400);
+		test_shot(dir, L"update_gone");
+		PostMessageW(g.hwnd, WM_CLOSE, 0, 0);
+		return 0;
+	}
 	if(GetEnvironmentVariableW(L"PSSTREAM_TEST_TOUR", NULL, 0))
 	{
 		ui.tour = 1;
@@ -2526,7 +2590,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmd, int show)
 	while(GetMessageW(&msg, NULL, 0, 0) > 0)
 	{
 		// While assigning a hotkey, keys like Esc and Tab must reach the window instead of the dialog logic
-		if(!ui.capturing && !ui.tour && IsDialogMessageW(g.hwnd, &msg))
+		if(!ui.capturing && !ui.tour && !g.update_busy && IsDialogMessageW(g.hwnd, &msg))
 			continue;
 		TranslateMessage(&msg);
 		DispatchMessageW(&msg);

@@ -49,7 +49,7 @@
 
 // Below this rate we are outside what chiaki-ng offers, so a console that refuses to start
 // gets a second try with it.
-#define APP_VERSION "0.1.23"
+#define APP_VERSION "0.1.24"
 #define UPDATE_RECHECK_MS (6 * 60 * 60 * 1000)
 #define UPDATE_TRIES 6
 #define UPDATE_RETRY_MS 20000
@@ -124,7 +124,7 @@ static const Resolution resolutions[] = {
 
 typedef struct {
 	int res, fps, kbps, h265, hw;
-	int ao_res, ao_kbps;
+	int ao_kbps; // audio only always asks for 360p, the least the PS5 accepts
 	int volume, buffer_ms, loss_pct, reconnect, no_controller, wifi_opt, autostart_audio, win_start, tray, auto_wake, gamepad;
 	int hotkey_audio, hotkey_video, hotkey_mute; // HKM_GETHOTKEY format
 	char device[256]; // empty is the system default
@@ -188,6 +188,7 @@ static struct {
 	wchar_t pad_name[64];
 	int regist_tries;
 	volatile LONG update_ready, update_busy, update_failed, update_restart;
+	volatile LONG update_percent; // download progress for the update screen, 100 while unpacking
 	DWORD started_at;
 	char update_url[512], update_digest[72];
 	bool relaunched;
@@ -1416,7 +1417,7 @@ static bool session_start(bool video, const Settings *s, bool safe)
 	// The console keeps sending video even when the client ignores it, and chiaki_session_init
 	// forces 2 Mbps when video is disabled, so the smallest stream has to be set afterwards.
 	if(!video)
-		profile_set(&g.session.connect_info.video_profile, s->ao_res, 30, s->ao_kbps, CHIAKI_CODEC_H264, safe);
+		profile_set(&g.session.connect_info.video_profile, RES_MIN, 30, s->ao_kbps, CHIAKI_CODEC_H264, safe);
 
 	chiaki_session_set_event_cb(&g.session, session_event_cb, NULL);
 	ChiakiAudioSink sink;
@@ -1694,7 +1695,7 @@ static bool stream_changed(const Settings *a, const Settings *b, bool video)
 	if(a->loss_pct != b->loss_pct || a->no_controller != b->no_controller || a->gamepad != b->gamepad)
 		return true;
 	if(!video)
-		return a->ao_res != b->ao_res || a->ao_kbps != b->ao_kbps;
+		return a->ao_kbps != b->ao_kbps;
 	return a->res != b->res || a->fps != b->fps || a->kbps != b->kbps || a->h265 != b->h265 || a->hw != b->hw;
 }
 
@@ -2037,7 +2038,6 @@ static void config_load(void)
 	s->kbps = config_int("kbps", p->kbps, 500, 100000);
 	s->h265 = config_int("h265", p->h265, 0, 1);
 	s->hw = config_int("hw", 1, 0, 1);
-	s->ao_res = config_int("ao_res", RES_MIN, RES_MIN, RES_MIN);
 	s->ao_kbps = config_int("ao_kbps", 500, 100, 2000);
 	s->volume = config_int("volume", 100, 0, 200);
 	s->buffer_ms = config_int("buffer_ms", 150, 40, 500);
@@ -2068,7 +2068,6 @@ static void config_save_settings(const Settings *s)
 	config_set_int("kbps", s->kbps);
 	config_set_int("h265", s->h265);
 	config_set_int("hw", s->hw);
-	config_set_int("ao_res", s->ao_res);
 	config_set_int("ao_kbps", s->ao_kbps);
 	config_set_int("volume", s->volume);
 	config_set_int("buffer_ms", s->buffer_ms);
@@ -2362,6 +2361,7 @@ static int update_progress_cb(void *user, curl_off_t total, curl_off_t now, curl
 	(void)ul_now;
 	int *last = user;
 	int percent = total > 0 ? (int)(now * 100 / total) : 0;
+	g.update_percent = percent;
 	if(percent != *last)
 	{
 		*last = percent;
@@ -2490,6 +2490,7 @@ static void update_begin(void)
 {
 	if(InterlockedExchange(&g.update_busy, 1))
 		return;
+	g.update_percent = 0;
 	set_status(L"Güncelleme indiriliyor...");
 	CloseHandle(CreateThread(NULL, 0, update_download_main, NULL, 0, NULL));
 }

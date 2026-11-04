@@ -221,6 +221,11 @@ static const wchar_t *const english[][2] = {
 	{ L"Eşleştirmeye geç", L"Go to Pairing" },
 	{ L"Turu göster", L"Show tour" },
 	{ L"Yeni sürüm yükleniyor. Uygulama birazdan kendiliğinden yeniden açılacak", L"Installing the new version. The app will reopen by itself in a moment" },
+	{ L"Yeni sürüm geldi!", L"A new version is here!" },
+	{ L"PS Stream %hs yükleniyor. Bitince uygulama kendiliğinden yeniden açılır, eşleştirmen ve ayarların aynen kalır.", L"Installing PS Stream %hs. The app reopens by itself when it's done, and your pairing and settings stay as they are." },
+	{ L"Hazırlanıyor", L"Getting ready" },
+	{ L"İndiriliyor", L"Downloading" },
+	{ L"YARDIM", L"HELP" },
 };
 
 static bool lang_english;
