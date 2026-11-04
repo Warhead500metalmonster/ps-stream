@@ -49,7 +49,7 @@
 
 // Below this rate we are outside what chiaki-ng offers, so a console that refuses to start
 // gets a second try with it.
-#define APP_VERSION "0.1.24"
+#define APP_VERSION "0.1.25"
 #define UPDATE_RECHECK_MS (6 * 60 * 60 * 1000)
 #define UPDATE_TRIES 6
 #define UPDATE_RETRY_MS 20000
@@ -87,6 +87,9 @@
 #define AUDIO_TARGET_STEP_MS 10
 #define AUDIO_TARGET_DECAY_MS 60000
 #define RECONNECT_MS 1500
+// The PS5 sends sound a hundred times a second, silence included. Nothing at all for this long means
+// it dropped the stream without saying so, and only a new connection brings it back.
+#define STALL_MS 15000
 #define AUDIO_REOPEN_MS 2000
 #define IN_USE_QUIET_MS 15000
 
@@ -181,6 +184,7 @@ static struct {
 	bool audio_waiting;
 	int audio_target_ms;
 	DWORD audio_last_dropout, connected_at;
+	volatile DWORD last_rx; // when the PS5 last sent sound or a picture
 	volatile LONG audio_dropouts, video_fps10, video_lost_total, ps5_standby;
 	char update_tag[32];
 	volatile LONG network_changed, regist_rejected, muted, session_live, rumble_new, rumble_left, rumble_right;
@@ -348,6 +352,7 @@ static void audio_settings_cb(uint32_t channels, uint32_t rate, void *user)
 static void audio_frame_cb(int16_t *buf, size_t samples_count, void *user)
 {
 	(void)user;
+	g.last_rx = GetTickCount();
 	// A headset that was unplugged leaves the device stopped for good, and with no device at all
 	// this runs a hundred times a second, so only try every so often
 	bool device_gone = !g.audio_dev || SDL_GetAudioDeviceStatus(g.audio_dev) == SDL_AUDIO_STOPPED;
@@ -455,6 +460,7 @@ static void frame_available_cb(ChiakiFfmpegDecoder *decoder, void *user)
 {
 	(void)decoder;
 	(void)user;
+	g.last_rx = GetTickCount();
 	if(InterlockedExchange(&g.frame_pending, 1))
 		return;
 	SDL_Event e = { 0 };
@@ -1323,6 +1329,7 @@ static void session_event_cb(ChiakiEvent *event, void *user)
 	{
 		case CHIAKI_EVENT_CONNECTED:
 			g.connected_at = GetTickCount();
+			g.last_rx = g.connected_at;
 			g.connected = 1;
 			SetEvent(g.wake);
 			set_status(g.want_video ? L"Bağlandı. Görüntü açık" : L"Bağlandı. Ses açık");
@@ -1718,6 +1725,8 @@ static DWORD WINAPI worker_main(void *arg)
 			LONG left = (LONG)(retry_at - GetTickCount());
 			timeout = left > 0 ? (DWORD)left : 0;
 		}
+		else if(running && g.connected)
+			timeout = 1000; // to notice a stream that went quiet
 		WaitForSingleObject(g.wake, timeout);
 		if(InterlockedExchange(&g.network_changed, 0))
 		{
@@ -1767,6 +1776,12 @@ static DWORD WINAPI worker_main(void *arg)
 
 		if(running)
 		{
+			if(g.connected && GetTickCount() - g.last_rx > STALL_MS && !g.ended)
+			{
+				CHIAKI_LOGI(&g.log, "Nothing from the PS5 for %d s, connecting again", STALL_MS / 1000);
+				g.quit_reason = CHIAKI_QUIT_REASON_STREAM_CONNECTION_UNKNOWN;
+				g.ended = 1;
+			}
 			bool ended = InterlockedExchange(&g.ended, 0) != 0;
 			bool changed = stream_changed(&s, &run, run_video);
 			if(ended || !want_any || want_video != run_video || changed)

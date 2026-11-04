@@ -104,7 +104,7 @@ index afa1a60..0cfd598 100644
  	{
  		CHIAKI_LOGE(stream_connection->log, "StreamConnection failed to send controller connection");
 diff --git a/lib/src/takion.c b/lib/src/takion.c
-index 38f9f5d..8710c51 100644
+index 38f9f5d..3181d06 100644
 --- a/lib/src/takion.c
 +++ b/lib/src/takion.c
 @@ -55,7 +55,10 @@
@@ -155,7 +155,39 @@ index 38f9f5d..8710c51 100644
  			break;
  	}
  	if(err != CHIAKI_ERR_SUCCESS)
-@@ -1538,7 +1541,7 @@ static ChiakiErrorCode takion_recv_message_init_ack(ChiakiTakion *takion, Takion
+@@ -1419,9 +1422,11 @@ static void takion_handle_packet_message_data(ChiakiTakion *takion, uint8_t *pac
+ 
+ static void takion_handle_packet_message_data_ack(ChiakiTakion *takion, uint8_t flags, uint8_t *buf, size_t buf_size)
+ {
+-	if(buf_size != 0xc)
++	// Gap ack blocks and duplicate seqnums follow the fixed part. The PS5 sends them whenever a packet
++	// went missing, so on lossy Wi-Fi these are most of the acks and their cumulative seqnum must count.
++	if(buf_size < 0xc)
+ 	{
+-		CHIAKI_LOGE(takion->log, "Takion received data ack with size %zx != %#x", buf_size, 0xc);
++		CHIAKI_LOGE(takion->log, "Takion received data ack with size %zx < %#x", buf_size, 0xc);
+ 		return;
+ 	}
+ 
+@@ -1430,15 +1435,12 @@ static void takion_handle_packet_message_data_ack(ChiakiTakion *takion, uint8_t
+ 	uint16_t gap_ack_blocks_count = ntohs(*((chiaki_unaligned_uint16_t *)(buf + 8)));
+ 	uint16_t dup_tsns_count = ntohs(*((chiaki_unaligned_uint16_t *)(buf + 0xa)));
+ 
+-	if(buf_size != gap_ack_blocks_count * 4 + 0xc)
++	if(buf_size != ((size_t)gap_ack_blocks_count + dup_tsns_count) * 4 + 0xc)
+ 	{
+-		CHIAKI_LOGW(takion->log, "Takion received data ack with invalid gap_ack_blocks_count");
++		CHIAKI_LOGW(takion->log, "Takion received data ack with size %zx not matching %u gap blocks and %u duplicates", buf_size, gap_ack_blocks_count, dup_tsns_count);
+ 		return;
+ 	}
+ 
+-	if(dup_tsns_count != 0)
+-		CHIAKI_LOGW(takion->log, "Takion received data ack with nonzero dup_tsns_count %#x", dup_tsns_count);
+-
+ 	CHIAKI_LOGV(takion->log, "Takion received data ack with cumulative_seq_num = %#x, a_rwnd = %#x, gap_ack_blocks_count = %#x, dup_tsns_count = %#x",
+ 			cumulative_seq_num, a_rwnd, gap_ack_blocks_count, dup_tsns_count);
+ 
+@@ -1538,7 +1540,7 @@ static ChiakiErrorCode takion_recv_message_init_ack(ChiakiTakion *takion, Takion
  {
  	uint8_t message[1 + TAKION_MESSAGE_HEADER_SIZE + 0x10 + TAKION_COOKIE_SIZE];
  	size_t received_size = sizeof(message);
@@ -164,7 +196,7 @@ index 38f9f5d..8710c51 100644
  	if(err != CHIAKI_ERR_SUCCESS)
  		return err;
  
-@@ -1585,14 +1588,14 @@ static ChiakiErrorCode takion_recv_message_cookie_ack(ChiakiTakion *takion)
+@@ -1585,14 +1587,14 @@ static ChiakiErrorCode takion_recv_message_cookie_ack(ChiakiTakion *takion)
  {
  	uint8_t message[1 + TAKION_MESSAGE_HEADER_SIZE];
  	size_t received_size = sizeof(message);
@@ -181,3 +213,41 @@ index 38f9f5d..8710c51 100644
  		if(err != CHIAKI_ERR_SUCCESS)
  			return err;
  	}
+diff --git a/lib/src/takionsendbuffer.c b/lib/src/takionsendbuffer.c
+index 5cee13c..fd52c37 100644
+--- a/lib/src/takionsendbuffer.c
++++ b/lib/src/takionsendbuffer.c
+@@ -11,7 +11,11 @@
+ 
+ #define TAKION_DATA_RESEND_TIMEOUT_MS 200
+ #define TAKION_DATA_RESEND_WAKEUP_TIMEOUT_MS (TAKION_DATA_RESEND_TIMEOUT_MS/2)
+-#define TAKION_DATA_RESEND_TRIES_MAX 25
++// Fast resends ride out a short loss burst. After that, slower ones keep going for a while longer:
++// a packet given up on leaves a hole the PS5 can't get past, so everything sent later goes unheard.
++#define TAKION_DATA_RESEND_FAST_TRIES 25
++#define TAKION_DATA_RESEND_SLOW_TIMEOUT_MS 1000
++#define TAKION_DATA_RESEND_TRIES_MAX (TAKION_DATA_RESEND_FAST_TRIES + 35)
+ #define TAKION_SEND_BUFFER_SIZE 16
+ 
+ #endif
+@@ -242,7 +246,8 @@ static void takion_send_buffer_resend(ChiakiTakionSendBuffer *send_buffer)
+ 	for(size_t i=0; i<send_buffer->packets_count; i++)
+ 	{
+ 		ChiakiTakionSendBufferPacket *packet = &send_buffer->packets[i];
+-		if(now - packet->last_send_ms > TAKION_DATA_RESEND_TIMEOUT_MS)
++		uint64_t timeout = packet->tries < TAKION_DATA_RESEND_FAST_TRIES ? TAKION_DATA_RESEND_TIMEOUT_MS : TAKION_DATA_RESEND_SLOW_TIMEOUT_MS;
++		if(now - packet->last_send_ms > timeout)
+ 		{
+ 			if(packet->tries >= TAKION_DATA_RESEND_TRIES_MAX)
+ 			{
+@@ -256,7 +261,9 @@ static void takion_send_buffer_resend(ChiakiTakionSendBuffer *send_buffer)
+ 					i-= 1;
+ 				continue;
+ 			}
+-			CHIAKI_LOGI(send_buffer->log, "Takion Send Buffer re-sending packet with seqnum %#llx, tries: %llu", (unsigned long long)packet->seq_num, (unsigned long long)packet->tries);
++			// Every resend used to be logged, which filled megabytes of log during a single dropout
++			if(packet->tries == 0 || packet->tries == TAKION_DATA_RESEND_FAST_TRIES)
++				CHIAKI_LOGI(send_buffer->log, "Takion Send Buffer re-sending packet with seqnum %#llx, tries: %llu", (unsigned long long)packet->seq_num, (unsigned long long)packet->tries);
+ 			packet->last_send_ms = now;
+ 			chiaki_takion_send_raw(send_buffer->takion, packet->buf, packet->buf_size);
+ 			packet->tries++;
