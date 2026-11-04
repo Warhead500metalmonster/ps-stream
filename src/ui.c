@@ -51,7 +51,7 @@
 #define ICON_PLAY L""
 
 enum { UI_NONE, UI_NAV0, UI_NAV1, UI_NAV2, UI_AUDIO, UI_VIDEO, UI_MUTE, UI_LOWER, UI_HK_MUTE, UI_DETAILS, UI_ADVANCED, UI_SIMPLE, UI_APPLY, UI_FIND, UI_LOGIN, UI_ACCOUNT_CLEAR, UI_PAIR, UI_REPAIR,
-	UI_DEVICE, UI_HK_AUDIO, UI_HK_VIDEO, UI_HW, UI_RECONNECT, UI_CONTROLLER, UI_WIFI, UI_AUTOSTART, UI_AUTOWAKE, UI_GAMEPAD, UI_WINSTART, UI_TRAY, UI_UPDATES, UI_QUICK_VOLUME, UI_WAKE, UI_UPDATE_NOW, UI_OPEN_LOGS, UI_OPEN_REPO, UI_BITRATE, UI_AO_BITRATE, UI_VOLUME, UI_BUFFER, UI_LOSS, UI_AUDIO_ONLY,
+	UI_DEVICE, UI_HK_AUDIO, UI_HK_VIDEO, UI_HW, UI_RECONNECT, UI_CONTROLLER, UI_WIFI, UI_AUTOSTART, UI_AUTOWAKE, UI_GAMEPAD, UI_WINSTART, UI_TRAY, UI_QUICK_VOLUME, UI_WAKE, UI_UPDATE_NOW, UI_OPEN_LOGS, UI_OPEN_REPO, UI_BITRATE, UI_AO_BITRATE, UI_VOLUME, UI_BUFFER, UI_LOSS, UI_AUDIO_ONLY, UI_TOUR_SKIP, UI_TOUR_BACK, UI_TOUR_NEXT, UI_TOUR_AGAIN,
 	UI_PRESET0 = 46, UI_RES0 = 52, UI_FPS0 = 60, UI_CODEC0 = 65, UI_AORES0 = 70, UI_LANG0 = 80, UI_MAX = 96 };
 
 static struct {
@@ -85,11 +85,15 @@ static struct {
 	RectF rects[UI_MAX];
 	bool rect_set[UI_MAX];
 	int hot_id;
+	int tour; // step of the first-run tour plus one, 0 when it isn't showing
+	bool tour_pending;
+	RectF card_rects[2]; // audio and video cards, for the tour's spotlight
 	char **devices;
 	int device_count;
 } ui;
 
 static float F(float v) { return v * g.dpi / 96.0f; }
+static void tour_start(void);
 
 // ---------- drawing ----------
 
@@ -650,6 +654,8 @@ static void page_play(void)
 	// Without the details row, the cards take its room
 	float extra = anim(UI_NONE + UI_MAX, ui.details ? 0 : 70);
 	float cw = (UI_W - 48 - 16) / 2.0f, cy = 78, ch = 330 + extra;
+	ui.card_rects[0] = (RectF){ 24, cy, cw, ch };
+	ui.card_rects[1] = (RectF){ 24 + cw + 16, cy, cw, ch };
 	card(UI_AUDIO, 24, cy, cw, ch, COLOR(255, 214, 134, 46), COLOR(255, 110, 58, 24), ICON_AUDIO,
 			L"Ses", L"Oyunun sesini bilgisayardan duy.", g.want_audio != 0);
 
@@ -792,7 +798,7 @@ static bool settings_dirty(const Settings *a, const Settings *b)
 	return a->res != b->res || a->fps != b->fps || a->kbps != b->kbps || a->h265 != b->h265 || a->hw != b->hw
 		|| a->ao_res != b->ao_res || a->ao_kbps != b->ao_kbps || a->loss_pct != b->loss_pct
 		|| a->no_controller != b->no_controller || a->wifi_opt != b->wifi_opt || a->autostart_audio != b->autostart_audio
-		|| a->win_start != b->win_start || a->tray != b->tray || a->update_check != b->update_check || a->auto_wake != b->auto_wake || a->gamepad != b->gamepad
+		|| a->win_start != b->win_start || a->tray != b->tray || a->auto_wake != b->auto_wake || a->gamepad != b->gamepad
 		|| a->reconnect != b->reconnect || a->hotkey_audio != b->hotkey_audio || a->hotkey_video != b->hotkey_video || a->hotkey_mute != b->hotkey_mute
 		|| strcmp(a->device, b->device) != 0;
 }
@@ -864,7 +870,6 @@ static void page_settings_simple(void)
 	y += 66;
 	plain_switch(UI_TRAY, L"Tepsiye küçült", L"Küçültünce saatin yanında dursun", x, y, w, &d->tray);
 	y += 66;
-	plain_switch(UI_UPDATES, L"Güncelleme denetle", L"Yeni sürüm çıkınca haber versin", x, y, w, &d->update_check);
 
 	y = py + ph - 124;
 	if(pill_button(UI_ADVANCED, L"Gelişmiş ayarlar", x, y, w, 46, false, true))
@@ -875,6 +880,8 @@ static void page_settings_simple(void)
 	y += 58;
 	swprintf(t, 64, L"PS Stream v%hs", APP_VERSION);
 	text(t, ui.semi, x, y, 150, 34, C_MUTED, 0, 1);
+	if(pill_button(UI_TOUR_AGAIN, L"Turu göster", x + w - 346, y, 110, 34, false, true))
+		tour_start();
 	if(pill_button(UI_OPEN_LOGS, L"Kayıtları aç", x + w - 228, y, 110, 34, false, true))
 		data_folder_open();
 	if(pill_button(UI_OPEN_REPO, L"GitHub", x + w - 110, y, 110, 34, false, true))
@@ -947,8 +954,6 @@ static void page_settings(void)
 	y += 40;
 	switch_row(UI_WINSTART, L"Windows ile başlat", L"Bilgisayar açılınca uygulama saatin yanında küçük olarak başlar.", x, y, col, &d->win_start);
 	switch_row(UI_TRAY, L"Tepsiye küçült", L"Küçültünce görev çubuğunda yer kaplamaz, saatin yanındaki simgede durur.", x2, y, col, &d->tray);
-	y += 40;
-	switch_row(UI_UPDATES, L"Güncelleme denetle", L"Açılışta GitHub'dan son sürüm numarasını sorar. Sen Güncelle'ye basmadan hiçbir şey indirmez.", x, y, col, &d->update_check);
 
 	x = rx + 20;
 	cx = rx + 150;
@@ -1220,14 +1225,7 @@ static void status_bar(void)
 			if(lower < 0)
 				audio_only_select();
 			else
-			{
-				const Preset *p = &presets[lower];
-				current.res = p->res;
-				current.fps = p->fps;
-				current.kbps = p->kbps;
-				current.h265 = p->h265;
-				settings_commit(&current);
-			}
+				preset_select(lower);
 		}
 	}
 	else if(g.update_ready)
@@ -1275,6 +1273,161 @@ static void devices_load(void)
 	}
 }
 
+// ---------- first-run tour ----------
+
+// Raise this to show the tour again to everyone after a big change
+#define TOUR_VERSION 1
+#define TOUR_W 420
+#define TOUR_H 222
+
+enum { TOUR_WELCOME, TOUR_PAIR, TOUR_AUDIO, TOUR_VIDEO, TOUR_QUALITY, TOUR_SETTINGS, TOUR_DONE, TOUR_STEPS };
+
+static void tour_start(void)
+{
+	ui.tour_pending = false;
+	ui.tour = 1;
+	show_page(PAGE_PLAY); // the pairing page's text boxes are windows the overlay can't cover
+}
+
+static void tour_end(void)
+{
+	ui.tour = 0;
+	config_set_int("tour_seen", TOUR_VERSION);
+	if(!g.paired)
+		show_page(PAGE_PAIR);
+	ui.again = true;
+}
+
+static void ui_frame(void);
+
+static void tour_step(int delta)
+{
+	int step = ui.tour - 1 + delta;
+	if(step >= TOUR_STEPS)
+		tour_end();
+	else if(step >= 0)
+		ui.tour = step + 1;
+	ui.again = true;
+}
+
+// What each step points at, in layout units. False for the steps with nothing to point at.
+static bool tour_spot(int step, RectF *out)
+{
+	RectF r;
+	if(step == TOUR_PAIR || step == TOUR_SETTINGS)
+		r = ui.rects[UI_NAV0 + (step == TOUR_PAIR ? PAGE_PAIR : PAGE_SETTINGS)];
+	else if(step == TOUR_AUDIO || step == TOUR_VIDEO)
+		r = ui.card_rects[step == TOUR_VIDEO];
+	else if(step == TOUR_QUALITY)
+	{
+		RectF a = ui.rects[UI_AUDIO_ONLY], b = ui.rects[UI_PRESET0 + PRESET_COUNT];
+		r = (RectF){ a.X, a.Y, b.X + b.Width - a.X, a.Height };
+	}
+	else
+		return false;
+	*out = (RectF){ r.X - 6, r.Y - 6, r.Width + 12, r.Height + 12 };
+	return r.Width > 0;
+}
+
+static void tour_draw(void)
+{
+	int step = ui.tour - 1;
+	RectF spot;
+	bool has_spot = tour_spot(step, &spot);
+
+	// Everything but the spotlight goes dark, so it's clear where to look
+	GpPath *dark;
+	GdipCreatePath(FillModeAlternate, &dark);
+	GdipAddPathRectangle(dark, 0, 0, F(UI_W), F(UI_H));
+	if(has_spot)
+	{
+		GpPath *hole = path_round(F(spot.X), F(spot.Y), F(spot.Width), F(spot.Height), F(18));
+		GdipAddPathPath(dark, hole, FALSE);
+		GdipDeletePath(hole);
+	}
+	GpSolidFill *shade;
+	GdipCreateSolidFill(COLOR(185, 8, 9, 13), &shade);
+	GdipFillPath(ui.gx, (GpBrush *)shade, dark);
+	GdipDeleteBrush((GpBrush *)shade);
+	GdipDeletePath(dark);
+	if(has_spot)
+		stroke_round(spot.X, spot.Y, spot.Width, spot.Height, 18, 2.5f, C_ACCENT);
+
+	// The card sits beside the spotlight: below, above, right or left, whichever fits first
+	float x = (UI_W - TOUR_W) / 2.0f, y = (UI_H - TOUR_H) / 2.0f;
+	if(has_spot)
+	{
+		float cx = spot.X + spot.Width / 2 - TOUR_W / 2.0f, cy = spot.Y;
+		cx = cx < 12 ? 12 : cx > UI_W - TOUR_W - 12 ? UI_W - TOUR_W - 12 : cx;
+		cy = cy < 12 ? 12 : cy > UI_H - TOUR_H - 12 ? UI_H - TOUR_H - 12 : cy;
+		if(spot.Y + spot.Height + 12 + TOUR_H <= UI_H - 8)
+			x = cx, y = spot.Y + spot.Height + 12;
+		else if(spot.Y - 12 - TOUR_H >= 8)
+			x = cx, y = spot.Y - 12 - TOUR_H;
+		else if(spot.X + spot.Width + 12 + TOUR_W <= UI_W - 8)
+			x = spot.X + spot.Width + 12, y = cy;
+		else if(spot.X - 12 - TOUR_W >= 8)
+			x = spot.X - 12 - TOUR_W, y = cy;
+	}
+	shadow(x, y, TOUR_W, TOUR_H, 22);
+	fill_round(x, y, TOUR_W, TOUR_H, 22, COLOR(255, 33, 36, 44));
+	stroke_round(x, y, TOUR_W, TOUR_H, 22, 1, WHITE(34));
+
+	static const wchar_t *const titles[TOUR_STEPS] = {
+		L"PS Stream'e hoş geldin!", L"Önce PS5'i bir kez tanıt", L"Oyunun sesi bilgisayarda", L"Görüntü ve Discord",
+		L"İnternetin zayıfsa", L"Ayarlar ve gamepad", L"Hazırsın!",
+	};
+	static const wchar_t *const bodies[TOUR_STEPS] = {
+		L"PS5'indeki oyunun sesini ve görüntüsünü bu bilgisayara getirir. Nasıl kullanılacağını birkaç kısa adımda göstereyim. İstemezsen turu geçebilirsin.",
+		NULL,
+		L"Ses'teki Aç'a bas, oyunun sesi bilgisayardan gelir. PS5 dinlenme modundaysa uygulama onu kendisi uyandırır. Hoparlör simgesi sesi anında kısar.",
+		L"Görüntü'deki Aç'a bas, oyun ayrı bir pencerede açılır. Discord'da yayın yaparken \"PS Stream - Görüntü\" penceresini seç. F11 tam ekran yapar.",
+		L"Wi-Fi zayıfsa Sadece ses'i ya da En düşük'ü seç. Bağlantı bozulunca uygulama altta seni uyarır ve kaliteyi tek tuşla düşürmeyi önerir.",
+		L"Buradan Xbox kolunla oynamayı, kısayolları ve Windows açılınca başlamayı ayarlarsın. Pencereyi küçültünce uygulama saatin yanına iner.",
+		L"Bu turu istediğin zaman Ayarlar'dan tekrar açabilirsin. İyi oyunlar!",
+	};
+	const wchar_t *body = bodies[step];
+	if(step == TOUR_PAIR)
+		body = g.paired ? L"PS5'in zaten eşleşmiş, bu adımı geçebilirsin. Başka bir PS5 kullanırsan buradan yeniden eşleştirirsin."
+			: L"Eşleştirme'de PSN ile giriş yap, sonra PS5'te Ayarlar > Sistem > Uzaktan Oynatma > Cihazı Bağla'daki 8 haneli kodu yaz. Bunu bir kere yaparsın.";
+
+	// Progress dots, so it's clear how short this is
+	for(int i = 0; i < TOUR_STEPS; i++)
+		fill_round(x + 28 + i * 14 + (i > step ? 14 : 0), y + 26, i == step ? 22 : 8, 8, 4, i == step ? C_ACCENT : i < step ? WHITE(120) : WHITE(45));
+	text(titles[step], ui.title, x + 26, y + 46, TOUR_W - 52, 36, C_TEXT, 0, 1);
+	text(body, ui.body, x + 26, y + 88, TOUR_W - 52, 86, WHITE(215), 0, 0);
+
+	float by = y + TOUR_H - 58;
+	bool last = step == TOUR_DONE;
+	if(!last && pill_button(UI_TOUR_SKIP, L"Turu geç", x + 20, by, 110, 38, false, true))
+	{
+		tour_end();
+		return;
+	}
+	if(step > 0 && pill_button(UI_TOUR_BACK, L"Geri", x + TOUR_W - 236, by, 92, 38, false, true))
+	{
+		tour_step(-1);
+		return;
+	}
+	const wchar_t *next = step == TOUR_WELCOME ? L"Başla" : last ? (g.paired ? L"Başlayalım" : L"Eşleştirmeye geç") : L"İleri";
+	if(pill_button(UI_TOUR_NEXT, next, x + TOUR_W - 136, by, 116, 38, true, true))
+		tour_step(1);
+}
+
+static bool tour_key(int vk)
+{
+	if(!ui.tour)
+		return false;
+	if(vk == VK_ESCAPE)
+		tour_end();
+	else if(vk == VK_RIGHT || vk == VK_RETURN || vk == VK_SPACE)
+		tour_step(1);
+	else if(vk == VK_LEFT)
+		tour_step(-1);
+	ui_frame();
+	return true;
+}
+
 static void ui_frame(void)
 {
 	if(ui.in_frame)
@@ -1286,6 +1439,8 @@ static void ui_frame(void)
 	ui.anim_step = 1 - (float)exp(-(frame_ms > 33 ? 33 : frame_ms) / 45.0);
 	ui.animating = false;
 	BitBlt(ui.back_dc, 0, 0, S(UI_W), S(UI_H), ui.bg_dc, 0, 0, SRCCOPY);
+	if(ui.tour_pending && IsWindowVisible(g.hwnd) && !IsIconic(g.hwnd))
+		tour_start();
 	int passes = 0;
 	do
 	{
@@ -1294,6 +1449,14 @@ static void ui_frame(void)
 		ui.again = false;
 		ui.tip = NULL;
 		memset(ui.rect_set, 0, sizeof(ui.rect_set));
+		// During the tour the page underneath is only a picture: it sees no mouse
+		float mx = ui.mx, my = ui.my;
+		bool press = ui.press, release = ui.release;
+		if(ui.tour)
+		{
+			ui.mx = ui.my = -10000;
+			ui.press = ui.release = false;
+		}
 		top_bar();
 		if(ui.page == PAGE_PLAY)
 			page_play();
@@ -1302,6 +1465,15 @@ static void ui_frame(void)
 		else
 			page_pair();
 		status_bar();
+		if(ui.tour)
+		{
+			ui.mx = mx;
+			ui.my = my;
+			ui.press = press;
+			ui.release = release;
+			ui.tip = NULL;
+			tour_draw();
+		}
 		ui.release = false;
 		ui.press = false;
 	} while(ui.again && ++passes < 3);
@@ -1435,6 +1607,7 @@ static void connection_watch(void)
 		ui.weak_drops = g.audio_dropouts;
 		ui.weak_checked_at = GetTickCount();
 	}
+	update_auto();
 	DWORD now = GetTickCount();
 	if(!live)
 		return;
@@ -1553,8 +1726,10 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 		case WM_TIMER:
 			if(wp == TIMER_UPDATE_RECHECK)
 			{
-				if(settings_get().update_check && !g.update_ready)
+#ifndef PSSTREAM_TEST
+				if(!g.update_ready)
 					CloseHandle(CreateThread(NULL, 0, update_check_main, NULL, 0, NULL));
+#endif
 				return 0;
 			}
 			if(wp == 1)
@@ -1685,6 +1860,8 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 				capture_hotkey((int)wp);
 				return 0;
 			}
+			if(msg == WM_KEYDOWN && tour_key((int)wp))
+				return 0;
 			break;
 		case WM_CTLCOLOREDIT:
 			SetTextColor((HDC)wp, RGB(255, 255, 255));
@@ -1926,6 +2103,39 @@ static DWORD WINAPI ui_test_main(void *arg)
 {
 	const wchar_t *dir = arg;
 	Sleep(300);
+	if(GetEnvironmentVariableW(L"PSSTREAM_TEST_TOUR", NULL, 0))
+	{
+		ui.tour = 1;
+		PostMessageW(g.hwnd, WM_APP_STATUS, 0, 0);
+		Sleep(400);
+		for(int step = 0; step < TOUR_STEPS; step++)
+		{
+			wchar_t name[32];
+			swprintf(name, 32, L"tour_%d", step);
+			test_shot(dir, name);
+			CHIAKI_LOGI(&g.log, "[tour] step %d shown, page %d", ui.tour - 1, ui.page);
+			test_click(step == 2 ? UI_TOUR_BACK : UI_TOUR_NEXT);
+			if(step == 2)
+			{
+				CHIAKI_LOGI(&g.log, "[tour] back to step %d", ui.tour - 1);
+				test_click(UI_TOUR_NEXT);
+				test_click(UI_TOUR_NEXT);
+			}
+			Sleep(250);
+		}
+		CHIAKI_LOGI(&g.log, "[tour] after the last step: tour=%d page=%d seen=%d", ui.tour, ui.page, config_int("tour_seen", 0, 0, 1000));
+		ui.tour = 1;
+		PostMessageW(g.hwnd, WM_APP_STATUS, 0, 0);
+		Sleep(300);
+		PostMessageW(g.hwnd, WM_KEYDOWN, VK_RIGHT, 0);
+		Sleep(300);
+		CHIAKI_LOGI(&g.log, "[tour] right arrow moved to step %d", ui.tour - 1);
+		PostMessageW(g.hwnd, WM_KEYDOWN, VK_ESCAPE, 0);
+		Sleep(300);
+		CHIAKI_LOGI(&g.log, "[tour] escape closed it: tour=%d", ui.tour);
+		PostMessageW(g.hwnd, WM_CLOSE, 0, 0);
+		return 0;
+	}
 	if(!g.paired)
 	{
 		test_shot(dir, L"pair");
@@ -2248,13 +2458,23 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmd, int show)
 
 	ui_create(inst);
 	show_page(g.paired ? PAGE_PLAY : PAGE_PAIR);
+	// Shown once to everyone, new or updated, as soon as the window is on screen
+	ui.tour_pending = config_int("tour_seen", 0, 0, 1000) < TOUR_VERSION && !g.test_hidden;
+	g.started_at = GetTickCount();
+	if(g.relaunched)
+		config_set_int("update_fails", 0);
+	else if(g.update_failed)
+		config_set_int("update_fails", config_int("update_fails", 0, 0, 100) + 1);
 	if(!hotkeys_register(&g.settings))
 		wcscpy(g.status, L"Bir kısayol başka programda kullanılıyor, Ayarlar'dan değiştir");
 	ui_frame();
 	if(!g.host[0])
 		find_ps5();
-	if(g.settings.update_check)
-		CloseHandle(CreateThread(NULL, 0, update_check_main, NULL, 0, NULL));
+#ifdef PSSTREAM_TEST
+	// Test copies only ever ask a local stand-in for GitHub
+	if(GetEnvironmentVariableW(L"PSSTREAM_TEST_UPDATE_API", NULL, 0))
+#endif
+	CloseHandle(CreateThread(NULL, 0, update_check_main, NULL, 0, NULL));
 	CloseHandle(CreateThread(NULL, 0, update_cleanup_main, NULL, 0, NULL));
 
 	LPTHREAD_START_ROUTINE thread_main = worker_main;
@@ -2308,7 +2528,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmd, int show)
 	while(GetMessageW(&msg, NULL, 0, 0) > 0)
 	{
 		// While assigning a hotkey, keys like Esc and Tab must reach the window instead of the dialog logic
-		if(!ui.capturing && IsDialogMessageW(g.hwnd, &msg))
+		if(!ui.capturing && !ui.tour && IsDialogMessageW(g.hwnd, &msg))
 			continue;
 		TranslateMessage(&msg);
 		DispatchMessageW(&msg);

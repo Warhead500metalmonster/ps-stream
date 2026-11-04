@@ -41,6 +41,7 @@ You need Windows 10 or 11 (64-bit), a PS5 on the same network, and a web browser
 
 1. Download the latest zip from [Releases](../../releases/latest) and extract it.
 2. Open `PS Stream.exe`. Keep the folder together, because the app needs the files in `dist`. Windows may warn you because the app isn't signed. Choose **More info**, then **Run anyway**.
+   - A short tour shows where everything is. Press **Skip tour** if you don't need it, and replay it anytime with **Show tour** in Settings.
 3. On the **Pairing** page:
    - The app looks for your PS5. If it can't find it, type the console's IP address.
    - Press **Sign in with PSN** and sign in on Sony's page in your browser. Your password goes only to Sony. While it waits, the app checks your browser's address bar and clipboard for Sony's redirect address, and links your account when it appears. If it doesn't link, copy the address from the address bar.
@@ -69,9 +70,11 @@ For the best results on Wi-Fi, connect the PS5 to your router with a cable, or u
 
 ## Updates
 
-At startup, the app asks GitHub for the latest release number, and shows an **Update** button if there is a newer one. That check sends no account or console data. Nothing is downloaded until you press the button.
+The app keeps itself up to date. At startup, it asks GitHub for the latest release number. That check sends no account or console data.
 
-When you press it, the app downloads the release from GitHub, checks it against the checksum GitHub lists for that file, replaces its files and restarts. Your pairing and settings stay as they are. If the new version doesn't start, the old files go back. Turn off **Check for updates** in Settings to stop the check.
+When there's a newer version, the app downloads it from GitHub, checks it against the checksum GitHub lists for that file, replaces its files and restarts. Your pairing and settings stay as they are. It never interrupts a game: it installs right after the app opens, or once audio and video are both off.
+
+If the new version doesn't start, the old files go back and the old version keeps running. After three failed tries, the app stops installing that version by itself, and the **Update** button at the bottom lets you try again.
 
 ## Known limitations
 

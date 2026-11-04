@@ -49,10 +49,14 @@
 
 // Below this rate we are outside what chiaki-ng offers, so a console that refuses to start
 // gets a second try with it.
-#define APP_VERSION "0.1.21"
+#define APP_VERSION "0.1.22"
 #define UPDATE_RECHECK_MS (6 * 60 * 60 * 1000)
 #define UPDATE_TRIES 6
 #define UPDATE_RETRY_MS 20000
+// New versions install themselves, but never in the middle of a game: only this soon after the
+// app opens, or once audio and video are both off. A version that failed this often waits for Update.
+#define UPDATE_AUTO_GRACE_MS 120000
+#define UPDATE_AUTO_MAX_FAILS 3
 #define UPDATE_DOWNLOAD_PREFIX "https://github.com/Warhead500metalmonster/ps-stream/releases/download/"
 #define RELEASES_URL L"https://github.com/Warhead500metalmonster/ps-stream/releases/latest"
 #define REPO_URL L"https://github.com/Warhead500metalmonster/ps-stream"
@@ -121,7 +125,7 @@ static const Resolution resolutions[] = {
 typedef struct {
 	int res, fps, kbps, h265, hw;
 	int ao_res, ao_kbps;
-	int volume, buffer_ms, loss_pct, reconnect, no_controller, wifi_opt, autostart_audio, win_start, tray, update_check, auto_wake, gamepad;
+	int volume, buffer_ms, loss_pct, reconnect, no_controller, wifi_opt, autostart_audio, win_start, tray, auto_wake, gamepad;
 	int hotkey_audio, hotkey_video, hotkey_mute; // HKM_GETHOTKEY format
 	char device[256]; // empty is the system default
 } Settings;
@@ -183,6 +187,7 @@ static struct {
 	wchar_t pad_name[64];
 	int regist_tries;
 	volatile LONG update_ready, update_busy, update_failed, update_restart;
+	DWORD started_at;
 	char update_url[512], update_digest[72];
 	bool relaunched;
 	HANDLE single_instance;
@@ -1996,7 +2001,6 @@ static void config_load(void)
 	s->autostart_audio = config_int("autostart_audio", 1, 0, 1);
 	s->win_start = win_start_get();
 	s->tray = config_int("tray", 1, 0, 1);
-	s->update_check = config_int("update_check", 1, 0, 1);
 	s->auto_wake = config_int("auto_wake", 1, 0, 1);
 	s->hotkey_audio = hotkey_load("hotkey_audio", MAKEWORD(VK_F9, HOTKEYF_CONTROL | HOTKEYF_ALT));
 	s->hotkey_video = hotkey_load("hotkey_video", MAKEWORD(VK_F10, HOTKEYF_CONTROL | HOTKEYF_ALT));
@@ -2027,7 +2031,6 @@ static void config_save_settings(const Settings *s)
 	config_set_int("wifi_opt", s->wifi_opt);
 	config_set_int("autostart_audio", s->autostart_audio);
 	config_set_int("tray", s->tray);
-	config_set_int("update_check", s->update_check);
 	config_set_int("auto_wake", s->auto_wake);
 	config_set_int("hotkey_audio", s->hotkey_audio);
 	config_set_int("hotkey_video", s->hotkey_video);
@@ -2329,7 +2332,31 @@ static void update_fail(const wchar_t *text, const char *why)
 	dir_delete(dir);
 	g.update_failed = 1;
 	g.update_busy = 0;
+	config_set_int("update_fails", config_int("update_fails", 0, 0, 100) + 1);
 	set_status(text);
+}
+
+static void update_begin(void);
+
+static void update_auto(void)
+{
+	if(!g.update_ready || g.update_busy || !update_available_here() || config_int("update_fails", 0, 0, 100) >= UPDATE_AUTO_MAX_FAILS)
+		return;
+	// Just updated and still not the newest means the release itself is wrong. Installing it again
+	// would loop, so this counts as a failed try instead.
+	static bool counted;
+	if(g.relaunched)
+	{
+		if(!counted)
+			config_set_int("update_fails", config_int("update_fails", 0, 0, 100) + 1);
+		counted = true;
+		return;
+	}
+	if((g.want_audio || g.want_video) && GetTickCount() - g.started_at > UPDATE_AUTO_GRACE_MS)
+		return;
+	CHIAKI_LOGI(&g.log, "Installing %s by itself", g.update_tag);
+	update_begin();
+	set_status(L"Yeni sürüm yükleniyor. Uygulama birazdan kendiliğinden yeniden açılacak");
 }
 
 static DWORD WINAPI update_download_main(void *arg)
@@ -2641,10 +2668,6 @@ static DWORD WINAPI update_check_main(void *arg)
 		update_asset_find(body.data, tag);
 		snprintf(g.update_tag, sizeof(g.update_tag), "%s", tag);
 		g.update_ready = 1;
-#ifdef PSSTREAM_TEST
-		if(!g.relaunched && !g.update_failed && GetEnvironmentVariableA("PSSTREAM_TEST_AUTOUPDATE", NULL, 0))
-			update_begin();
-#endif
 		PostMessageW(g.hwnd, WM_APP_STATUS, 0, 0);
 	}
 	CHIAKI_LOGI(&g.log, "Update check: current %s, latest %s (%s)", current, tag[0] ? tag : "unknown", curl_easy_strerror(res));
