@@ -2408,7 +2408,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmd, int show)
 		}
 	}
 
-	wchar_t dir[MAX_PATH], log_path[MAX_PATH], old_log[MAX_PATH];
+	wchar_t dir[MAX_PATH];
 	SHGetFolderPathW(NULL, CSIDL_APPDATA, NULL, 0, dir);
 	wcsncat(dir, L"\\PSStream", MAX_PATH - wcslen(dir) - 1);
 	CreateDirectoryW(dir, NULL);
@@ -2417,11 +2417,9 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmd, int show)
 #endif
 	wcscpy(g.data_dir, dir);
 	swprintf(g.config_path, MAX_PATH, L"%ls\\config.ini", dir);
-	swprintf(log_path, MAX_PATH, L"%ls\\log.txt", dir);
-	swprintf(old_log, MAX_PATH, L"%ls\\log.onceki.txt", dir);
-	MoveFileExW(log_path, old_log, MOVEFILE_REPLACE_EXISTING);
-	g.log_file = _wfopen(log_path, L"w");
+	log_open(false);
 	chiaki_log_init(&g.log, CHIAKI_LOG_ALL & ~CHIAKI_LOG_VERBOSE & ~CHIAKI_LOG_DEBUG, log_cb, NULL);
+	CHIAKI_LOGI(&g.log, "==== PS Stream %s started%s ====", APP_VERSION, g.relaunched ? " after an update" : "");
 
 	chiaki_lib_init();
 	curl_global_init(CURL_GLOBAL_DEFAULT);
@@ -2548,7 +2546,6 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmd, int show)
 	curl_global_cleanup();
 	if(g.update_restart)
 		update_finish();
-	if(g.log_file)
-		fclose(g.log_file);
+	log_close();
 	return 0;
 }

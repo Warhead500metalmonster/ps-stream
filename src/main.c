@@ -49,7 +49,7 @@
 
 // Below this rate we are outside what chiaki-ng offers, so a console that refuses to start
 // gets a second try with it.
-#define APP_VERSION "0.1.22"
+#define APP_VERSION "0.1.23"
 #define UPDATE_RECHECK_MS (6 * 60 * 60 * 1000)
 #define UPDATE_TRIES 6
 #define UPDATE_RETRY_MS 20000
@@ -149,6 +149,7 @@ static struct {
 	UINT dpi;
 	wchar_t config_path[MAX_PATH], data_dir[MAX_PATH];
 	FILE *log_file;
+	long long log_bytes;
 	ChiakiLog log;
 	bool test_hidden;
 	const char *test_video_shot;
@@ -239,6 +240,42 @@ static bool log_is_noise(const char *msg)
 	return msg[0] == ' ' && strspn(msg, " 0123456789abcdef") >= 8;
 }
 
+// Sessions are added to one file, so restarting or updating doesn't wipe the one worth reading.
+// Past the size limit the file moves to log.onceki.txt and a fresh one starts.
+// Re-entrant, so a crash logged while the same thread was writing still gets written
+static CRITICAL_SECTION log_lock;
+
+// Must be called with log_lock held, or before other threads log
+static void log_open(bool rotate)
+{
+	static bool lock_ready;
+	if(!lock_ready)
+		InitializeCriticalSection(&log_lock);
+	lock_ready = true;
+	wchar_t path[MAX_PATH], old[MAX_PATH];
+	swprintf(path, MAX_PATH, L"%ls\\log.txt", g.data_dir);
+	swprintf(old, MAX_PATH, L"%ls\\log.onceki.txt", g.data_dir);
+	if(g.log_file)
+		fclose(g.log_file);
+	if(rotate)
+		MoveFileExW(path, old, MOVEFILE_REPLACE_EXISTING);
+	g.log_file = _wfopen(path, L"a");
+	g.log_bytes = 0;
+	if(g.log_file && _fseeki64(g.log_file, 0, SEEK_END) == 0)
+		g.log_bytes = _ftelli64(g.log_file);
+	if(!rotate && g.log_bytes > LOG_MAX_BYTES)
+		log_open(true);
+}
+
+static void log_close(void)
+{
+	EnterCriticalSection(&log_lock);
+	if(g.log_file)
+		fclose(g.log_file);
+	g.log_file = NULL;
+	LeaveCriticalSection(&log_lock);
+}
+
 static void log_cb(ChiakiLogLevel level, const char *msg, void *user)
 {
 	// The library only reports that pairing failed. An answer from the PS5 means the code was
@@ -247,15 +284,26 @@ static void log_cb(ChiakiLogLevel level, const char *msg, void *user)
 		g.regist_rejected = 1;
 	(void)level;
 	(void)user;
-	static long written;
-	if(!g.log_file || written > LOG_MAX_BYTES || log_is_noise(msg))
+	if(log_is_noise(msg))
 		return;
 	SYSTEMTIME t;
 	GetLocalTime(&t);
-	int n = fprintf(g.log_file, "%02d:%02d:%02d %s\n", t.wHour, t.wMinute, t.wSecond, msg);
-	if(n > 0)
-		written += n;
-	fflush(g.log_file);
+	EnterCriticalSection(&log_lock);
+	if(g.log_file && g.log_bytes > LOG_MAX_BYTES)
+		log_open(true);
+	if(g.log_file)
+	{
+		// Lines only carry the time, so each day gets a date line
+		static WORD last_day;
+		int n = 0;
+		if(t.wDay != last_day)
+			n += fprintf(g.log_file, "---- %04d-%02d-%02d ----\n", t.wYear, t.wMonth, t.wDay);
+		last_day = t.wDay;
+		n += fprintf(g.log_file, "%02d:%02d:%02d %s\n", t.wHour, t.wMinute, t.wSecond, msg);
+		g.log_bytes += n > 0 ? n : 0;
+		fflush(g.log_file);
+	}
+	LeaveCriticalSection(&log_lock);
 }
 
 // ---------- audio ----------
@@ -2554,9 +2602,7 @@ static void update_finish(void)
 		CloseHandle(g.single_instance);
 	HANDLE ready = CreateEventW(NULL, TRUE, FALSE, L"PSStreamUpdated");
 	// The new version takes over the log file
-	if(g.log_file)
-		fclose(g.log_file);
-	g.log_file = NULL;
+	log_close();
 
 	PROCESS_INFORMATION pi;
 	bool ok = update_swap_folder(staged, root) && update_swap_folder(staged_dist, dist) && update_launch(exe, L"--updated", &pi);
