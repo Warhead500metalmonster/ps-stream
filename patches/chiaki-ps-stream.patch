@@ -18,6 +18,18 @@ index e90ecea..10876cf 100644
  	} connect_info;
  
  	ChiakiTarget target;
+diff --git a/lib/include/chiaki/takion.h b/lib/include/chiaki/takion.h
+index 16bad78..1289570 100644
+--- a/lib/include/chiaki/takion.h
++++ b/lib/include/chiaki/takion.h
+@@ -153,6 +153,7 @@ typedef struct chiaki_takion_t
+ 	ChiakiGKCrypt *gkcrypt_remote; // if NULL (default), remote gmacs are IGNORED (!) and everything is expected to be unencrypted
+ 
+ 	ChiakiReorderQueue data_queue;
++	bool data_acked; // data_queue has delivered and acked something
+ 	ChiakiReorderQueue video_queue;
+ 	bool video_queue_initialized;
+ 	int64_t video_queue_head_wait_start_us;
 diff --git a/lib/src/session.c b/lib/src/session.c
 index 41c6bbf..9508442 100644
 --- a/lib/src/session.c
@@ -31,10 +43,10 @@ index 41c6bbf..9508442 100644
  	return CHIAKI_ERR_SUCCESS;
  
 diff --git a/lib/src/streamconnection.c b/lib/src/streamconnection.c
-index afa1a60..0cfd598 100644
+index afa1a60..7f38d6d 100644
 --- a/lib/src/streamconnection.c
 +++ b/lib/src/streamconnection.c
-@@ -31,6 +31,8 @@
+@@ -31,8 +31,11 @@
  #define STREAM_CONNECTION_PORT 9296
  
  #define EXPECT_TIMEOUT_MS 5000
@@ -42,8 +54,11 @@ index afa1a60..0cfd598 100644
 +#define TAKION_CONNECT_TIMEOUT_MS 10000
  
  #define HEARTBEAT_INTERVAL_MS 1000
++#define DISCONNECT_ACK_WAIT_MS 500
  
-@@ -226,7 +228,7 @@ CHIAKI_EXPORT ChiakiErrorCode chiaki_stream_connection_run(ChiakiStreamConnectio
+ 
+ typedef enum {
+@@ -226,7 +229,7 @@ CHIAKI_EXPORT ChiakiErrorCode chiaki_stream_connection_run(ChiakiStreamConnectio
  		goto close_takion;
  	}
  
@@ -52,7 +67,7 @@ index afa1a60..0cfd598 100644
  	assert(err == CHIAKI_ERR_SUCCESS || err == CHIAKI_ERR_TIMEOUT);
  	CHECK_STOP(close_takion);
  	if(err != CHIAKI_ERR_SUCCESS)
-@@ -289,15 +291,18 @@ CHIAKI_EXPORT ChiakiErrorCode chiaki_stream_connection_run(ChiakiStreamConnectio
+@@ -289,15 +292,18 @@ CHIAKI_EXPORT ChiakiErrorCode chiaki_stream_connection_run(ChiakiStreamConnectio
  
  	err = chiaki_mutex_lock(&stream_connection->feedback_sender_mutex);
  	assert(err == CHIAKI_ERR_SUCCESS);
@@ -78,7 +93,7 @@ index afa1a60..0cfd598 100644
  	chiaki_mutex_unlock(&stream_connection->feedback_sender_mutex);
  
  	stream_connection->state = STATE_IDLE;
-@@ -326,8 +331,11 @@ CHIAKI_EXPORT ChiakiErrorCode chiaki_stream_connection_run(ChiakiStreamConnectio
+@@ -326,8 +332,11 @@ CHIAKI_EXPORT ChiakiErrorCode chiaki_stream_connection_run(ChiakiStreamConnectio
  
  	err = chiaki_mutex_lock(&stream_connection->feedback_sender_mutex);
  	assert(err == CHIAKI_ERR_SUCCESS);
@@ -92,7 +107,30 @@ index afa1a60..0cfd598 100644
  	chiaki_mutex_unlock(&stream_connection->feedback_sender_mutex);
  
  	err = CHIAKI_ERR_SUCCESS;
-@@ -959,7 +967,9 @@ static void stream_connection_takion_data_expect_streaminfo(ChiakiStreamConnecti
+@@ -339,7 +348,21 @@ disconnect:
+ 		free(stream_connection->streaminfo_early_buf);
+ 		stream_connection->streaminfo_early_buf = NULL;
+ 	}
+-	stream_connection_send_disconnect(stream_connection);
++	if(stream_connection_send_disconnect(stream_connection) == CHIAKI_ERR_SUCCESS && !stream_connection->remote_disconnected)
++	{
++		// Closing right away gave a lost Disconnect no second chance, and the PS5 then kept the old
++		// session and answered the next connection with "already in use". The send buffer resends it
++		// meanwhile; once it's empty the PS5 has acked everything, the Disconnect included.
++		for(int waited = 0; waited < DISCONNECT_ACK_WAIT_MS; waited += 20)
++		{
++			chiaki_mutex_lock(&stream_connection->takion.send_buffer.mutex);
++			size_t pending = stream_connection->takion.send_buffer.packets_count;
++			chiaki_mutex_unlock(&stream_connection->takion.send_buffer.mutex);
++			if(!pending)
++				break;
++			chiaki_cond_timedwait(&stream_connection->state_cond, &stream_connection->state_mutex, 20);
++		}
++	}
+ 
+ 	if(stream_connection->should_stop)
+ 	{
+@@ -959,7 +982,9 @@ static void stream_connection_takion_data_expect_streaminfo(ChiakiStreamConnecti
  
  	stream_connection_send_streaminfo_ack(stream_connection);
  	
@@ -104,7 +142,7 @@ index afa1a60..0cfd598 100644
  	{
  		CHIAKI_LOGE(stream_connection->log, "StreamConnection failed to send controller connection");
 diff --git a/lib/src/takion.c b/lib/src/takion.c
-index 38f9f5d..3181d06 100644
+index 38f9f5d..d1b09ca 100644
 --- a/lib/src/takion.c
 +++ b/lib/src/takion.c
 @@ -55,7 +55,10 @@
@@ -119,7 +157,15 @@ index 38f9f5d..3181d06 100644
  /**
   * Base type of Takion packets. Lower nibble of the first byte in datagrams.
   */
-@@ -257,7 +260,7 @@ CHIAKI_EXPORT ChiakiErrorCode chiaki_takion_connect(ChiakiTakion *takion, Chiaki
+@@ -197,6 +200,7 @@ CHIAKI_EXPORT ChiakiErrorCode chiaki_takion_connect(ChiakiTakion *takion, Chiaki
+ 	takion->log = info->log;
+ 	takion->close_socket = info->close_socket;
+ 	takion->version = info->protocol_version;
++	takion->data_acked = false;
+ 	takion->disable_audio_video = info->disable_audio_video;
+ 
+ 	switch(takion->version)
+@@ -257,7 +261,7 @@ CHIAKI_EXPORT ChiakiErrorCode chiaki_takion_connect(ChiakiTakion *takion, Chiaki
  			CHIAKI_LOGE(takion->log, "Takion had problem reading extra messages from socket using PSN Connection with error: " CHIAKI_SOCKET_ERROR_FMT, CHIAKI_SOCKET_ERROR_VALUE);
  			goto error_sock;
  		}
@@ -128,7 +174,7 @@ index 38f9f5d..3181d06 100644
  		int r = setsockopt(takion->sock, SOL_SOCKET, SO_RCVBUF, (const CHIAKI_SOCKET_BUF_TYPE)&rcvbuf_val, sizeof(rcvbuf_val));
  		if(r < 0)
  		{
-@@ -345,7 +348,7 @@ CHIAKI_EXPORT ChiakiErrorCode chiaki_takion_connect(ChiakiTakion *takion, Chiaki
+@@ -345,7 +349,7 @@ CHIAKI_EXPORT ChiakiErrorCode chiaki_takion_connect(ChiakiTakion *takion, Chiaki
  			ret = CHIAKI_ERR_NETWORK;
  			goto error_pipe;
  		}
@@ -137,7 +183,7 @@ index 38f9f5d..3181d06 100644
  		int r = setsockopt(takion->sock, SOL_SOCKET, SO_RCVBUF, (const CHIAKI_SOCKET_BUF_TYPE)&rcvbuf_val, sizeof(rcvbuf_val));
  		if(r < 0)
  		{
-@@ -851,7 +854,7 @@ static ChiakiErrorCode takion_handshake(ChiakiTakion *takion, uint32_t *seq_num_
+@@ -851,7 +855,7 @@ static ChiakiErrorCode takion_handshake(ChiakiTakion *takion, uint32_t *seq_num_
  
  		// INIT_ACK <-
  		err = takion_recv_message_init_ack(takion, &init_ack_payload);
@@ -146,7 +192,7 @@ index 38f9f5d..3181d06 100644
  			break;
  	}
  	if(err != CHIAKI_ERR_SUCCESS)
-@@ -897,7 +900,7 @@ static ChiakiErrorCode takion_handshake(ChiakiTakion *takion, uint32_t *seq_num_
+@@ -897,7 +901,7 @@ static ChiakiErrorCode takion_handshake(ChiakiTakion *takion, uint32_t *seq_num_
  		// COOKIE_ACK <-
  
  		err = takion_recv_message_cookie_ack(takion);
@@ -155,7 +201,33 @@ index 38f9f5d..3181d06 100644
  			break;
  	}
  	if(err != CHIAKI_ERR_SUCCESS)
-@@ -1419,9 +1422,11 @@ static void takion_handle_packet_message_data(ChiakiTakion *takion, uint8_t *pac
+@@ -1387,7 +1391,10 @@ static void takion_flush_data_queue(ChiakiTakion *takion)
+ 	}
+ 
+ 	if(ack)
++	{
+ 		chiaki_takion_send_message_data_ack(takion, (uint32_t)seq_num);
++		takion->data_acked = true;
++	}
+ }
+ 
+ static void takion_handle_packet_message_data(ChiakiTakion *takion, uint8_t *packet_buf, size_t packet_buf_size, uint8_t type_b, uint8_t *payload, size_t payload_size)
+@@ -1413,15 +1420,26 @@ static void takion_handle_packet_message_data(ChiakiTakion *takion, uint8_t *pac
+ 	entry->channel = ntohs(*((chiaki_unaligned_uint16_t *)(payload + 4)));
+ 	ChiakiSeqNum32 seq_num = ntohl(*((chiaki_unaligned_uint32_t *)(payload + 0)));
+ 
++	// A packet that was already delivered comes again only because our ack for it got lost. Acking it
++	// once more is the only way the PS5 learns it arrived. Dropping it silently left the PS5 resending
++	// until it gave up on us and ended the stream with "Server shutting down".
++	uint32_t delivered_end = (uint32_t)takion->data_queue.begin;
++	bool repeat = takion->data_acked && (int32_t)(seq_num - delivered_end) < 0;
++
+ 	chiaki_reorder_queue_push(&takion->data_queue, seq_num, entry);
+ 	takion_flush_data_queue(takion);
++
++	if(repeat)
++		chiaki_takion_send_message_data_ack(takion, delivered_end - 1);
+ }
  
  static void takion_handle_packet_message_data_ack(ChiakiTakion *takion, uint8_t flags, uint8_t *buf, size_t buf_size)
  {
@@ -169,7 +241,7 @@ index 38f9f5d..3181d06 100644
  		return;
  	}
  
-@@ -1430,15 +1435,12 @@ static void takion_handle_packet_message_data_ack(ChiakiTakion *takion, uint8_t
+@@ -1430,15 +1448,12 @@ static void takion_handle_packet_message_data_ack(ChiakiTakion *takion, uint8_t
  	uint16_t gap_ack_blocks_count = ntohs(*((chiaki_unaligned_uint16_t *)(buf + 8)));
  	uint16_t dup_tsns_count = ntohs(*((chiaki_unaligned_uint16_t *)(buf + 0xa)));
  
@@ -187,7 +259,7 @@ index 38f9f5d..3181d06 100644
  	CHIAKI_LOGV(takion->log, "Takion received data ack with cumulative_seq_num = %#x, a_rwnd = %#x, gap_ack_blocks_count = %#x, dup_tsns_count = %#x",
  			cumulative_seq_num, a_rwnd, gap_ack_blocks_count, dup_tsns_count);
  
-@@ -1538,7 +1540,7 @@ static ChiakiErrorCode takion_recv_message_init_ack(ChiakiTakion *takion, Takion
+@@ -1538,7 +1553,7 @@ static ChiakiErrorCode takion_recv_message_init_ack(ChiakiTakion *takion, Takion
  {
  	uint8_t message[1 + TAKION_MESSAGE_HEADER_SIZE + 0x10 + TAKION_COOKIE_SIZE];
  	size_t received_size = sizeof(message);
@@ -196,7 +268,7 @@ index 38f9f5d..3181d06 100644
  	if(err != CHIAKI_ERR_SUCCESS)
  		return err;
  
-@@ -1585,14 +1587,14 @@ static ChiakiErrorCode takion_recv_message_cookie_ack(ChiakiTakion *takion)
+@@ -1585,14 +1600,14 @@ static ChiakiErrorCode takion_recv_message_cookie_ack(ChiakiTakion *takion)
  {
  	uint8_t message[1 + TAKION_MESSAGE_HEADER_SIZE];
  	size_t received_size = sizeof(message);

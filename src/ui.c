@@ -2596,6 +2596,8 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmd, int show)
 		DispatchMessageW(&msg);
 	}
 
+	// So a log that ends here reads as closed on purpose, not as a crash
+	CHIAKI_LOGI(&g.log, "App closing%s", g.update_restart ? " for an update" : "");
 	g.quit = 1;
 	SetEvent(g.wake);
 	// Stopping tells the PS5 we left. If that hangs, leave anyway instead of tearing SDL down under it
