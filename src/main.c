@@ -49,7 +49,7 @@
 
 // Below this rate we are outside what chiaki-ng offers, so a console that refuses to start
 // gets a second try with it.
-#define APP_VERSION "0.1.26"
+#define APP_VERSION "0.1.27"
 #define UPDATE_RECHECK_MS (6 * 60 * 60 * 1000)
 #define UPDATE_TRIES 6
 #define UPDATE_RETRY_MS 20000
@@ -185,6 +185,8 @@ static struct {
 	int audio_target_ms;
 	DWORD audio_last_dropout, connected_at;
 	volatile DWORD last_rx; // when the PS5 last sent sound or a picture
+	DWORD audio_rx_at; // when the last sound arrived, 0 at the start of a session
+	volatile LONG audio_gap_max; // longest wait between two sounds since the last connection report
 	volatile LONG audio_dropouts, video_fps10, video_lost_total, ps5_standby;
 	char update_tag[32];
 	volatile LONG network_changed, regist_rejected, muted, session_live, rumble_new, rumble_left, rumble_right;
@@ -352,7 +354,19 @@ static void audio_settings_cb(uint32_t channels, uint32_t rate, void *user)
 static void audio_frame_cb(int16_t *buf, size_t samples_count, void *user)
 {
 	(void)user;
-	g.last_rx = GetTickCount();
+	// This runs on the thread that receives everything from the PS5. A game downloading or unpacking
+	// on the PC kept it waiting for the CPU, and packets then came out in bursts with gaps between.
+	static __thread bool boosted;
+	if(!boosted)
+	{
+		boosted = true;
+		SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+	}
+	DWORD arrived = GetTickCount();
+	if(g.audio_rx_at && (LONG)(arrived - g.audio_rx_at) > g.audio_gap_max)
+		g.audio_gap_max = (LONG)(arrived - g.audio_rx_at);
+	g.audio_rx_at = arrived;
+	g.last_rx = arrived;
 	// A headset that was unplugged leaves the device stopped for good, and with no device at all
 	// this runs a hundred times a second, so only try every so often
 	bool device_gone = !g.audio_dev || SDL_GetAudioDeviceStatus(g.audio_dev) == SDL_AUDIO_STOPPED;
@@ -1412,6 +1426,7 @@ static bool session_start(bool video, const Settings *s, bool safe)
 	g.connected = 0;
 	g.ended = 0;
 	g.audio_dropouts = 0;
+	g.audio_rx_at = 0;
 	g.video_fps10 = 0;
 	g.video_lost_total = 0;
 	ChiakiErrorCode err = chiaki_session_init(&g.session, &info, &g.log);
@@ -1455,6 +1470,13 @@ error:
 
 static void session_stop(bool video)
 {
+	// The next session, even after a restart, starts from the buffer this one settled on
+	static int saved_target;
+	if(g.audio_target_ms && g.audio_target_ms != saved_target)
+	{
+		config_set_int("audio_target", g.audio_target_ms);
+		saved_target = g.audio_target_ms;
+	}
 	EnterCriticalSection(&g.pad_lock);
 	g.session_live = 0;
 	LeaveCriticalSection(&g.pad_lock);
@@ -2056,6 +2078,10 @@ static void config_load(void)
 	s->ao_kbps = config_int("ao_kbps", 500, 100, 2000);
 	s->volume = config_int("volume", 100, 0, 200);
 	s->buffer_ms = config_int("buffer_ms", 150, 40, 500);
+	// Starting at the smallest buffer meant crackling for the first seconds of every session until it
+	// grew back. One step under what the last session needed lets it shrink again if the link got better.
+	int learned = config_int("audio_target", 0, AUDIO_TARGET_MIN_MS, AUDIO_TARGET_MAX_MS);
+	g.audio_target_ms = learned - AUDIO_TARGET_STEP_MS > AUDIO_TARGET_MIN_MS ? learned - AUDIO_TARGET_STEP_MS : AUDIO_TARGET_MIN_MS;
 	s->loss_pct = config_int("loss_pct", 5, 1, 20);
 	s->reconnect = config_int("reconnect", 1, 0, 1);
 	s->no_controller = config_int("no_controller", 1, 0, 1);

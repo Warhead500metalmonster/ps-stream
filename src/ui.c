@@ -1661,9 +1661,11 @@ static void connection_watch(void)
 	if(now - ui.weak_checked_at < WEAK_WINDOW_MS)
 		return;
 	int lost = g.video_lost_total - ui.weak_lost, drops = g.audio_dropouts - ui.weak_drops;
+	LONG gap = InterlockedExchange(&g.audio_gap_max, 0);
+	// The longest wait between sounds tells Wi-Fi bursts apart from a PC that was too busy
 	if(lost || drops || ui.loss_peak > 0)
-		CHIAKI_LOGI(&g.log, "Connection in the last %d s: %d lost frames, %d audio dropouts, packet loss peak %.0f%%",
-				WEAK_WINDOW_MS / 1000, lost, drops, ui.loss_peak * 100);
+		CHIAKI_LOGI(&g.log, "Connection in the last %d s: %d lost frames, %d audio dropouts, packet loss peak %.0f%%, longest sound gap %ld ms%s",
+				WEAK_WINDOW_MS / 1000, lost, drops, ui.loss_peak * 100, (long)gap, IsWindowVisible(g.hwnd) && !IsIconic(g.hwnd) ? "" : ", window hidden");
 	ui.loss_peak = 0;
 	ui.weak_lost = g.video_lost_total;
 	ui.weak_drops = g.audio_dropouts;
@@ -2439,6 +2441,16 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmd, int show)
 	InitializeCriticalSection(&g.pad_lock);
 	InitializeCriticalSection(&g.sdl_lock);
 	SetPriorityClass(GetCurrentProcess(), ABOVE_NORMAL_PRIORITY_CLASS);
+	// Windows 11 slows down apps without a visible window (EcoQoS) and ignores their timer requests.
+	// Audio only runs hidden in the tray, and that showed as sound gaps with no packet loss at all.
+	PROCESS_POWER_THROTTLING_STATE throttle = { PROCESS_POWER_THROTTLING_CURRENT_VERSION,
+		PROCESS_POWER_THROTTLING_EXECUTION_SPEED | PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION, 0 };
+	if(!SetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling, &throttle, sizeof(throttle)))
+	{
+		// Older Windows 10 doesn't know the timer flag
+		throttle.ControlMask = PROCESS_POWER_THROTTLING_EXECUTION_SPEED;
+		SetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling, &throttle, sizeof(throttle));
+	}
 
 	int argc = 0;
 	wchar_t **argv = CommandLineToArgvW(GetCommandLineW(), &argc);
