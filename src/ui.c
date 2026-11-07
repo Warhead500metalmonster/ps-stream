@@ -500,7 +500,10 @@ static void toggle(int which)
 	if(which == UI_AUDIO)
 		g.want_audio = !g.want_audio;
 	else
+	{
 		g.want_video = !g.want_video;
+		config_set_int("autostart_video", g.want_video);
+	}
 	SetEvent(g.wake);
 }
 
@@ -511,6 +514,7 @@ static void audio_only_select(void)
 	if(g.want_audio && g.want_video)
 	{
 		g.want_video = 0;
+		config_set_int("autostart_video", 0);
 		SetEvent(g.wake);
 	}
 }
@@ -2577,6 +2581,10 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmd, int show)
 	if(autostart && g.paired && g.host[0] && g.settings.autostart_audio)
 	{
 		g.want_audio = 1;
+		// Opens the way it was last left. Starting with sound only and turning video on seconds later
+		// meant a second connection, and the PS5 refuses that as "in use" for about 9 s.
+		// Started hidden with Windows, a video window popping up would be a surprise.
+		g.want_video = !start_in_tray && config_int("autostart_video", 0, 0, 1);
 		SetEvent(g.wake);
 	}
 
