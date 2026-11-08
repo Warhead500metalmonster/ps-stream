@@ -1927,8 +1927,13 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 			ui_frame();
 			return 0;
 		case WM_APP_VIDEO_CLOSED:
+			// Turns video off without changing how the app opens next time: people close the video
+			// window on their way out, and the next launch then started with sound only
 			if(g.want_video)
-				toggle(UI_VIDEO);
+			{
+				g.want_video = 0;
+				SetEvent(g.wake);
+			}
 			ui_frame();
 			return 0;
 		case WM_APP_ALL_OFF:

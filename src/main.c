@@ -49,7 +49,7 @@
 
 // Below this rate we are outside what chiaki-ng offers, so a console that refuses to start
 // gets a second try with it.
-#define APP_VERSION "0.1.28"
+#define APP_VERSION "0.1.29"
 #define UPDATE_RECHECK_MS (6 * 60 * 60 * 1000)
 #define UPDATE_TRIES 6
 #define UPDATE_RETRY_MS 20000
@@ -92,6 +92,9 @@
 #define STALL_MS 15000
 #define AUDIO_REOPEN_MS 2000
 #define IN_USE_QUIET_MS 15000
+// After "Server shutting down" the PS5's Remote Play server stays up a few more seconds. Trying
+// then got "in use" or hung for up to 51 s; when the PS5 stayed on it took 12 s or more anyway.
+#define RETRY_AFTER_SHUTDOWN_MS 6000
 
 #define PSN_CLIENT_ID "ba495a24-818c-472b-b12d-ff231c1b5745"
 #define PSN_CLIENT_ID_W L"ba495a24-818c-472b-b12d-ff231c1b5745"
@@ -1842,6 +1845,8 @@ static DWORD WINAPI worker_main(void *arg)
 					// Right after startup the network needs a moment, so keep trying quickly and quietly
 					bool early = GetTickCount() - trying_since < RETRY_FAST_WINDOW_MS;
 					int delay = early ? RETRY_FAST_MS : RETRY_MAX_MS;
+					if(reason == CHIAKI_QUIT_REASON_STREAM_CONNECTION_REMOTE_SHUTDOWN && delay < RETRY_AFTER_SHUTDOWN_MS)
+						delay = RETRY_AFTER_SHUTDOWN_MS;
 					retry_at = GetTickCount() + delay;
 					const wchar_t *text = quit_reason_text(reason);
 					if(wcscmp(text, L"Bağlantı yok, tekrar deneniyor...") == 0)
