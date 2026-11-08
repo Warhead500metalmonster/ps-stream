@@ -49,7 +49,7 @@
 
 // Below this rate we are outside what chiaki-ng offers, so a console that refuses to start
 // gets a second try with it.
-#define APP_VERSION "0.1.30"
+#define APP_VERSION "0.1.31"
 #define UPDATE_RECHECK_MS (6 * 60 * 60 * 1000)
 #define UPDATE_TRIES 6
 #define UPDATE_RETRY_MS 20000
@@ -1813,6 +1813,9 @@ static DWORD WINAPI worker_main(void *arg)
 				trying_since = GetTickCount();
 				retry_at = trying_since + 1000;
 			}
+			else if(running)
+				// Wi-Fi dropping and coming back mid-game shows up here, which explains a gap that follows
+				CHIAKI_LOGI(&g.log, "Network changed during the session");
 		}
 
 		bool want_video = g.want_video != 0;

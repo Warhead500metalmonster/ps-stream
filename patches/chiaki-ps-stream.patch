@@ -31,22 +31,38 @@ index 16bad78..1289570 100644
  	bool video_queue_initialized;
  	int64_t video_queue_head_wait_start_us;
 diff --git a/lib/include/chiaki/videoreceiver.h b/lib/include/chiaki/videoreceiver.h
-index a340b5d..a3c4086 100644
+index a340b5d..4cab07c 100644
 --- a/lib/include/chiaki/videoreceiver.h
 +++ b/lib/include/chiaki/videoreceiver.h
-@@ -37,6 +37,7 @@ typedef struct chiaki_video_receiver_t
+@@ -37,6 +37,8 @@ typedef struct chiaki_video_receiver_t
  	ChiakiBitstream bitstream;
  	ChiakiMutex waiting_for_idr_mutex;
  	bool waiting_for_idr;
 +	uint64_t idr_requested_ms; // when the IDR frame being waited for was last asked for
++	uint64_t corrupt_reported_ms; // when corrupt frames were last reported
  	ChiakiMutex frames_lost_mutex;
  } ChiakiVideoReceiver;
  
 diff --git a/lib/src/senkusha.c b/lib/src/senkusha.c
-index 05b4517..c840b4a 100644
+index 05b4517..7133e77 100644
 --- a/lib/src/senkusha.c
 +++ b/lib/src/senkusha.c
-@@ -109,7 +109,8 @@ CHIAKI_EXPORT void chiaki_senkusha_fini(ChiakiSenkusha *senkusha)
+@@ -32,7 +32,13 @@
+ #define CONNECT_TIMEOUT_MS 30000
+ 
+ #define SENKUSHA_PING_COUNT_DEFAULT 10
+-#define EXPECT_PONG_TIMEOUT_MS 1000
++// Pongs come back in tens of ms. Each lost ping used to cost a whole second: 6 s on one weak Wi-Fi
++// connect, and nothing changes for the stream if the test gives up sooner or stops at enough pongs.
++#define EXPECT_PONG_TIMEOUT_MS 400
++#define SENKUSHA_PINGS_ENOUGH 5
++// The MTU test's wait comes from the RTT, which one quick pong can make 8 ms. A 38 ms wait then lost
++// every pong to normal Wi-Fi jitter and wrongly cut the MTU from 1454 to 581.
++#define MTU_TIMEOUT_MIN_MS 120
+ 
+ // Assuming IPv4, sizeof(ip header) + sizeof(udp header)
+ #define MTU_UDP_PACKET_ADD 0x1c
+@@ -109,7 +115,8 @@ CHIAKI_EXPORT void chiaki_senkusha_fini(ChiakiSenkusha *senkusha)
  static bool state_finished_cond_check(void *user)
  {
  	ChiakiSenkusha *senkusha = user;
@@ -56,7 +72,7 @@ index 05b4517..c840b4a 100644
  }
  
  CHIAKI_EXPORT ChiakiErrorCode chiaki_senkusha_run(ChiakiSenkusha *senkusha, uint32_t *mtu_in, uint32_t *mtu_out, uint64_t *rtt_us, chiaki_socket_t *socket)
-@@ -184,7 +185,12 @@ CHIAKI_EXPORT ChiakiErrorCode chiaki_senkusha_run(ChiakiSenkusha *senkusha, uint
+@@ -184,7 +191,12 @@ CHIAKI_EXPORT ChiakiErrorCode chiaki_senkusha_run(ChiakiSenkusha *senkusha, uint
  		if(senkusha->should_stop)
  			err = CHIAKI_ERR_CANCELED;
  		else
@@ -69,6 +85,26 @@ index 05b4517..c840b4a 100644
  
  		QUIT(quit_takion);
  	}
+@@ -257,8 +269,8 @@ CHIAKI_EXPORT ChiakiErrorCode chiaki_senkusha_run(ChiakiSenkusha *senkusha, uint
+ 	}
+ 
+ 	uint64_t mtu_timeout_ms = (*rtt_us * 5) / 1000;
+-	if(mtu_timeout_ms < 5)
+-		mtu_timeout_ms = 5;
++	if(mtu_timeout_ms < MTU_TIMEOUT_MIN_MS)
++		mtu_timeout_ms = MTU_TIMEOUT_MIN_MS;
+ 	if(mtu_timeout_ms > 500)
+ 		mtu_timeout_ms = 500;
+ 
+@@ -365,6 +377,8 @@ static ChiakiErrorCode senkusha_run_rtt_test(ChiakiSenkusha *senkusha, uint16_t
+ 		rtt_us_acc += delta_us;
+ 		pings_successful += 1;
+ 		CHIAKI_LOGI(senkusha->log, "Senkusha received Pong, RTT = %.3f ms", (float)delta_us * 0.001f);
++		if(pings_successful >= SENKUSHA_PINGS_ENOUGH)
++			break;
+ 	}
+ 
+ 	err = senkusha_send_echo_command(senkusha, false);
 diff --git a/lib/src/session.c b/lib/src/session.c
 index 41c6bbf..9508442 100644
 --- a/lib/src/session.c
@@ -200,7 +236,7 @@ index afa1a60..b859beb 100644
  	{
  		CHIAKI_LOGE(stream_connection->log, "StreamConnection failed to send controller connection");
 diff --git a/lib/src/takion.c b/lib/src/takion.c
-index 38f9f5d..b7e7cea 100644
+index 38f9f5d..baea4db 100644
 --- a/lib/src/takion.c
 +++ b/lib/src/takion.c
 @@ -45,7 +45,9 @@
@@ -214,19 +250,20 @@ index 38f9f5d..b7e7cea 100644
  
  #define TAKION_POSTPONE_PACKETS_SIZE 32
  
-@@ -55,7 +57,10 @@
+@@ -55,7 +57,11 @@
  
  #define TAKION_EXPECT_TIMEOUT_MS 5000
  
 -#define MAX_CONNECT_RESEND_TRIES 3
-+// The handshake answer normally comes back within one round trip, so waiting a second before
-+// asking again lets a lost packet on weak Wi-Fi be resent inside StreamConnection's wait
-+#define MAX_CONNECT_RESEND_TRIES 8
-+#define TAKION_CONNECT_RESEND_TIMEOUT_MS 1000
++// The handshake answer normally comes back within one round trip (25 to 60 ms on weak Wi-Fi), so
++// half a second is plenty before asking again. Each lost packet used to cost a full second. 16 tries
++// keep the same 8 s window, still inside StreamConnection's wait.
++#define MAX_CONNECT_RESEND_TRIES 16
++#define TAKION_CONNECT_RESEND_TIMEOUT_MS 500
  /**
   * Base type of Takion packets. Lower nibble of the first byte in datagrams.
   */
-@@ -197,6 +202,7 @@ CHIAKI_EXPORT ChiakiErrorCode chiaki_takion_connect(ChiakiTakion *takion, Chiaki
+@@ -197,6 +203,7 @@ CHIAKI_EXPORT ChiakiErrorCode chiaki_takion_connect(ChiakiTakion *takion, Chiaki
  	takion->log = info->log;
  	takion->close_socket = info->close_socket;
  	takion->version = info->protocol_version;
@@ -234,7 +271,7 @@ index 38f9f5d..b7e7cea 100644
  	takion->disable_audio_video = info->disable_audio_video;
  
  	switch(takion->version)
-@@ -257,7 +263,7 @@ CHIAKI_EXPORT ChiakiErrorCode chiaki_takion_connect(ChiakiTakion *takion, Chiaki
+@@ -257,7 +264,7 @@ CHIAKI_EXPORT ChiakiErrorCode chiaki_takion_connect(ChiakiTakion *takion, Chiaki
  			CHIAKI_LOGE(takion->log, "Takion had problem reading extra messages from socket using PSN Connection with error: " CHIAKI_SOCKET_ERROR_FMT, CHIAKI_SOCKET_ERROR_VALUE);
  			goto error_sock;
  		}
@@ -243,7 +280,7 @@ index 38f9f5d..b7e7cea 100644
  		int r = setsockopt(takion->sock, SOL_SOCKET, SO_RCVBUF, (const CHIAKI_SOCKET_BUF_TYPE)&rcvbuf_val, sizeof(rcvbuf_val));
  		if(r < 0)
  		{
-@@ -345,7 +351,7 @@ CHIAKI_EXPORT ChiakiErrorCode chiaki_takion_connect(ChiakiTakion *takion, Chiaki
+@@ -345,7 +352,7 @@ CHIAKI_EXPORT ChiakiErrorCode chiaki_takion_connect(ChiakiTakion *takion, Chiaki
  			ret = CHIAKI_ERR_NETWORK;
  			goto error_pipe;
  		}
@@ -252,7 +289,7 @@ index 38f9f5d..b7e7cea 100644
  		int r = setsockopt(takion->sock, SOL_SOCKET, SO_RCVBUF, (const CHIAKI_SOCKET_BUF_TYPE)&rcvbuf_val, sizeof(rcvbuf_val));
  		if(r < 0)
  		{
-@@ -851,7 +857,7 @@ static ChiakiErrorCode takion_handshake(ChiakiTakion *takion, uint32_t *seq_num_
+@@ -851,7 +858,7 @@ static ChiakiErrorCode takion_handshake(ChiakiTakion *takion, uint32_t *seq_num_
  
  		// INIT_ACK <-
  		err = takion_recv_message_init_ack(takion, &init_ack_payload);
@@ -261,7 +298,7 @@ index 38f9f5d..b7e7cea 100644
  			break;
  	}
  	if(err != CHIAKI_ERR_SUCCESS)
-@@ -897,7 +903,7 @@ static ChiakiErrorCode takion_handshake(ChiakiTakion *takion, uint32_t *seq_num_
+@@ -897,7 +904,7 @@ static ChiakiErrorCode takion_handshake(ChiakiTakion *takion, uint32_t *seq_num_
  		// COOKIE_ACK <-
  
  		err = takion_recv_message_cookie_ack(takion);
@@ -270,7 +307,7 @@ index 38f9f5d..b7e7cea 100644
  			break;
  	}
  	if(err != CHIAKI_ERR_SUCCESS)
-@@ -1387,7 +1393,10 @@ static void takion_flush_data_queue(ChiakiTakion *takion)
+@@ -1387,7 +1394,10 @@ static void takion_flush_data_queue(ChiakiTakion *takion)
  	}
  
  	if(ack)
@@ -281,7 +318,7 @@ index 38f9f5d..b7e7cea 100644
  }
  
  static void takion_handle_packet_message_data(ChiakiTakion *takion, uint8_t *packet_buf, size_t packet_buf_size, uint8_t type_b, uint8_t *payload, size_t payload_size)
-@@ -1413,15 +1422,26 @@ static void takion_handle_packet_message_data(ChiakiTakion *takion, uint8_t *pac
+@@ -1413,15 +1423,26 @@ static void takion_handle_packet_message_data(ChiakiTakion *takion, uint8_t *pac
  	entry->channel = ntohs(*((chiaki_unaligned_uint16_t *)(payload + 4)));
  	ChiakiSeqNum32 seq_num = ntohl(*((chiaki_unaligned_uint32_t *)(payload + 0)));
  
@@ -310,7 +347,7 @@ index 38f9f5d..b7e7cea 100644
  		return;
  	}
  
-@@ -1430,15 +1450,12 @@ static void takion_handle_packet_message_data_ack(ChiakiTakion *takion, uint8_t
+@@ -1430,15 +1451,12 @@ static void takion_handle_packet_message_data_ack(ChiakiTakion *takion, uint8_t
  	uint16_t gap_ack_blocks_count = ntohs(*((chiaki_unaligned_uint16_t *)(buf + 8)));
  	uint16_t dup_tsns_count = ntohs(*((chiaki_unaligned_uint16_t *)(buf + 0xa)));
  
@@ -328,7 +365,7 @@ index 38f9f5d..b7e7cea 100644
  	CHIAKI_LOGV(takion->log, "Takion received data ack with cumulative_seq_num = %#x, a_rwnd = %#x, gap_ack_blocks_count = %#x, dup_tsns_count = %#x",
  			cumulative_seq_num, a_rwnd, gap_ack_blocks_count, dup_tsns_count);
  
-@@ -1538,7 +1555,7 @@ static ChiakiErrorCode takion_recv_message_init_ack(ChiakiTakion *takion, Takion
+@@ -1538,7 +1556,7 @@ static ChiakiErrorCode takion_recv_message_init_ack(ChiakiTakion *takion, Takion
  {
  	uint8_t message[1 + TAKION_MESSAGE_HEADER_SIZE + 0x10 + TAKION_COOKIE_SIZE];
  	size_t received_size = sizeof(message);
@@ -337,7 +374,7 @@ index 38f9f5d..b7e7cea 100644
  	if(err != CHIAKI_ERR_SUCCESS)
  		return err;
  
-@@ -1585,14 +1602,14 @@ static ChiakiErrorCode takion_recv_message_cookie_ack(ChiakiTakion *takion)
+@@ -1585,14 +1603,14 @@ static ChiakiErrorCode takion_recv_message_cookie_ack(ChiakiTakion *takion)
  {
  	uint8_t message[1 + TAKION_MESSAGE_HEADER_SIZE];
  	size_t received_size = sizeof(message);
@@ -397,10 +434,10 @@ index 5cee13c..3d47c2a 100644
  			chiaki_takion_send_raw(send_buffer->takion, packet->buf, packet->buf_size);
  			packet->tries++;
 diff --git a/lib/src/videoreceiver.c b/lib/src/videoreceiver.c
-index ed3cc76..c70ddc4 100644
+index ed3cc76..376c29b 100644
 --- a/lib/src/videoreceiver.c
 +++ b/lib/src/videoreceiver.c
-@@ -3,8 +3,13 @@
+@@ -3,8 +3,26 @@
  #include <chiaki/videoreceiver.h>
  #include "../include/chiaki/session.h"
  
@@ -411,18 +448,41 @@ index ed3cc76..c70ddc4 100644
 +// picture stayed frozen until the PS5 happened to send one, 6 to 8 s in real sessions.
 +#define IDR_RETRY_MS 1500
 +
++// While waiting for an IDR frame every new frame is skipped, and each one used to send the PS5 another
++// reliable report of the same, ever longer range: 30 a second, right when Wi-Fi had the least room.
++#define CORRUPT_REPORT_WAITING_MS 250
++
++static ChiakiErrorCode video_receiver_report_corrupt(ChiakiVideoReceiver *video_receiver, ChiakiSeqNum16 start, ChiakiSeqNum16 end)
++{
++	uint64_t now = chiaki_time_now_monotonic_ms();
++	if(chiaki_video_receiver_get_waiting_for_idr(video_receiver) && now - video_receiver->corrupt_reported_ms < CORRUPT_REPORT_WAITING_MS)
++		return CHIAKI_ERR_SUCCESS;
++	video_receiver->corrupt_reported_ms = now;
++	return stream_connection_send_corrupt_frame(&video_receiver->session->stream_connection, start, end);
++}
++
  static ChiakiErrorCode chiaki_video_receiver_flush_frame(ChiakiVideoReceiver *video_receiver);
  
  static void add_ref_frame(ChiakiVideoReceiver *video_receiver, int32_t frame)
-@@ -54,6 +59,7 @@ CHIAKI_EXPORT void chiaki_video_receiver_init(ChiakiVideoReceiver *video_receive
+@@ -54,6 +72,8 @@ CHIAKI_EXPORT void chiaki_video_receiver_init(ChiakiVideoReceiver *video_receive
  	chiaki_bitstream_init(&video_receiver->bitstream, video_receiver->log, video_receiver->session->connect_info.video_profile.codec);
  	chiaki_mutex_init(&video_receiver->waiting_for_idr_mutex, false);
  	video_receiver->waiting_for_idr = false;
 +	video_receiver->idr_requested_ms = 0;
++	video_receiver->corrupt_reported_ms = 0;
  	chiaki_mutex_init(&video_receiver->frames_lost_mutex, false);
  }
  
-@@ -188,6 +194,18 @@ CHIAKI_EXPORT void chiaki_video_receiver_av_packet(ChiakiVideoReceiver *video_re
+@@ -162,7 +182,7 @@ CHIAKI_EXPORT void chiaki_video_receiver_av_packet(ChiakiVideoReceiver *video_re
+ 			&& !(frame_index == 1 && video_receiver->frame_index_cur < 0)) // ok for frame 1
+ 		{
+ 			CHIAKI_LOGW(video_receiver->log, "Detected missing or corrupt frame(s) from %d to %d", next_frame_expected, (int)frame_index);
+-			err = stream_connection_send_corrupt_frame(&video_receiver->session->stream_connection, next_frame_expected, frame_index - 1);
++			err = video_receiver_report_corrupt(video_receiver, next_frame_expected, frame_index - 1);
+ 			if(err != CHIAKI_ERR_SUCCESS)
+ 				CHIAKI_LOGW(video_receiver->log, "Error sending corrupt frame.");
+ 		}
+@@ -188,6 +208,18 @@ CHIAKI_EXPORT void chiaki_video_receiver_av_packet(ChiakiVideoReceiver *video_re
  	}
  }
  
@@ -441,7 +501,16 @@ index ed3cc76..c70ddc4 100644
  static ChiakiErrorCode chiaki_video_receiver_flush_frame(ChiakiVideoReceiver *video_receiver)
  {
  	uint8_t *frame;
-@@ -211,6 +229,7 @@ static ChiakiErrorCode chiaki_video_receiver_flush_frame(ChiakiVideoReceiver *vi
+@@ -200,7 +232,7 @@ static ChiakiErrorCode chiaki_video_receiver_flush_frame(ChiakiVideoReceiver *vi
+ 		if (flush_result == CHIAKI_FRAME_PROCESSOR_FLUSH_RESULT_FEC_FAILED)
+ 		{
+ 			ChiakiSeqNum16 next_frame_expected = (ChiakiSeqNum16)(video_receiver->frame_index_prev_complete + 1);
+-			stream_connection_send_corrupt_frame(&video_receiver->session->stream_connection, next_frame_expected, video_receiver->frame_index_cur);
++			video_receiver_report_corrupt(video_receiver, next_frame_expected, video_receiver->frame_index_cur);
+ 			if(video_receiver->session->connect_info.enable_idr_on_fec_failure)
+ 			{
+ 				bool waiting_for_idr = chiaki_video_receiver_get_waiting_for_idr(video_receiver);
+@@ -211,6 +243,7 @@ static ChiakiErrorCode chiaki_video_receiver_flush_frame(ChiakiVideoReceiver *vi
  					idr_request_sent = err == CHIAKI_ERR_SUCCESS;
  					if(err == CHIAKI_ERR_SUCCESS)
  					{
@@ -449,7 +518,7 @@ index ed3cc76..c70ddc4 100644
  						chiaki_video_receiver_set_waiting_for_idr(video_receiver, true);
  						CHIAKI_LOGI(video_receiver->log, "FEC failed, waiting for IDR frame");
  					}
-@@ -222,6 +241,7 @@ static ChiakiErrorCode chiaki_video_receiver_flush_frame(ChiakiVideoReceiver *vi
+@@ -222,6 +255,7 @@ static ChiakiErrorCode chiaki_video_receiver_flush_frame(ChiakiVideoReceiver *vi
  				else
  				{
  					CHIAKI_LOGW(video_receiver->log, "Video FEC failure, already waiting for requested IDR");
@@ -457,7 +526,7 @@ index ed3cc76..c70ddc4 100644
  				}
  				ChiakiEvent event = { 0 };
  				event.type = CHIAKI_EVENT_VIDEO_FEC_FAILURE;
-@@ -256,6 +276,7 @@ static ChiakiErrorCode chiaki_video_receiver_flush_frame(ChiakiVideoReceiver *vi
+@@ -256,6 +290,7 @@ static ChiakiErrorCode chiaki_video_receiver_flush_frame(ChiakiVideoReceiver *vi
  			else
  			{
  				CHIAKI_LOGV(video_receiver->log, "Skipping P-frame %d while waiting for IDR", (int)video_receiver->frame_index_cur);
