@@ -226,6 +226,8 @@ static const wchar_t *const english[][2] = {
 	{ L"Hazırlanıyor", L"Getting ready" },
 	{ L"İndiriliyor", L"Downloading" },
 	{ L"YARDIM", L"HELP" },
+	{ L"Görüntü takılıyor. Bilgisayar 2.4 GHz'de; \"%ls\" 5 GHz ağına bağlanmak çok iyi gelir", L"Video is stuttering. This PC is on 2.4 GHz; connecting to the 5 GHz network \"%ls\" helps a lot" },
+	{ L"Ses kesiliyor. Bilgisayar 2.4 GHz'de; \"%ls\" 5 GHz ağına bağlanmak çok iyi gelir", L"Sound is cutting out. This PC is on 2.4 GHz; connecting to the 5 GHz network \"%ls\" helps a lot" },
 };
 
 static bool lang_english;

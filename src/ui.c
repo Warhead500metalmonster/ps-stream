@@ -38,7 +38,6 @@
 #define ICON_AUDIO L""
 #define ICON_VIDEO L""
 #define ICON_GEAR L""
-#define ICON_BULB L""
 #define ICON_CHECK L"\uE73E"
 #define ICON_SYNC L"\uE895"
 #define ICON_INFO L"\uE946"
@@ -48,7 +47,6 @@
 #define ICON_STEP_FIND L"\uE721"
 #define ICON_STEP_ACCOUNT L"\uE77B"
 #define ICON_STEP_CODE L"\uE8D7"
-#define ICON_PLAY L""
 
 enum { UI_NONE, UI_NAV0, UI_NAV1, UI_NAV2, UI_AUDIO, UI_VIDEO, UI_MUTE, UI_LOWER, UI_HK_MUTE, UI_DETAILS, UI_ADVANCED, UI_SIMPLE, UI_APPLY, UI_FIND, UI_LOGIN, UI_ACCOUNT_CLEAR, UI_PAIR, UI_REPAIR,
 	UI_DEVICE, UI_HK_AUDIO, UI_HK_VIDEO, UI_HW, UI_RECONNECT, UI_CONTROLLER, UI_WIFI, UI_AUTOSTART, UI_AUTOWAKE, UI_GAMEPAD, UI_WINSTART, UI_TRAY, UI_QUICK_VOLUME, UI_WAKE, UI_UPDATE_NOW, UI_OPEN_LOGS, UI_OPEN_REPO, UI_BITRATE, UI_AO_BITRATE, UI_VOLUME, UI_BUFFER, UI_LOSS, UI_AUDIO_ONLY, UI_TOUR_SKIP, UI_TOUR_BACK, UI_TOUR_NEXT, UI_TOUR_AGAIN,
@@ -1683,7 +1681,19 @@ static void connection_watch(void)
 		ui.weak_shown_at = now;
 		// Channels 1 to 14 are 2.4 GHz, where neighbours and microwaves cause most of the loss
 		bool slow_band = g.wifi_channel >= 1 && g.wifi_channel <= 14;
-		if(g.want_video)
+		wchar_t better[33];
+		EnterCriticalSection(&g.lock);
+		wcscpy(better, g.wifi_5ghz);
+		LeaveCriticalSection(&g.lock);
+		if(slow_band && better[0])
+		{
+			// Translated here, since the network's name makes it a text of its own
+			wchar_t text[256];
+			swprintf(text, 256, tr(g.want_video ? L"Görüntü takılıyor. Bilgisayar 2.4 GHz'de; \"%ls\" 5 GHz ağına bağlanmak çok iyi gelir"
+					: L"Ses kesiliyor. Bilgisayar 2.4 GHz'de; \"%ls\" 5 GHz ağına bağlanmak çok iyi gelir"), better);
+			set_status(text);
+		}
+		else if(g.want_video)
 			set_status(slow_band ? L"Görüntü takılıyor. Bilgisayar 2.4 GHz Wi-Fi'de, 5 GHz ağa geçmek çok iyi gelir" : L"Bağlantı zayıf, görüntü kare kaybediyor");
 		else
 			set_status(slow_band ? L"Ses kesiliyor. Bilgisayar 2.4 GHz Wi-Fi'de, 5 GHz ağa geçmek çok iyi gelir" : L"Wi-Fi zayıf, ses kesiliyor. Modeme yaklaşmak veya 5 GHz'e geçmek iyi gelir");
@@ -2290,6 +2300,8 @@ static DWORD WINAPI ui_test_main(void *arg)
 		Sleep(800);
 		ui.weak_checked_at -= WEAK_WINDOW_MS;
 		g.wifi_channel = 6;
+		if(GetEnvironmentVariableW(L"PSSTREAM_TEST_5GHZ", NULL, 0))
+			wcscpy(g.wifi_5ghz, L"Ev_5G");
 		InterlockedExchangeAdd(&g.video_lost_total, 40);
 		Sleep(900);
 		test_log_status("weak connection");

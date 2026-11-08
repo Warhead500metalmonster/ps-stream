@@ -49,7 +49,7 @@
 
 // Below this rate we are outside what chiaki-ng offers, so a console that refuses to start
 // gets a second try with it.
-#define APP_VERSION "0.1.29"
+#define APP_VERSION "0.1.30"
 #define UPDATE_RECHECK_MS (6 * 60 * 60 * 1000)
 #define UPDATE_TRIES 6
 #define UPDATE_RETRY_MS 20000
@@ -177,6 +177,7 @@ static struct {
 	HANDLE wake;
 	volatile LONG want_audio, want_video, quit;
 	volatile LONG wifi_channel; // 0 when unknown or not on Wi-Fi
+	wchar_t wifi_5ghz[33]; // a saved 5 GHz network in reach while this PC sits on 2.4 GHz, guarded by lock
 	volatile LONG ended, connected, fatal, audio_reopen;
 	ChiakiQuitReason quit_reason;
 
@@ -1534,6 +1535,53 @@ static bool quit_reason_refused_stream(ChiakiQuitReason reason)
 
 // Stops Windows' periodic Wi-Fi scans, which stall traffic for moments, and asks the driver for
 // streaming mode. No admin rights needed; Windows undoes both when the handle closes.
+// Telling someone on 2.4 GHz to "use 5 GHz" only helps if they know which network that is. This
+// names one Windows already has a password for and that's strong enough here to be worth it.
+static void wifi_find_5ghz(const GUID *id, const DOT11_SSID *current)
+{
+	wchar_t best[33] = L"";
+	ULONG best_quality = 0;
+	WLAN_AVAILABLE_NETWORK_LIST *nets = NULL;
+	if(WlanGetAvailableNetworkList(g.wlan, id, 0, NULL, &nets) == ERROR_SUCCESS && nets)
+	{
+		for(DWORD i = 0; i < nets->dwNumberOfItems; i++)
+		{
+			WLAN_AVAILABLE_NETWORK *net = &nets->Network[i];
+			if(!(net->dwFlags & WLAN_AVAILABLE_NETWORK_HAS_PROFILE) || !net->dot11Ssid.uSSIDLength
+				|| net->dot11Ssid.uSSIDLength > DOT11_SSID_MAX_LENGTH)
+				continue;
+			// The same name on 5 GHz is Windows' own choice to make
+			if(net->dot11Ssid.uSSIDLength == current->uSSIDLength
+				&& memcmp(net->dot11Ssid.ucSSID, current->ucSSID, current->uSSIDLength) == 0)
+				continue;
+			WLAN_BSS_LIST *bss = NULL;
+			if(WlanGetNetworkBssList(g.wlan, id, &net->dot11Ssid, net->dot11BssType, net->bSecurityEnabled, NULL, &bss) != ERROR_SUCCESS || !bss)
+				continue;
+			for(DWORD b = 0; b < bss->dwNumberOfItems; b++)
+			{
+				WLAN_BSS_ENTRY *entry = &bss->wlanBssEntries[b];
+				// 5 and 6 GHz; through a wall or two they fade fast, so a weak one isn't worth moving to
+				if(entry->ulChCenterFrequency >= 4900000 && entry->uLinkQuality >= 45 && entry->uLinkQuality > best_quality)
+				{
+					best_quality = entry->uLinkQuality;
+					char ssid[DOT11_SSID_MAX_LENGTH + 1];
+					memcpy(ssid, net->dot11Ssid.ucSSID, net->dot11Ssid.uSSIDLength);
+					ssid[net->dot11Ssid.uSSIDLength] = 0;
+					if(!MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, ssid, -1, best, 33))
+						MultiByteToWideChar(CP_ACP, 0, ssid, -1, best, 33);
+				}
+			}
+			WlanFreeMemory(bss);
+		}
+		WlanFreeMemory(nets);
+	}
+	EnterCriticalSection(&g.lock);
+	wcscpy(g.wifi_5ghz, best);
+	LeaveCriticalSection(&g.lock);
+	if(best[0])
+		CHIAKI_LOGI(&g.log, "A saved 5 GHz network is in reach, signal %lu%%", best_quality);
+}
+
 static void wifi_tune(bool on)
 {
 	if(!on)
@@ -1577,6 +1625,8 @@ static void wifi_tune(bool on)
 		bool have_link = WlanQueryInterface(g.wlan, id, wlan_intf_opcode_current_connection, NULL, &size, (void **)&link, NULL) == ERROR_SUCCESS && link;
 		bool have_channel = WlanQueryInterface(g.wlan, id, wlan_intf_opcode_channel_number, NULL, &size, (void **)&channel, NULL) == ERROR_SUCCESS && channel;
 		g.wifi_channel = have_channel ? (LONG)*channel : 0;
+		if(have_link && have_channel && *channel >= 1 && *channel <= 14)
+			wifi_find_5ghz(id, &link->wlanAssociationAttributes.dot11Ssid);
 		if(have_link)
 			CHIAKI_LOGI(&g.log, "Wi-Fi link: signal %lu%%, receive %lu Mbps, send %lu Mbps, channel %lu",
 					link->wlanAssociationAttributes.wlanSignalQuality, link->wlanAssociationAttributes.ulRxRate / 1000,
