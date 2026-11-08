@@ -49,7 +49,7 @@
 
 // Below this rate we are outside what chiaki-ng offers, so a console that refuses to start
 // gets a second try with it.
-#define APP_VERSION "0.1.31"
+#define APP_VERSION "0.1.32"
 #define UPDATE_RECHECK_MS (6 * 60 * 60 * 1000)
 #define UPDATE_TRIES 6
 #define UPDATE_RETRY_MS 20000
@@ -177,6 +177,7 @@ static struct {
 	HANDLE wake;
 	volatile LONG want_audio, want_video, quit;
 	volatile LONG wifi_channel; // 0 when unknown or not on Wi-Fi
+	volatile LONG wifi_signal; // percent; WIFI_UNKNOWN when not measured, WIFI_NONE with no Wi-Fi connected
 	wchar_t wifi_5ghz[33]; // a saved 5 GHz network in reach while this PC sits on 2.4 GHz, guarded by lock
 	volatile LONG ended, connected, fatal, audio_reopen;
 	ChiakiQuitReason quit_reason;
@@ -1535,6 +1536,41 @@ static bool quit_reason_refused_stream(ChiakiQuitReason reason)
 
 // Stops Windows' periodic Wi-Fi scans, which stall traffic for moments, and asks the driver for
 // streaming mode. No admin rights needed; Windows undoes both when the handle closes.
+#define WIFI_UNKNOWN -1
+#define WIFI_NONE -2
+#define WIFI_REFRESH_MS 10000
+
+// Signal and channel of the Wi-Fi this PC is on. Measured once when connecting, it missed the signal
+// sinking mid-game, which on weak Wi-Fi is the first thing worth knowing about a dropout.
+static void wifi_read_link(void)
+{
+	WLAN_INTERFACE_INFO_LIST *list = NULL;
+	if(!g.wlan || WlanEnumInterfaces(g.wlan, NULL, &list) != ERROR_SUCCESS)
+		return;
+	LONG signal = WIFI_NONE, channel_number = 0;
+	for(DWORD i = 0; i < list->dwNumberOfItems; i++)
+	{
+		if(list->InterfaceInfo[i].isState != wlan_interface_state_connected)
+			continue;
+		const GUID *id = &list->InterfaceInfo[i].InterfaceGuid;
+		DWORD size = 0;
+		WLAN_CONNECTION_ATTRIBUTES *link = NULL;
+		ULONG *channel = NULL;
+		if(WlanQueryInterface(g.wlan, id, wlan_intf_opcode_current_connection, NULL, &size, (void **)&link, NULL) == ERROR_SUCCESS && link)
+			signal = (LONG)link->wlanAssociationAttributes.wlanSignalQuality;
+		if(WlanQueryInterface(g.wlan, id, wlan_intf_opcode_channel_number, NULL, &size, (void **)&channel, NULL) == ERROR_SUCCESS && channel)
+			channel_number = (LONG)*channel;
+		if(link)
+			WlanFreeMemory(link);
+		if(channel)
+			WlanFreeMemory(channel);
+		break;
+	}
+	WlanFreeMemory(list);
+	g.wifi_signal = signal;
+	g.wifi_channel = channel_number;
+}
+
 // Telling someone on 2.4 GHz to "use 5 GHz" only helps if they know which network that is. This
 // names one Windows already has a password for and that's strong enough here to be worth it.
 static void wifi_find_5ghz(const GUID *id, const DOT11_SSID *current)
@@ -1590,6 +1626,7 @@ static void wifi_tune(bool on)
 		{
 			WlanCloseHandle(g.wlan, NULL);
 			g.wlan = NULL;
+			g.wifi_signal = WIFI_UNKNOWN;
 			CHIAKI_LOGI(&g.log, "Wi-Fi low latency off");
 		}
 		return;
@@ -1619,12 +1656,15 @@ static void wifi_tune(bool on)
 		if(active)
 			WlanFreeMemory(active);
 		CHIAKI_LOGI(&g.log, "Wi-Fi low latency on: scan result %lu, streaming result %lu, streaming active %d", scan, stream, confirmed);
+		g.wifi_signal = WIFI_NONE;
 		// Connection problems usually come down to these, so the log should say them
 		WLAN_CONNECTION_ATTRIBUTES *link = NULL;
 		ULONG *channel = NULL;
 		bool have_link = WlanQueryInterface(g.wlan, id, wlan_intf_opcode_current_connection, NULL, &size, (void **)&link, NULL) == ERROR_SUCCESS && link;
 		bool have_channel = WlanQueryInterface(g.wlan, id, wlan_intf_opcode_channel_number, NULL, &size, (void **)&channel, NULL) == ERROR_SUCCESS && channel;
 		g.wifi_channel = have_channel ? (LONG)*channel : 0;
+		if(have_link)
+			g.wifi_signal = (LONG)link->wlanAssociationAttributes.wlanSignalQuality;
 		if(have_link && have_channel && *channel >= 1 && *channel <= 14)
 			wifi_find_5ghz(id, &link->wlanAssociationAttributes.dot11Ssid);
 		if(have_link)
@@ -1837,6 +1877,12 @@ static DWORD WINAPI worker_main(void *arg)
 			// A connected PS5 was on purpose or was already on. If it goes away from here, someone
 			// probably turned it off, and it must not come back by itself.
 			may_wake = false;
+			static DWORD wifi_read_at;
+			if(g.wlan && GetTickCount() - wifi_read_at >= WIFI_REFRESH_MS)
+			{
+				wifi_read_at = GetTickCount();
+				wifi_read_link();
+			}
 			if(!id_checked && !g.host_id[0])
 			{
 				// Remembers which console this is, so a second one at home can't take its place

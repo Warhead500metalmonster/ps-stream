@@ -228,6 +228,10 @@ static const wchar_t *const english[][2] = {
 	{ L"YARDIM", L"HELP" },
 	{ L"Görüntü takılıyor. Bilgisayar 2.4 GHz'de; \"%ls\" 5 GHz ağına bağlanmak çok iyi gelir", L"Video is stuttering. This PC is on 2.4 GHz; connecting to the 5 GHz network \"%ls\" helps a lot" },
 	{ L"Ses kesiliyor. Bilgisayar 2.4 GHz'de; \"%ls\" 5 GHz ağına bağlanmak çok iyi gelir", L"Sound is cutting out. This PC is on 2.4 GHz; connecting to the 5 GHz network \"%ls\" helps a lot" },
+	{ L"Görüntü takılıyor. Wi-Fi sinyali zayıf (%%%ld); bilgisayarı modeme yaklaştırmak çok iyi gelir", L"Video is stuttering. The Wi-Fi signal is weak (%ld%%); moving this PC closer to the router helps a lot" },
+	{ L"Ses kesiliyor. Wi-Fi sinyali zayıf (%%%ld); bilgisayarı modeme yaklaştırmak çok iyi gelir", L"Sound is cutting out. The Wi-Fi signal is weak (%ld%%); moving this PC closer to the router helps a lot" },
+	{ L"%%%ld, %ls GHz", L"%ld%%, %ls GHz" },
+	{ L"Kablolu", L"Wired" },
 };
 
 static bool lang_english;

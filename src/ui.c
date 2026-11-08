@@ -10,6 +10,7 @@
 #include "i18n.c"
 
 #define UI_W 920
+#define WEAK_SIGNAL 50 // Wi-Fi signal percent below which distance is the likely problem
 #define WEAK_WINDOW_MS 30000
 #define TIMER_UPDATE_RECHECK 4
 #define WEAK_LOST_FRAMES 30
@@ -29,11 +30,16 @@
 #define WHITE(a) COLOR(a, 255, 255, 255)
 #define C_TEXT WHITE(255)
 #define C_MUTED WHITE(165)
-#define C_ACCENT COLOR(255, 10, 112, 230)
+// PlayStation blue on deep navy, with white for whatever has focus, like the console's own menus
+#define C_ACCENT COLOR(255, 0, 112, 209)
 #define C_GREEN COLOR(255, 74, 222, 128)
 #define C_AMBER COLOR(255, 251, 191, 36)
 #define C_DARK COLOR(255, 24, 26, 31)
-#define C_FIELD COLOR(255, 43, 45, 51)
+#define C_FIELD COLOR(255, 20, 32, 58)
+#define C_FIELD_RGB RGB(20, 32, 58)
+#define C_GLASS COLOR(112, 12, 28, 64) // panels and tiles, letting the background show through
+#define C_BAR COLOR(214, 7, 17, 40)
+#define C_NAVY_TOP RGB(5, 16, 44)
 
 #define ICON_AUDIO L""
 #define ICON_VIDEO L""
@@ -179,18 +185,55 @@ static void glow(GpGraphics *gx, float cx, float cy, float radius, ARGB color)
 	GdipDeletePath(p);
 }
 
+// Triangle, circle, cross and square as outlines, in device pixels
+static void ps_shape(GpGraphics *gx, int kind, float cx, float cy, float size, float rotate, ARGB color)
+{
+	GpPen *pen;
+	GdipCreatePen1(color, size * 0.09f, UnitPixel, &pen);
+	GdipSetPenLineJoin(pen, LineJoinRound);
+	GdipSetPenStartCap(pen, LineCapRound);
+	GdipSetPenEndCap(pen, LineCapRound);
+	GdipTranslateWorldTransform(gx, cx, cy, MatrixOrderPrepend);
+	GdipRotateWorldTransform(gx, rotate, MatrixOrderPrepend);
+	float r = size / 2;
+	if(kind == 0)
+	{
+		GpPointF points[3] = { { 0, -r }, { r * 0.92f, r * 0.62f }, { -r * 0.92f, r * 0.62f } };
+		GdipDrawPolygon(gx, pen, points, 3);
+	}
+	else if(kind == 1)
+		GdipDrawEllipse(gx, pen, -r, -r, size, size);
+	else if(kind == 2)
+	{
+		GdipDrawLine(gx, pen, -r, -r, r, r);
+		GdipDrawLine(gx, pen, -r, r, r, -r);
+	}
+	else
+		GdipDrawRectangle(gx, pen, -r * 0.86f, -r * 0.86f, size * 0.86f, size * 0.86f);
+	GdipResetWorldTransform(gx);
+	GdipDeletePen(pen);
+}
+
 static void background_paint(GpGraphics *gx)
 {
 	float w = F(UI_W), h = F(UI_H);
 	GpPointF a = { 0, 0 }, b = { 0, h };
 	GpLineGradient *grad;
-	GdipCreateLineBrush(&a, &b, COLOR(255, 30, 32, 39), COLOR(255, 16, 17, 22), WrapModeTile, &grad);
+	GdipCreateLineBrush(&a, &b, COLOR(255, 5, 16, 44), COLOR(255, 1, 4, 14), WrapModeTile, &grad);
 	GdipFillRectangle(gx, (GpBrush *)grad, 0, 0, w, h);
 	GdipDeleteBrush((GpBrush *)grad);
-	glow(gx, w * 0.05f, h * 0.02f, w * 0.48f, COLOR(46, 240, 150, 50));
-	glow(gx, w * 0.98f, h * 0.10f, w * 0.52f, COLOR(58, 40, 100, 240));
-	wave(gx, 0, 0, w, h, 0.62f, 0.86f, 0.30f, 0.58f, WHITE(6));
-	wave(gx, 0, 0, w, h, 0.84f, 0.62f, 0.98f, 0.70f, WHITE(8));
+	glow(gx, w * 0.92f, h * 0.04f, w * 0.58f, COLOR(92, 0, 112, 209));
+	glow(gx, w * 0.04f, h * 0.98f, w * 0.46f, COLOR(64, 40, 56, 190));
+	glow(gx, w * 0.45f, h * 0.55f, w * 0.40f, COLOR(26, 0, 140, 255));
+	wave(gx, 0, 0, w, h, 0.62f, 0.86f, 0.30f, 0.58f, COLOR(8, 140, 190, 255));
+	wave(gx, 0, 0, w, h, 0.84f, 0.62f, 0.98f, 0.70f, COLOR(10, 140, 190, 255));
+	// The four button shapes, faint and in their own colours, as on the console's start screen
+	GdipSetSmoothingMode(gx, SmoothingModeAntiAlias);
+	float u = w / 920;
+	ps_shape(gx, 0, w * 0.70f, h * 0.83f, 120 * u, -8, COLOR(22, 64, 226, 196));
+	ps_shape(gx, 1, w * 0.84f, h * 0.71f, 104 * u, 0, COLOR(22, 255, 96, 110));
+	ps_shape(gx, 2, w * 0.95f, h * 0.88f, 92 * u, 6, COLOR(24, 120, 176, 255));
+	ps_shape(gx, 3, w * 0.57f, h * 0.95f, 84 * u, 12, COLOR(22, 255, 120, 220));
 }
 
 // ---------- widgets ----------
@@ -277,7 +320,9 @@ static bool chip(int id, const wchar_t *label, float x, float y, float w, float 
 {
 	Hit b = hit(id, x, y, w, h);
 	float on = anim(id + UI_MAX, selected ? 1.0f : 0);
-	fill_round(x, y, w, h, 10, mix(mix(WHITE(24), WHITE(48), anim(id, b.hot ? 1.0f : 0)), C_ACCENT, on));
+	fill_round(x, y, w, h, 10, mix(mix(WHITE(22), WHITE(46), anim(id, b.hot ? 1.0f : 0)), C_ACCENT, on));
+	if(on > 0)
+		stroke_round(x + 0.5f, y + 0.5f, w - 1, h - 1, 10, 1.5f, WHITE((int)(150 * on)));
 	text(label, ui.semi, x, y, w, h, mix(WHITE(215), C_TEXT, on), 1, 1);
 	return b.click;
 }
@@ -378,8 +423,8 @@ static void panel(float x, float y, float w, float h)
 	if(layer_begin(x, y, w, h, 0))
 	{
 		shadow(x, y, w, h, 22);
-		fill_round(x, y, w, h, 22, WHITE(13));
-		stroke_round(x, y, w, h, 22, 1, WHITE(20));
+		fill_round(x, y, w, h, 22, C_GLASS);
+		stroke_round(x, y, w, h, 22, 1, WHITE(22));
 		layer_end();
 	}
 	layer_draw();
@@ -599,7 +644,7 @@ static void card(int id, float x, float y, float w, float h, ARGB c1, ARGB c2, c
 		if(lit == 0)
 		{
 			GpSolidFill *dim;
-			GdipCreateSolidFill(COLOR(135, 16, 17, 22), &dim);
+			GdipCreateSolidFill(COLOR(140, 2, 8, 24), &dim);
 			GdipFillPath(ui.gx, (GpBrush *)dim, p);
 			GdipDeleteBrush((GpBrush *)dim);
 		}
@@ -609,8 +654,11 @@ static void card(int id, float x, float y, float w, float h, ARGB c1, ARGB c2, c
 	}
 	layer_draw();
 	if(lit > 0 && lit < 1)
-		fill_round(x, y, w, h, 26, COLOR((int)(135 * (1 - lit)), 16, 17, 22));
-	stroke_round(x + 1, y + 1, w - 2, h - 2, 25, 1 + lit, mix(WHITE(26), C_GREEN, lit));
+		fill_round(x, y, w, h, 26, COLOR((int)(140 * (1 - lit)), 2, 8, 24));
+	// Switched on, the card gets the console's focus look: a white ring with a soft halo
+	if(lit > 0)
+		stroke_round(x - 3, y - 3, w + 6, h + 6, 29, 4, WHITE((int)(34 * lit)));
+	stroke_round(x + 1, y + 1, w - 2, h - 2, 25, 1 + 1.5f * lit, mix(WHITE(26), WHITE(240), lit));
 
 	dot(x + 26, y + 22, 56, on ? WHITE(38) : WHITE(18));
 	text(icon, ui.icon_big, x + 26, y + 22, 56, 56, C_TEXT, 1, 1);
@@ -637,8 +685,8 @@ static void card_info(float x, float y, float w, const wchar_t *label, ARGB fill
 
 static void stat_tile(float x, float y, float w, float h, const wchar_t *label, const wchar_t *value, ARGB color)
 {
-	fill_round(x, y, w, h, 14, WHITE(13));
-	stroke_round(x, y, w, h, 14, 1, WHITE(16));
+	fill_round(x, y, w, h, 14, C_GLASS);
+	stroke_round(x, y, w, h, 14, 1, WHITE(18));
 	text(label, ui.small, x + 14, y + 8, w - 20, 20, C_MUTED, 0, 1);
 	text(value, ui.semi, x + 14, y + 28, w - 20, 24, color, 0, 1);
 }
@@ -658,7 +706,7 @@ static void page_play(void)
 	float cw = (UI_W - 48 - 16) / 2.0f, cy = 78, ch = 330 + extra;
 	ui.card_rects[0] = (RectF){ 24, cy, cw, ch };
 	ui.card_rects[1] = (RectF){ 24 + cw + 16, cy, cw, ch };
-	card(UI_AUDIO, 24, cy, cw, ch, COLOR(255, 214, 134, 46), COLOR(255, 110, 58, 24), ICON_AUDIO,
+	card(UI_AUDIO, 24, cy, cw, ch, COLOR(255, 76, 70, 196), COLOR(255, 16, 18, 70), ICON_AUDIO,
 			L"Ses", L"Oyunun sesini bilgisayardan duy.", g.want_audio != 0);
 
 	wchar_t info[128], device_w[64];
@@ -684,7 +732,7 @@ static void page_play(void)
 	if(mouse_in(40, vy - 2, 32, 32))
 		ui.tip = L"Sesi kısar, bağlantı açık kalır. Kısayol: Gelişmiş ayarlar";
 	int volume = s.volume;
-	ui.slider_fill = WHITE(240); // Blue fights with the orange card
+	ui.slider_fill = WHITE(240); // Blue would vanish into the card
 	if(slider(UI_QUICK_VOLUME, 80, vy, cw - 150, &volume, 0, 200))
 		volume_set(volume);
 	ui.slider_fill = C_ACCENT;
@@ -695,7 +743,7 @@ static void page_play(void)
 		ui.tip = L"Oyun sesinin seviyesi. %100 üstü sesi yükseltir.";
 
 	float vx = 24 + cw + 16;
-	card(UI_VIDEO, vx, cy, cw, ch, COLOR(255, 44, 104, 232), COLOR(255, 18, 34, 118), ICON_VIDEO,
+	card(UI_VIDEO, vx, cy, cw, ch, COLOR(255, 0, 120, 222), COLOR(255, 0, 30, 92), ICON_VIDEO,
 			L"Görüntü", L"Oyunu bilgisayarda gör.\nDiscord'da \"PS Stream - Görüntü\" penceresini seç.", g.want_video != 0);
 	if(mouse_in(vx, cy, cw, ch - 80))
 		ui.tip = L"Görüntü penceresinde F11 tam ekran yapar.";
@@ -715,9 +763,8 @@ static void page_play(void)
 		int id = i < 0 ? UI_AUDIO_ONLY : UI_PRESET0 + i;
 		Hit b = hit(id, x, y, w, h);
 		float on = anim(id + UI_MAX, selected ? 1.0f : 0);
-		fill_round(x, y, w, h, 16, mix(mix(WHITE(18), WHITE(40), anim(id, b.hot ? 1.0f : 0)), C_ACCENT, on));
-		if(on < 1)
-			stroke_round(x, y, w, h, 16, 1, mix(WHITE(16), C_ACCENT, on));
+		fill_round(x, y, w, h, 16, mix(mix(C_GLASS, WHITE(40), anim(id, b.hot ? 1.0f : 0)), C_ACCENT, on));
+		stroke_round(x + 0.5f, y + 0.5f, w - 1, h - 1, 16, 1 + on, mix(WHITE(20), WHITE(235), on));
 		// Five rising bars show the level at a glance
 		float bars_x = x + w / 2 - 19;
 		for(int bar = 0; bar < 5 && is_preset; bar++)
@@ -749,7 +796,8 @@ static void page_play(void)
 
 	// Live connection numbers, for anyone who wants to see what the Wi-Fi is doing
 	bool live = (g.want_audio || g.want_video) && g.connected;
-	wchar_t uptime[32] = L"-", ping[32] = L"-", audio[64] = L"-", video[64] = L"-";
+	wchar_t uptime[32] = L"-", ping[32] = L"-", audio[64] = L"-", video[64] = L"-", wifi[48] = L"-";
+	LONG signal = g.wifi_signal, channel = g.wifi_channel;
 	int ping_ms = -1;
 	if(live)
 	{
@@ -765,16 +813,24 @@ static void page_play(void)
 			swprintf(audio, 64, tr(L"%d ms tampon, %ld kesinti"), g.audio_target_ms, (long)g.audio_dropouts);
 		if(g.want_video && g.video_fps10)
 			swprintf(video, 64, tr(L"%ld FPS, %ld kayıp"), (long)((g.video_fps10 + 5) / 10), (long)g.video_lost_total);
+		if(signal >= 0)
+			swprintf(wifi, 48, tr(L"%%%ld, %ls GHz"), (long)signal, channel >= 1 && channel <= 14 ? L"2.4" : L"5");
+		else if(signal == WIFI_NONE)
+			wcscpy(wifi, tr(L"Kablolu"));
 	}
-	float ty = 504, th = 60, tw[] = { 170, 130, 300 };
+	// Weak or 2.4 GHz is the usual story behind dropouts, so it shows in amber
+	ARGB wifi_color = !live || signal == WIFI_UNKNOWN ? WHITE(120) : signal >= 0 && (signal < WEAK_SIGNAL || (channel >= 1 && channel <= 14)) ? C_AMBER : signal >= 0 ? C_GREEN : C_TEXT;
+	float ty = 504, th = 60, tw[] = { 140, 100, 160, 230 };
 	float tx = 24;
 	ARGB idle = WHITE(120);
 	stat_tile(tx, ty, tw[0], th, L"BAĞLANTI SÜRESİ", uptime, live ? C_TEXT : idle);
 	tx += tw[0] + 10;
 	stat_tile(tx, ty, tw[1], th, L"PING", ping, ping_ms < 0 ? idle : ping_ms < 30 ? C_GREEN : ping_ms < 80 ? C_TEXT : C_AMBER);
 	tx += tw[1] + 10;
-	stat_tile(tx, ty, tw[2], th, L"SES", audio, live && g.want_audio ? (g.audio_dropouts ? C_AMBER : C_TEXT) : idle);
+	stat_tile(tx, ty, tw[2], th, L"WI-FI", wifi, wifi_color);
 	tx += tw[2] + 10;
+	stat_tile(tx, ty, tw[3], th, L"SES", audio, live && g.want_audio ? (g.audio_dropouts ? C_AMBER : C_TEXT) : idle);
+	tx += tw[3] + 10;
 	stat_tile(tx, ty, UI_W - 24 - tx, th, L"GÖRÜNTÜ", video, live && g.want_video && g.video_fps10 ? (g.video_lost_total ? C_AMBER : C_TEXT) : idle);
 }
 
@@ -1051,7 +1107,7 @@ static void page_pair(void)
 	{
 		float x = 24 + i * (w + 16);
 		panel(x, y, w, h);
-		stroke_round(x, y, w, h, 22, 2, COLOR((int)(255 * anim(UI_MAX + UI_FIND + i, next_step == i ? 1.0f : 0)), 10, 112, 230));
+		stroke_round(x, y, w, h, 22, 2, COLOR((int)(255 * anim(UI_MAX + UI_FIND + i, next_step == i ? 1.0f : 0)), 255, 255, 255));
 		dot(x + 20, y + 20, 36, steps_done[i] ? COLOR(255, 34, 160, 90) : C_ACCENT);
 		if(steps_done[i])
 			text(ICON_CHECK, ui.icon, x + 20, y + 20, 36, 36, C_TEXT, 1, 1);
@@ -1127,8 +1183,6 @@ static void top_bar(void)
 
 	static const wchar_t *const names[] = { L"Oynat", L"Ayarlar", L"Eşleştirme" };
 	float x = 182, y = 20, h = 40, w = 106;
-	fill_round(x, y, w * 3 + 8, h, h / 2, WHITE(18));
-	stroke_round(x, y, w * 3 + 8, h, h / 2, 1, WHITE(14));
 	float slide = anim(UI_NAV0 + UI_MAX, (float)ui.page);
 	for(int i = 0; i < 3; i++)
 	{
@@ -1136,14 +1190,15 @@ static void top_bar(void)
 		Hit b = hit(UI_NAV0 + i, bx, y + 4, w, h - 8);
 		float hover = anim(UI_NAV0 + i, b.hot && ui.page != i ? 1.0f : 0);
 		if(hover > 0)
-			fill_round(bx, y + 4, w, h - 8, (h - 8) / 2, COLOR((int)(18 * hover), 255, 255, 255));
+			fill_round(bx, y + 4, w, h - 8, (h - 8) / 2, COLOR((int)(20 * hover), 255, 255, 255));
 	}
-	fill_round(x + 4 + slide * w, y + 4, w, h - 8, (h - 8) / 2, C_ACCENT);
+	// The page you're on is white with a bar under it, the others step back, as in the console's menus
+	fill_round(x + 4 + slide * w + w / 2 - 18, y + h - 3, 36, 3, 1.5f, WHITE(245));
 	for(int i = 0; i < 3; i++)
 	{
 		float bx = x + 4 + i * w;
 		Hit b = hit(UI_NAV0 + i, bx, y + 4, w, h - 8);
-		text(names[i], ui.semi, bx, y + 4, w, h - 8, ui.page == i || b.hot ? C_TEXT : C_MUTED, 1, 1);
+		text(names[i], ui.page == i ? ui.title : ui.semi, bx, y + 4, w, h - 8, ui.page == i ? C_TEXT : b.hot ? WHITE(225) : C_MUTED, 1, 1);
 		if(b.click)
 			show_page(i);
 	}
@@ -1167,8 +1222,8 @@ static void top_bar(void)
 	bool live = (g.want_audio || g.want_video) && g.connected;
 	wcscpy(host, !g.paired ? L"PS5 eşleşmedi" : live ? L"PS5 bağlı" : L"PS5 bağlı değil");
 	float pw = 210, px = UI_W - 24 - pw;
-	fill_round(px, y, pw, h, h / 2, WHITE(18));
-	stroke_round(px, y, pw, h, h / 2, 1, WHITE(14));
+	fill_round(px, y, pw, h, h / 2, C_GLASS);
+	stroke_round(px, y, pw, h, h / 2, 1, WHITE(20));
 	dot(px + 16, y + 15, 10, live ? C_GREEN : g.paired ? WHITE(120) : C_AMBER);
 	if(g.paired && mouse_in(px, y, pw, h))
 	{
@@ -1192,8 +1247,8 @@ static void top_bar(void)
 static void status_bar(void)
 {
 	float x = 24, y = UI_H - 64, w = UI_W - 48, h = 48;
-	fill_round(x, y, w, h, 16, COLOR(190, 36, 38, 46));
-	stroke_round(x, y, w, h, 16, 1, WHITE(14));
+	fill_round(x, y, w, h, 16, C_BAR);
+	stroke_round(x, y, w, h, 16, 1, WHITE(20));
 	bool on = g.want_audio || g.want_video;
 	bool live = on && g.connected;
 	text(live ? ICON_CHECK : on ? ICON_SYNC : ICON_INFO, ui.icon, x + 8, y, 36, h, live ? C_GREEN : on ? C_AMBER : C_MUTED, 1, 1);
@@ -1347,18 +1402,18 @@ static void overlay_dim(const RectF *spot)
 		GdipDeletePath(hole);
 	}
 	GpSolidFill *shade;
-	GdipCreateSolidFill(COLOR(185, 8, 9, 13), &shade);
+	GdipCreateSolidFill(COLOR(190, 1, 5, 16), &shade);
 	GdipFillPath(ui.gx, (GpBrush *)shade, dark);
 	GdipDeleteBrush((GpBrush *)shade);
 	GdipDeletePath(dark);
 	if(spot)
-		stroke_round(spot->X, spot->Y, spot->Width, spot->Height, 18, 2.5f, C_ACCENT);
+		stroke_round(spot->X, spot->Y, spot->Width, spot->Height, 18, 2.5f, WHITE(240));
 }
 
 static void overlay_card(float x, float y, float w, float h)
 {
 	shadow(x, y, w, h, 22);
-	fill_round(x, y, w, h, 22, COLOR(255, 33, 36, 44));
+	fill_round(x, y, w, h, 22, COLOR(255, 10, 22, 52));
 	stroke_round(x, y, w, h, 22, 1, WHITE(34));
 }
 
@@ -1368,7 +1423,7 @@ static void update_screen_draw(void)
 	overlay_dim(NULL);
 	float w = 460, h = 222, x = (UI_W - w) / 2, y = (UI_H - h) / 2;
 	overlay_card(x, y, w, h);
-	dot(x + 26, y + 26, 48, COLOR(255, 10, 112, 230));
+	dot(x + 26, y + 26, 48, C_ACCENT);
 	text(ICON_SYNC, ui.icon, x + 26, y + 26, 48, 48, C_TEXT, 1, 1);
 	text(L"Yeni sürüm geldi!", ui.title, x + 90, y + 26, w - 116, 48, C_TEXT, 0, 1);
 	wchar_t body[256];
@@ -1664,10 +1719,15 @@ static void connection_watch(void)
 		return;
 	int lost = g.video_lost_total - ui.weak_lost, drops = g.audio_dropouts - ui.weak_drops;
 	LONG gap = InterlockedExchange(&g.audio_gap_max, 0);
-	// The longest wait between sounds tells Wi-Fi bursts apart from a PC that was too busy
+	LONG signal = g.wifi_signal, channel = g.wifi_channel;
+	char wifi[48] = "";
+	if(signal >= 0)
+		snprintf(wifi, sizeof(wifi), ", Wi-Fi signal %ld%% on channel %ld", (long)signal, (long)channel);
+	// The longest wait between sounds tells Wi-Fi bursts apart from a PC that was too busy, and the
+	// signal tells a fading link apart from a crowded one
 	if(lost || drops || ui.loss_peak > 0)
-		CHIAKI_LOGI(&g.log, "Connection in the last %d s: %d lost frames, %d audio dropouts, packet loss peak %.0f%%, longest sound gap %ld ms%s",
-				WEAK_WINDOW_MS / 1000, lost, drops, ui.loss_peak * 100, (long)gap, IsWindowVisible(g.hwnd) && !IsIconic(g.hwnd) ? "" : ", window hidden");
+		CHIAKI_LOGI(&g.log, "Connection in the last %d s: %d lost frames, %d audio dropouts, packet loss peak %.0f%%, longest sound gap %ld ms%s%s",
+				WEAK_WINDOW_MS / 1000, lost, drops, ui.loss_peak * 100, (long)gap, wifi, IsWindowVisible(g.hwnd) && !IsIconic(g.hwnd) ? "" : ", window hidden");
 	ui.loss_peak = 0;
 	ui.weak_lost = g.video_lost_total;
 	ui.weak_drops = g.audio_dropouts;
@@ -1685,7 +1745,15 @@ static void connection_watch(void)
 		EnterCriticalSection(&g.lock);
 		wcscpy(better, g.wifi_5ghz);
 		LeaveCriticalSection(&g.lock);
-		if(slow_band && better[0])
+		if(signal >= 0 && signal < WEAK_SIGNAL)
+		{
+			// A fading signal is fixed by distance, whatever the band
+			wchar_t text[256];
+			swprintf(text, 256, tr(g.want_video ? L"Görüntü takılıyor. Wi-Fi sinyali zayıf (%%%ld); bilgisayarı modeme yaklaştırmak çok iyi gelir"
+					: L"Ses kesiliyor. Wi-Fi sinyali zayıf (%%%ld); bilgisayarı modeme yaklaştırmak çok iyi gelir"), (long)signal);
+			set_status(text);
+		}
+		else if(slow_band && better[0])
 		{
 			// Translated here, since the network's name makes it a text of its own
 			wchar_t text[256];
@@ -1924,7 +1992,7 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 			break;
 		case WM_CTLCOLOREDIT:
 			SetTextColor((HDC)wp, RGB(255, 255, 255));
-			SetBkColor((HDC)wp, RGB(43, 45, 51));
+			SetBkColor((HDC)wp, C_FIELD_RGB);
 			return (LRESULT)ui.field_brush;
 		case WM_HOTKEY:
 			if(wp == HOTKEY_MUTE)
@@ -2075,7 +2143,7 @@ static void ui_create(HINSTANCE inst)
 	ui.icon_huge = font_make(L"Segoe MDL2 Assets", 120);
 	ui.slider_fill = C_ACCENT;
 	GdipCreateStringFormat(0, LANG_NEUTRAL, &ui.fmt);
-	ui.field_brush = CreateSolidBrush(RGB(43, 45, 51));
+	ui.field_brush = CreateSolidBrush(C_FIELD_RGB);
 
 	WNDCLASSW wc = { 0 };
 	wc.lpfnWndProc = wnd_proc;
@@ -2092,6 +2160,10 @@ static void ui_create(HINSTANCE inst)
 			rect.right - rect.left, rect.bottom - rect.top, NULL, NULL, inst, NULL);
 	BOOL dark = TRUE;
 	DwmSetWindowAttribute(g.hwnd, 20, &dark, sizeof(dark));
+	// Windows 11 colours the title bar to match the top of the window; older versions skip this
+	COLORREF caption = C_NAVY_TOP, caption_text = RGB(255, 255, 255);
+	DwmSetWindowAttribute(g.hwnd, 35, &caption, sizeof(caption));
+	DwmSetWindowAttribute(g.hwnd, 36, &caption_text, sizeof(caption_text));
 	POINT saved = { config_int("win_x", 99999, -32768, 32767), config_int("win_y", 99999, -32768, 32767) };
 	POINT corner = { saved.x + 40, saved.y + 40 };
 	if(saved.x != 99999 && saved.y != 99999 && MonitorFromPoint(corner, MONITOR_DEFAULTTONULL))
@@ -2461,6 +2533,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmd, int show)
 	InitializeCriticalSection(&g.lock);
 	InitializeCriticalSection(&g.pad_lock);
 	InitializeCriticalSection(&g.sdl_lock);
+	g.wifi_signal = WIFI_UNKNOWN;
 	SetPriorityClass(GetCurrentProcess(), ABOVE_NORMAL_PRIORITY_CLASS);
 	// Windows 11 slows down apps without a visible window (EcoQoS) and ignores their timer requests.
 	// Audio only runs hidden in the tray, and that showed as sound gaps with no packet loss at all.
