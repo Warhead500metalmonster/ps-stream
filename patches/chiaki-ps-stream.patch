@@ -1,3 +1,21 @@
+diff --git a/lib/include/chiaki/reorderqueue.h b/lib/include/chiaki/reorderqueue.h
+index e972d91..e26f387 100644
+--- a/lib/include/chiaki/reorderqueue.h
++++ b/lib/include/chiaki/reorderqueue.h
+@@ -123,6 +123,13 @@ CHIAKI_EXPORT bool chiaki_reorder_queue_peek(ChiakiReorderQueue *queue, uint64_t
+  */
+ CHIAKI_EXPORT void chiaki_reorder_queue_drop(ChiakiReorderQueue *queue, uint64_t index);
+ 
++/**
++ * Move begin past the missing elements at the front, up to the first one that is there, so pull
++ * can go on. For a sender that has given up on resending them.
++ * @return the number of sequence numbers skipped
++ */
++CHIAKI_EXPORT uint64_t chiaki_reorder_queue_skip_missing(ChiakiReorderQueue *queue);
++
+ #ifdef __cplusplus
+ }
+ #endif
 diff --git a/lib/include/chiaki/session.h b/lib/include/chiaki/session.h
 index e90ecea..10876cf 100644
 --- a/lib/include/chiaki/session.h
@@ -19,14 +37,15 @@ index e90ecea..10876cf 100644
  
  	ChiakiTarget target;
 diff --git a/lib/include/chiaki/takion.h b/lib/include/chiaki/takion.h
-index 16bad78..1289570 100644
+index 16bad78..ca12ad5 100644
 --- a/lib/include/chiaki/takion.h
 +++ b/lib/include/chiaki/takion.h
-@@ -153,6 +153,7 @@ typedef struct chiaki_takion_t
+@@ -153,6 +153,8 @@ typedef struct chiaki_takion_t
  	ChiakiGKCrypt *gkcrypt_remote; // if NULL (default), remote gmacs are IGNORED (!) and everything is expected to be unencrypted
  
  	ChiakiReorderQueue data_queue;
 +	bool data_acked; // data_queue has delivered and acked something
++	uint64_t data_hole_since_ms; // when data_queue started waiting for a missing packet, 0 when it isn't
  	ChiakiReorderQueue video_queue;
  	bool video_queue_initialized;
  	int64_t video_queue_head_wait_start_us;
@@ -43,6 +62,29 @@ index a340b5d..4cab07c 100644
  	ChiakiMutex frames_lost_mutex;
  } ChiakiVideoReceiver;
  
+diff --git a/lib/src/reorderqueue.c b/lib/src/reorderqueue.c
+index 656c10d..f295fb7 100644
+--- a/lib/src/reorderqueue.c
++++ b/lib/src/reorderqueue.c
+@@ -172,6 +172,18 @@ CHIAKI_EXPORT bool chiaki_reorder_queue_peek(ChiakiReorderQueue *queue, uint64_t
+ 	return true;
+ }
+ 
++CHIAKI_EXPORT uint64_t chiaki_reorder_queue_skip_missing(ChiakiReorderQueue *queue)
++{
++	uint64_t skipped = 0;
++	while(queue->count > 0 && !queue->queue[idx(queue->begin)].set)
++	{
++		queue->begin = add(queue->begin, 1);
++		queue->count--;
++		skipped++;
++	}
++	return skipped;
++}
++
+ CHIAKI_EXPORT void chiaki_reorder_queue_drop(ChiakiReorderQueue *queue, uint64_t index)
+ {
+ 	if(index >= queue->count)
 diff --git a/lib/src/senkusha.c b/lib/src/senkusha.c
 index 05b4517..7133e77 100644
 --- a/lib/src/senkusha.c
@@ -236,11 +278,22 @@ index afa1a60..b859beb 100644
  	{
  		CHIAKI_LOGE(stream_connection->log, "StreamConnection failed to send controller connection");
 diff --git a/lib/src/takion.c b/lib/src/takion.c
-index 38f9f5d..baea4db 100644
+index 38f9f5d..ddc3a6f 100644
 --- a/lib/src/takion.c
 +++ b/lib/src/takion.c
-@@ -45,7 +45,9 @@
- #define TAKION_REORDER_QUEUE_SIZE_EXP 4 // => 16 entries
+@@ -42,10 +42,19 @@
+ #define TAKION_OUTBOUND_STREAMS 0x64
+ #define TAKION_INBOUND_STREAMS 0x64
+ 
+-#define TAKION_REORDER_QUEUE_SIZE_EXP 4 // => 16 entries
++// 64 entries. With 16, everything after a short dropout's first 16 packets was thrown away and had
++// to be sent again.
++#define TAKION_REORDER_QUEUE_SIZE_EXP 6
++
++// The PS5 resends a data packet for about 5 s, then gives up. Waiting for it after that blocked
++// every later packet: none was delivered or acked, so the PS5 sent each one 25 times, a storm of
++// hundreds of packets a second that went on for the rest of the session and choked the Wi-Fi.
++#define TAKION_DATA_HOLE_SKIP_MS 5500
  #define TAKION_AV_VIDEO_REORDER_QUEUE_SIZE_EXP 6 // => 64 entries
  #define TAKION_AV_REORDER_TIMEOUT_US 16000 // ~1 frame at 60fps
 -#define TAKION_SEND_BUFFER_SIZE 16
@@ -250,7 +303,7 @@ index 38f9f5d..baea4db 100644
  
  #define TAKION_POSTPONE_PACKETS_SIZE 32
  
-@@ -55,7 +57,11 @@
+@@ -55,7 +64,11 @@
  
  #define TAKION_EXPECT_TIMEOUT_MS 5000
  
@@ -263,15 +316,16 @@ index 38f9f5d..baea4db 100644
  /**
   * Base type of Takion packets. Lower nibble of the first byte in datagrams.
   */
-@@ -197,6 +203,7 @@ CHIAKI_EXPORT ChiakiErrorCode chiaki_takion_connect(ChiakiTakion *takion, Chiaki
+@@ -197,6 +210,8 @@ CHIAKI_EXPORT ChiakiErrorCode chiaki_takion_connect(ChiakiTakion *takion, Chiaki
  	takion->log = info->log;
  	takion->close_socket = info->close_socket;
  	takion->version = info->protocol_version;
 +	takion->data_acked = false;
++	takion->data_hole_since_ms = 0;
  	takion->disable_audio_video = info->disable_audio_video;
  
  	switch(takion->version)
-@@ -257,7 +264,7 @@ CHIAKI_EXPORT ChiakiErrorCode chiaki_takion_connect(ChiakiTakion *takion, Chiaki
+@@ -257,7 +272,7 @@ CHIAKI_EXPORT ChiakiErrorCode chiaki_takion_connect(ChiakiTakion *takion, Chiaki
  			CHIAKI_LOGE(takion->log, "Takion had problem reading extra messages from socket using PSN Connection with error: " CHIAKI_SOCKET_ERROR_FMT, CHIAKI_SOCKET_ERROR_VALUE);
  			goto error_sock;
  		}
@@ -280,7 +334,7 @@ index 38f9f5d..baea4db 100644
  		int r = setsockopt(takion->sock, SOL_SOCKET, SO_RCVBUF, (const CHIAKI_SOCKET_BUF_TYPE)&rcvbuf_val, sizeof(rcvbuf_val));
  		if(r < 0)
  		{
-@@ -345,7 +352,7 @@ CHIAKI_EXPORT ChiakiErrorCode chiaki_takion_connect(ChiakiTakion *takion, Chiaki
+@@ -345,7 +360,7 @@ CHIAKI_EXPORT ChiakiErrorCode chiaki_takion_connect(ChiakiTakion *takion, Chiaki
  			ret = CHIAKI_ERR_NETWORK;
  			goto error_pipe;
  		}
@@ -289,7 +343,7 @@ index 38f9f5d..baea4db 100644
  		int r = setsockopt(takion->sock, SOL_SOCKET, SO_RCVBUF, (const CHIAKI_SOCKET_BUF_TYPE)&rcvbuf_val, sizeof(rcvbuf_val));
  		if(r < 0)
  		{
-@@ -851,7 +858,7 @@ static ChiakiErrorCode takion_handshake(ChiakiTakion *takion, uint32_t *seq_num_
+@@ -851,7 +866,7 @@ static ChiakiErrorCode takion_handshake(ChiakiTakion *takion, uint32_t *seq_num_
  
  		// INIT_ACK <-
  		err = takion_recv_message_init_ack(takion, &init_ack_payload);
@@ -298,7 +352,7 @@ index 38f9f5d..baea4db 100644
  			break;
  	}
  	if(err != CHIAKI_ERR_SUCCESS)
-@@ -897,7 +904,7 @@ static ChiakiErrorCode takion_handshake(ChiakiTakion *takion, uint32_t *seq_num_
+@@ -897,7 +912,7 @@ static ChiakiErrorCode takion_handshake(ChiakiTakion *takion, uint32_t *seq_num_
  		// COOKIE_ACK <-
  
  		err = takion_recv_message_cookie_ack(takion);
@@ -307,7 +361,7 @@ index 38f9f5d..baea4db 100644
  			break;
  	}
  	if(err != CHIAKI_ERR_SUCCESS)
-@@ -1387,7 +1394,10 @@ static void takion_flush_data_queue(ChiakiTakion *takion)
+@@ -1387,7 +1402,10 @@ static void takion_flush_data_queue(ChiakiTakion *takion)
  	}
  
  	if(ack)
@@ -318,7 +372,7 @@ index 38f9f5d..baea4db 100644
  }
  
  static void takion_handle_packet_message_data(ChiakiTakion *takion, uint8_t *packet_buf, size_t packet_buf_size, uint8_t type_b, uint8_t *payload, size_t payload_size)
-@@ -1413,15 +1423,26 @@ static void takion_handle_packet_message_data(ChiakiTakion *takion, uint8_t *pac
+@@ -1413,15 +1431,45 @@ static void takion_handle_packet_message_data(ChiakiTakion *takion, uint8_t *pac
  	entry->channel = ntohs(*((chiaki_unaligned_uint16_t *)(payload + 4)));
  	ChiakiSeqNum32 seq_num = ntohl(*((chiaki_unaligned_uint32_t *)(payload + 0)));
  
@@ -333,6 +387,25 @@ index 38f9f5d..baea4db 100644
 +
 +	if(repeat)
 +		chiaki_takion_send_message_data_ack(takion, delivered_end - 1);
++
++	// Whatever is still queued after a flush waits behind a missing packet
++	if(chiaki_reorder_queue_count(&takion->data_queue) > 0)
++	{
++		uint64_t now = chiaki_time_now_monotonic_ms();
++		if(!takion->data_hole_since_ms)
++			takion->data_hole_since_ms = now;
++		else if(now - takion->data_hole_since_ms > TAKION_DATA_HOLE_SKIP_MS)
++		{
++			uint32_t from = (uint32_t)takion->data_queue.begin;
++			uint64_t skipped = chiaki_reorder_queue_skip_missing(&takion->data_queue);
++			CHIAKI_LOGW(takion->log, "Takion skipping %llu data packet(s) from %#x the PS5 gave up resending",
++					(unsigned long long)skipped, (unsigned int)from);
++			takion->data_hole_since_ms = 0;
++			takion_flush_data_queue(takion);
++		}
++	}
++	else
++		takion->data_hole_since_ms = 0;
  }
  
  static void takion_handle_packet_message_data_ack(ChiakiTakion *takion, uint8_t flags, uint8_t *buf, size_t buf_size)
@@ -347,7 +420,7 @@ index 38f9f5d..baea4db 100644
  		return;
  	}
  
-@@ -1430,15 +1451,12 @@ static void takion_handle_packet_message_data_ack(ChiakiTakion *takion, uint8_t
+@@ -1430,15 +1478,12 @@ static void takion_handle_packet_message_data_ack(ChiakiTakion *takion, uint8_t
  	uint16_t gap_ack_blocks_count = ntohs(*((chiaki_unaligned_uint16_t *)(buf + 8)));
  	uint16_t dup_tsns_count = ntohs(*((chiaki_unaligned_uint16_t *)(buf + 0xa)));
  
@@ -365,7 +438,7 @@ index 38f9f5d..baea4db 100644
  	CHIAKI_LOGV(takion->log, "Takion received data ack with cumulative_seq_num = %#x, a_rwnd = %#x, gap_ack_blocks_count = %#x, dup_tsns_count = %#x",
  			cumulative_seq_num, a_rwnd, gap_ack_blocks_count, dup_tsns_count);
  
-@@ -1538,7 +1556,7 @@ static ChiakiErrorCode takion_recv_message_init_ack(ChiakiTakion *takion, Takion
+@@ -1538,7 +1583,7 @@ static ChiakiErrorCode takion_recv_message_init_ack(ChiakiTakion *takion, Takion
  {
  	uint8_t message[1 + TAKION_MESSAGE_HEADER_SIZE + 0x10 + TAKION_COOKIE_SIZE];
  	size_t received_size = sizeof(message);
@@ -374,7 +447,7 @@ index 38f9f5d..baea4db 100644
  	if(err != CHIAKI_ERR_SUCCESS)
  		return err;
  
-@@ -1585,14 +1603,14 @@ static ChiakiErrorCode takion_recv_message_cookie_ack(ChiakiTakion *takion)
+@@ -1585,14 +1630,14 @@ static ChiakiErrorCode takion_recv_message_cookie_ack(ChiakiTakion *takion)
  {
  	uint8_t message[1 + TAKION_MESSAGE_HEADER_SIZE];
  	size_t received_size = sizeof(message);
