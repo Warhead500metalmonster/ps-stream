@@ -50,15 +50,16 @@ index 16bad78..ca12ad5 100644
  	bool video_queue_initialized;
  	int64_t video_queue_head_wait_start_us;
 diff --git a/lib/include/chiaki/videoreceiver.h b/lib/include/chiaki/videoreceiver.h
-index a340b5d..4cab07c 100644
+index a340b5d..d08b01c 100644
 --- a/lib/include/chiaki/videoreceiver.h
 +++ b/lib/include/chiaki/videoreceiver.h
-@@ -37,6 +37,8 @@ typedef struct chiaki_video_receiver_t
+@@ -37,6 +37,9 @@ typedef struct chiaki_video_receiver_t
  	ChiakiBitstream bitstream;
  	ChiakiMutex waiting_for_idr_mutex;
  	bool waiting_for_idr;
 +	uint64_t idr_requested_ms; // when the IDR frame being waited for was last asked for
 +	uint64_t corrupt_reported_ms; // when corrupt frames were last reported
++	int32_t lost_counted_to; // last frame already counted as lost, -1 for none
  	ChiakiMutex frames_lost_mutex;
  } ChiakiVideoReceiver;
  
@@ -507,7 +508,7 @@ index 5cee13c..3d47c2a 100644
  			chiaki_takion_send_raw(send_buffer->takion, packet->buf, packet->buf_size);
  			packet->tries++;
 diff --git a/lib/src/videoreceiver.c b/lib/src/videoreceiver.c
-index ed3cc76..376c29b 100644
+index ed3cc76..906447f 100644
 --- a/lib/src/videoreceiver.c
 +++ b/lib/src/videoreceiver.c
 @@ -3,8 +3,26 @@
@@ -537,16 +538,17 @@ index ed3cc76..376c29b 100644
  static ChiakiErrorCode chiaki_video_receiver_flush_frame(ChiakiVideoReceiver *video_receiver);
  
  static void add_ref_frame(ChiakiVideoReceiver *video_receiver, int32_t frame)
-@@ -54,6 +72,8 @@ CHIAKI_EXPORT void chiaki_video_receiver_init(ChiakiVideoReceiver *video_receive
+@@ -54,6 +72,9 @@ CHIAKI_EXPORT void chiaki_video_receiver_init(ChiakiVideoReceiver *video_receive
  	chiaki_bitstream_init(&video_receiver->bitstream, video_receiver->log, video_receiver->session->connect_info.video_profile.codec);
  	chiaki_mutex_init(&video_receiver->waiting_for_idr_mutex, false);
  	video_receiver->waiting_for_idr = false;
 +	video_receiver->idr_requested_ms = 0;
 +	video_receiver->corrupt_reported_ms = 0;
++	video_receiver->lost_counted_to = -1;
  	chiaki_mutex_init(&video_receiver->frames_lost_mutex, false);
  }
  
-@@ -162,7 +182,7 @@ CHIAKI_EXPORT void chiaki_video_receiver_av_packet(ChiakiVideoReceiver *video_re
+@@ -162,7 +183,7 @@ CHIAKI_EXPORT void chiaki_video_receiver_av_packet(ChiakiVideoReceiver *video_re
  			&& !(frame_index == 1 && video_receiver->frame_index_cur < 0)) // ok for frame 1
  		{
  			CHIAKI_LOGW(video_receiver->log, "Detected missing or corrupt frame(s) from %d to %d", next_frame_expected, (int)frame_index);
@@ -555,7 +557,7 @@ index ed3cc76..376c29b 100644
  			if(err != CHIAKI_ERR_SUCCESS)
  				CHIAKI_LOGW(video_receiver->log, "Error sending corrupt frame.");
  		}
-@@ -188,6 +208,18 @@ CHIAKI_EXPORT void chiaki_video_receiver_av_packet(ChiakiVideoReceiver *video_re
+@@ -188,6 +209,18 @@ CHIAKI_EXPORT void chiaki_video_receiver_av_packet(ChiakiVideoReceiver *video_re
  	}
  }
  
@@ -574,7 +576,7 @@ index ed3cc76..376c29b 100644
  static ChiakiErrorCode chiaki_video_receiver_flush_frame(ChiakiVideoReceiver *video_receiver)
  {
  	uint8_t *frame;
-@@ -200,7 +232,7 @@ static ChiakiErrorCode chiaki_video_receiver_flush_frame(ChiakiVideoReceiver *vi
+@@ -200,7 +233,7 @@ static ChiakiErrorCode chiaki_video_receiver_flush_frame(ChiakiVideoReceiver *vi
  		if (flush_result == CHIAKI_FRAME_PROCESSOR_FLUSH_RESULT_FEC_FAILED)
  		{
  			ChiakiSeqNum16 next_frame_expected = (ChiakiSeqNum16)(video_receiver->frame_index_prev_complete + 1);
@@ -583,7 +585,7 @@ index ed3cc76..376c29b 100644
  			if(video_receiver->session->connect_info.enable_idr_on_fec_failure)
  			{
  				bool waiting_for_idr = chiaki_video_receiver_get_waiting_for_idr(video_receiver);
-@@ -211,6 +243,7 @@ static ChiakiErrorCode chiaki_video_receiver_flush_frame(ChiakiVideoReceiver *vi
+@@ -211,6 +244,7 @@ static ChiakiErrorCode chiaki_video_receiver_flush_frame(ChiakiVideoReceiver *vi
  					idr_request_sent = err == CHIAKI_ERR_SUCCESS;
  					if(err == CHIAKI_ERR_SUCCESS)
  					{
@@ -591,7 +593,7 @@ index ed3cc76..376c29b 100644
  						chiaki_video_receiver_set_waiting_for_idr(video_receiver, true);
  						CHIAKI_LOGI(video_receiver->log, "FEC failed, waiting for IDR frame");
  					}
-@@ -222,6 +255,7 @@ static ChiakiErrorCode chiaki_video_receiver_flush_frame(ChiakiVideoReceiver *vi
+@@ -222,6 +256,7 @@ static ChiakiErrorCode chiaki_video_receiver_flush_frame(ChiakiVideoReceiver *vi
  				else
  				{
  					CHIAKI_LOGW(video_receiver->log, "Video FEC failure, already waiting for requested IDR");
@@ -599,7 +601,24 @@ index ed3cc76..376c29b 100644
  				}
  				ChiakiEvent event = { 0 };
  				event.type = CHIAKI_EVENT_VIDEO_FEC_FAILURE;
-@@ -256,6 +290,7 @@ static ChiakiErrorCode chiaki_video_receiver_flush_frame(ChiakiVideoReceiver *vi
+@@ -229,7 +264,15 @@ static ChiakiErrorCode chiaki_video_receiver_flush_frame(ChiakiVideoReceiver *vi
+ 				event.video_fec_failure.idr_request_sent = idr_request_sent;
+ 				chiaki_session_send_event(video_receiver->session, &event);
+ 			}
+-		int32_t lost = video_receiver->frame_index_cur - next_frame_expected + 1;
++		// While waiting for an IDR, every failed frame covered all frames since the last good one again,
++		// so one short dropout was counted as hundreds of lost frames
++		ChiakiSeqNum16 lost_from = next_frame_expected;
++		if(video_receiver->lost_counted_to >= 0
++			&& chiaki_seq_num_16_gt((ChiakiSeqNum16)(video_receiver->lost_counted_to + 1), lost_from))
++			lost_from = (ChiakiSeqNum16)(video_receiver->lost_counted_to + 1);
++		int32_t lost = chiaki_seq_num_16_gt(lost_from, (ChiakiSeqNum16)video_receiver->frame_index_cur)
++			? 0 : (int32_t)(ChiakiSeqNum16)(video_receiver->frame_index_cur - lost_from) + 1;
++		video_receiver->lost_counted_to = video_receiver->frame_index_cur;
+ 		chiaki_mutex_lock(&video_receiver->frames_lost_mutex);
+ 		video_receiver->frames_lost += lost;
+ 		video_receiver->frames_lost_total += lost;
+@@ -256,6 +299,7 @@ static ChiakiErrorCode chiaki_video_receiver_flush_frame(ChiakiVideoReceiver *vi
  			else
  			{
  				CHIAKI_LOGV(video_receiver->log, "Skipping P-frame %d while waiting for IDR", (int)video_receiver->frame_index_cur);

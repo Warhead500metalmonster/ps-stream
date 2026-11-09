@@ -49,7 +49,7 @@
 
 // Below this rate we are outside what chiaki-ng offers, so a console that refuses to start
 // gets a second try with it.
-#define APP_VERSION "0.1.36"
+#define APP_VERSION "0.1.37"
 #define UPDATE_RECHECK_MS (6 * 60 * 60 * 1000)
 #define UPDATE_TRIES 6
 #define UPDATE_RETRY_MS 20000
@@ -228,6 +228,7 @@ static struct {
 	ChiakiFfmpegDecoder decoder;
 	HANDLE video_thread, video_ready;
 	volatile LONG video_stop, frame_pending;
+	volatile LONG frames_fed; // complete frames handed to the decoder
 } g;
 
 static int S(int v) { return MulDiv(v, g.dpi, 96); }
@@ -486,6 +487,19 @@ static void audio_frame_cb(int16_t *buf, size_t samples_count, void *user)
 }
 
 // ---------- video ----------
+
+// A decoder that takes frames but gives no picture back. In a real session the picture froze for 17
+// and 25 s while every frame arrived whole and the sound played on: nothing was missing, so nothing
+// asked the PS5 for a fresh picture, and an IDR frame was what ended both freezes.
+#define DECODER_STALL_FRAMES 10
+#define DECODER_STALL_MS 700
+#define DECODER_STALL_RETRY_MS 1500
+
+static bool video_sample_cb(uint8_t *buf, size_t buf_size, int32_t frames_lost, bool frame_recovered, void *user)
+{
+	InterlockedIncrement(&g.frames_fed);
+	return chiaki_ffmpeg_decoder_video_sample_cb(buf, buf_size, frames_lost, frame_recovered, user);
+}
 
 static void frame_available_cb(ChiakiFfmpegDecoder *decoder, void *user)
 {
@@ -810,8 +824,32 @@ static DWORD WINAPI video_thread_main(void *arg)
 	int stat_frames = 0, stat_lost = 0, stat_windows = 0;
 	double stat_loss = 0; // highest packet loss chiaki measured in this window, which it reports to the PS5
 	bool fullscreen = false;
+	LONG pictures = 0, stall_fed = g.frames_fed, stall_pictures = 0, stall_asks = 0;
+	double stall_since = now_ms(), stall_asked_at = 0;
 	while((renderer || on_gpu) && !g.video_stop)
 	{
+		// Frames going in with no picture coming out: ask the PS5 for a fresh picture to start from,
+		// and again every so often until one shows
+		LONG fed = g.frames_fed;
+		if(pictures != stall_pictures || !g.session_live || !g.connected)
+		{
+			if(stall_asks && pictures != stall_pictures)
+				CHIAKI_LOGI(&g.log, "Video picture back after %.0f ms", now_ms() - stall_since);
+			stall_pictures = pictures;
+			stall_fed = fed;
+			stall_since = now_ms();
+			stall_asks = 0;
+		}
+		else if(fed - stall_fed >= DECODER_STALL_FRAMES && now_ms() - stall_since >= DECODER_STALL_MS
+			&& (!stall_asks || now_ms() - stall_asked_at >= DECODER_STALL_RETRY_MS))
+		{
+			if(!stall_asks)
+				CHIAKI_LOGW(&g.log, "Video decoder took %ld frames without giving a picture, asking the PS5 for a fresh one", (long)(fed - stall_fed));
+			chiaki_session_request_idr(&g.session);
+			stall_asks++;
+			stall_asked_at = now_ms();
+		}
+
 		SDL_Event e;
 		if(SDL_WaitEventTimeout(&e, 100))
 		{
@@ -843,6 +881,8 @@ static DWORD WINAPI video_thread_main(void *arg)
 			double t0 = now_ms();
 			ChiakiFfmpegFrame frame = chiaki_ffmpeg_decoder_pull_frame(&g.decoder, &lost);
 			AVFrame *f = frame.frame;
+			if(f)
+				pictures++;
 			stat_pull += now_ms() - t0;
 			stat_lost += lost;
 			if(f && on_gpu && f->format != AV_PIX_FMT_D3D11)
@@ -1463,7 +1503,7 @@ static bool session_start(bool video, const Settings *s, bool safe)
 	chiaki_opus_decoder_get_sink(&g.opus, &sink);
 	chiaki_session_set_audio_sink(&g.session, &sink);
 	if(video)
-		chiaki_session_set_video_sample_cb(&g.session, chiaki_ffmpeg_decoder_video_sample_cb, &g.decoder);
+		chiaki_session_set_video_sample_cb(&g.session, video_sample_cb, &g.decoder);
 
 	err = chiaki_session_start(&g.session);
 	if(err != CHIAKI_ERR_SUCCESS)
