@@ -49,7 +49,7 @@
 
 // Below this rate we are outside what chiaki-ng offers, so a console that refuses to start
 // gets a second try with it.
-#define APP_VERSION "0.1.37"
+#define APP_VERSION "0.1.38"
 #define UPDATE_RECHECK_MS (6 * 60 * 60 * 1000)
 #define UPDATE_TRIES 6
 #define UPDATE_RETRY_MS 20000
@@ -663,6 +663,11 @@ static bool gpu_prepare(GpuView *v, const AVFrame *f, int out_w, int out_h)
 		ID3D11VideoContext_VideoProcessorSetOutputColorSpace(v->vctx, v->vp, &rgb);
 		if(v->vctx1)
 			ID3D11VideoContext1_VideoProcessorSetOutputColorSpace1(v->vctx1, v->vp, DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709);
+		// The decoder's textures are taller than the picture: rows are padded to a multiple of 16, or 128
+		// for H.265, so 1080p H.265 comes in a 1152-row texture. Without a source rectangle the padding
+		// was scaled in too and showed as a black band along the bottom.
+		RECT src = { 0, 0, f->width, f->height };
+		ID3D11VideoContext_VideoProcessorSetStreamSourceRect(v->vctx, v->vp, 0, TRUE, &src);
 		RECT dest = gpu_fit(f->width, f->height, out_w, out_h);
 		ID3D11VideoContext_VideoProcessorSetStreamDestRect(v->vctx, v->vp, 0, TRUE, &dest);
 		v->src_w = f->width;
@@ -773,6 +778,47 @@ static void gpu_shot(GpuView *v, const char *path)
 }
 #endif
 
+// While the video window is dragged bigger or smaller, its inside keeps the picture's shape, so the
+// picture fills it with no bars at the sides or top and bottom. Maximizing or snapping can still give
+// it another shape; F11 fills the screen.
+static LRESULT CALLBACK video_sizing_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp, UINT_PTR id, DWORD_PTR ref)
+{
+	(void)id;
+	const SIZE *pic = (const SIZE *)ref;
+	if(msg == WM_SIZING && pic->cx > 0 && pic->cy > 0)
+	{
+		RECT *r = (RECT *)lp, win, client;
+		GetWindowRect(hwnd, &win);
+		GetClientRect(hwnd, &client);
+		int frame_w = (win.right - win.left) - client.right, frame_h = (win.bottom - win.top) - client.bottom;
+		if(wp == WMSZ_TOP || wp == WMSZ_BOTTOM)
+			r->right = r->left + MulDiv(r->bottom - r->top - frame_h, pic->cx, pic->cy) + frame_w;
+		else
+		{
+			int h = MulDiv(r->right - r->left - frame_w, pic->cy, pic->cx) + frame_h;
+			if(wp == WMSZ_TOPLEFT || wp == WMSZ_TOPRIGHT)
+				r->top = r->bottom - h;
+			else
+				r->bottom = r->top + h;
+		}
+	}
+	return DefSubclassProc(hwnd, msg, wp, lp);
+}
+
+// Called when the stream's size is known or changes: brings a plain window to the picture's shape
+static void video_shape_set(SDL_Window *window, SIZE *shape, int w, int h)
+{
+	shape->cx = w;
+	shape->cy = h;
+	if(w <= 0 || h <= 0 || (SDL_GetWindowFlags(window) & (SDL_WINDOW_FULLSCREEN | SDL_WINDOW_MAXIMIZED | SDL_WINDOW_MINIMIZED)))
+		return;
+	int win_w, win_h;
+	SDL_GetWindowSize(window, &win_w, &win_h);
+	int want = (int)((long long)win_w * h / w);
+	if(abs(want - win_h) > 1)
+		SDL_SetWindowSize(window, win_w, want);
+}
+
 static double now_ms(void)
 {
 	static LARGE_INTEGER freq;
@@ -803,8 +849,19 @@ static DWORD WINAPI video_thread_main(void *arg)
 	POINT win_corner = { win_x + 40, win_y + 40 };
 	if(win_x == 99999 || win_y == 99999 || !MonitorFromPoint(win_corner, MONITOR_DEFAULTTONULL))
 		win_x = win_y = SDL_WINDOWPOS_CENTERED;
-	SDL_Window *window = SDL_CreateWindow(title, win_x, win_y, config_int("video_w", S(960), 320, 16384), config_int("video_h", S(540), 180, 16384),
+	// The PS5 sends 16:9, so the window opens at that shape and the picture fills it
+	int start_w = config_int("video_w", S(960), 320, 16384);
+	SDL_Window *window = SDL_CreateWindow(title, win_x, win_y, start_w, start_w * 9 / 16,
 			SDL_WINDOW_RESIZABLE | (g.test_hidden ? SDL_WINDOW_HIDDEN : 0));
+	SIZE pic_shape = { 16, 9 }; // the stream's own size once a frame says so
+	HWND video_hwnd = NULL;
+	if(window)
+	{
+		SDL_SysWMinfo info;
+		SDL_VERSION(&info.version);
+		if(SDL_GetWindowWMInfo(window, &info) && SetWindowSubclass(info.info.win.window, video_sizing_proc, 1, (DWORD_PTR)&pic_shape))
+			video_hwnd = info.info.win.window;
+	}
 	GpuView gpu;
 	bool on_gpu = window && gpu_open(&gpu, window, g.decoder.hw_device_ctx);
 	SDL_Renderer *renderer = window && !on_gpu ? SDL_CreateRenderer(window, -1, 0) : NULL;
@@ -902,6 +959,7 @@ static DWORD WINAPI video_thread_main(void *arg)
 				{
 					tex_w = f->width;
 					tex_h = f->height;
+					video_shape_set(window, &pic_shape, tex_w, tex_h);
 					CHIAKI_LOGI(&g.log, "Video: %dx%d, hardware decoding, drawn on the GPU", tex_w, tex_h);
 				}
 				av_frame_free(&last);
@@ -931,6 +989,7 @@ static DWORD WINAPI video_thread_main(void *arg)
 						texture = SDL_CreateTexture(renderer, show->format == AV_PIX_FMT_NV12 ? SDL_PIXELFORMAT_NV12 : SDL_PIXELFORMAT_IYUV,
 								SDL_TEXTUREACCESS_STREAMING, tex_w, tex_h);
 						SDL_RenderSetLogicalSize(renderer, tex_w, tex_h);
+						video_shape_set(window, &pic_shape, tex_w, tex_h);
 						CHIAKI_LOGI(&g.log, "Video: %dx%d, %s", tex_w, tex_h, f->hw_frames_ctx ? "hardware decoding" : "software decoding");
 					}
 					t0 = now_ms();
@@ -1034,6 +1093,8 @@ static DWORD WINAPI video_thread_main(void *arg)
 			config_set_int("video_w", win_w);
 			config_set_int("video_h", win_h);
 		}
+		if(video_hwnd)
+			RemoveWindowSubclass(video_hwnd, video_sizing_proc, 1);
 		SDL_DestroyWindow(window);
 	}
 	EnterCriticalSection(&g.sdl_lock);
