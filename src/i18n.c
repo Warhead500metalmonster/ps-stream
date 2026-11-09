@@ -232,6 +232,8 @@ static const wchar_t *const english[][2] = {
 	{ L"Ses kesiliyor. Wi-Fi sinyali zayıf (%%%ld); bilgisayarı modeme yaklaştırmak çok iyi gelir", L"Sound is cutting out. The Wi-Fi signal is weak (%ld%%); moving this PC closer to the router helps a lot" },
 	{ L"%%%ld, %ls GHz", L"%ld%%, %ls GHz" },
 	{ L"Kablolu", L"Wired" },
+	{ L"Modem Wi-Fi kanalını değiştirdi, bu an tüm cihazlarda internet kesilir. Modem ayarından kanalı 1, 6 veya 11'e sabitle", L"The router changed its Wi-Fi channel, cutting the internet on every device for a moment. Set channel 1, 6 or 11 in its settings" },
+	{ L"Modem Wi-Fi kanalını değiştirdi, bu an tüm cihazlarda internet kesilir. Modem ayarından kanalı sabitle", L"The router changed its Wi-Fi channel, cutting the internet on every device for a moment. Set a fixed channel in its settings" },
 };
 
 static bool lang_english;

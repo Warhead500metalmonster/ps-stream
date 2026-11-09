@@ -49,7 +49,7 @@
 
 // Below this rate we are outside what chiaki-ng offers, so a console that refuses to start
 // gets a second try with it.
-#define APP_VERSION "0.1.35"
+#define APP_VERSION "0.1.36"
 #define UPDATE_RECHECK_MS (6 * 60 * 60 * 1000)
 #define UPDATE_TRIES 6
 #define UPDATE_RETRY_MS 20000
@@ -190,6 +190,7 @@ static struct {
 	volatile LONG wifi_channel; // 0 when unknown or not on Wi-Fi
 	volatile LONG wifi_signal; // percent; WIFI_UNKNOWN when not measured, WIFI_NONE with no Wi-Fi connected
 	wchar_t wifi_5ghz[33]; // a saved 5 GHz network in reach while this PC sits on 2.4 GHz, guarded by lock
+	volatile LONG wifi_moved_at; // GetTickCount when the router moved its Wi-Fi to another channel mid-session, 0 for never
 	volatile LONG ended, connected, fatal, audio_reopen;
 	ChiakiQuitReason quit_reason;
 
@@ -1551,6 +1552,39 @@ static bool quit_reason_refused_stream(ChiakiQuitReason reason)
 #define WIFI_NONE -2
 #define WIFI_REFRESH_MS 10000
 
+static void config_read(const wchar_t *section, const char *key, char *buf, DWORD size);
+static void config_write(const wchar_t *section, const char *key, const char *value);
+
+// Routers left on "auto channel" move their Wi-Fi to another channel now and then, and every device
+// on it loses the connection for a few seconds up to a minute. That looks exactly like an app choking
+// the internet, so the log says when it happens. The last channel is kept, so a move while the app
+// was closed shows too. live: seen during a session, so it explains a dropout happening now.
+static void wifi_note_channel(const DOT11_MAC_ADDRESS bssid, ULONG channel, bool live)
+{
+	if(!channel)
+		return;
+	char ap[16], seen[32], before[32] = "";
+	snprintf(ap, sizeof(ap), "%02x%02x%02x%02x%02x%02x", bssid[0], bssid[1], bssid[2], bssid[3], bssid[4], bssid[5]);
+	snprintf(seen, sizeof(seen), "%s/%lu", ap, channel);
+	config_read(L"wifi", "router", before, sizeof(before));
+	if(strcmp(before, seen) == 0)
+		return;
+	config_write(L"wifi", "router", seen);
+	// Another router or access point is a different network, not a move
+	size_t ap_len = strlen(ap);
+	if(strncmp(before, ap, ap_len) != 0 || before[ap_len] != '/')
+		return;
+	if(live)
+	{
+		InterlockedExchange(&g.wifi_moved_at, (LONG)(GetTickCount() | 1));
+		CHIAKI_LOGW(&g.log, "The router moved its Wi-Fi from channel %s to %lu just now. Every device on it loses the connection for a moment when that happens",
+				before + ap_len + 1, channel);
+	}
+	else
+		CHIAKI_LOGW(&g.log, "The router moved its Wi-Fi from channel %s to %lu since the last connection. Every device on it loses the connection for a moment when that happens",
+				before + ap_len + 1, channel);
+}
+
 // Signal and channel of the Wi-Fi this PC is on. Measured once when connecting, it missed the signal
 // sinking mid-game, which on weak Wi-Fi is the first thing worth knowing about a dropout.
 static void wifi_read_link(void)
@@ -1571,6 +1605,8 @@ static void wifi_read_link(void)
 			signal = (LONG)link->wlanAssociationAttributes.wlanSignalQuality;
 		if(WlanQueryInterface(g.wlan, id, wlan_intf_opcode_channel_number, NULL, &size, (void **)&channel, NULL) == ERROR_SUCCESS && channel)
 			channel_number = (LONG)*channel;
+		if(link && channel)
+			wifi_note_channel(link->wlanAssociationAttributes.dot11Bssid, *channel, true);
 		if(link)
 			WlanFreeMemory(link);
 		if(channel)
@@ -1578,6 +1614,10 @@ static void wifi_read_link(void)
 		break;
 	}
 	WlanFreeMemory(list);
+	if(signal == WIFI_NONE && g.wifi_signal >= 0)
+		CHIAKI_LOGW(&g.log, "Wi-Fi connection lost");
+	else if(signal >= 0 && g.wifi_signal == WIFI_NONE)
+		CHIAKI_LOGI(&g.log, "Wi-Fi connection back, signal %ld%% on channel %ld", (long)signal, (long)channel_number);
 	g.wifi_signal = signal;
 	g.wifi_channel = channel_number;
 }
@@ -1676,6 +1716,8 @@ static void wifi_tune(bool on)
 		g.wifi_channel = have_channel ? (LONG)*channel : 0;
 		if(have_link)
 			g.wifi_signal = (LONG)link->wlanAssociationAttributes.wlanSignalQuality;
+		if(have_link && have_channel)
+			wifi_note_channel(link->wlanAssociationAttributes.dot11Bssid, *channel, false);
 		if(have_link && have_channel && *channel >= 1 && *channel <= 14)
 			wifi_find_5ghz(id, &link->wlanAssociationAttributes.dot11Ssid);
 		if(have_link)

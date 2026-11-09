@@ -16,6 +16,7 @@
 #define WEAK_LOST_FRAMES 30
 #define WEAK_DROPOUTS 3
 #define WEAK_REPEAT_MS 300000
+#define WIFI_MOVED_RECENT_MS 90000 // a router's channel move this recent explains a dropout
 // A test copy must never find, or be stopped by, the copy someone is using
 #ifdef PSSTREAM_TEST
 #define WINDOW_CLASS L"PSStreamTestWindow"
@@ -1745,7 +1746,14 @@ static void connection_watch(void)
 		EnterCriticalSection(&g.lock);
 		wcscpy(better, g.wifi_5ghz);
 		LeaveCriticalSection(&g.lock);
-		if(signal >= 0 && signal < WEAK_SIGNAL)
+		LONG moved_at = g.wifi_moved_at;
+		if(moved_at && GetTickCount() - (DWORD)moved_at < WIFI_MOVED_RECENT_MS)
+		{
+			// Neither distance nor band helps here: the router cut everyone off to change channel
+			set_status(slow_band ? L"Modem Wi-Fi kanalını değiştirdi, bu an tüm cihazlarda internet kesilir. Modem ayarından kanalı 1, 6 veya 11'e sabitle"
+					: L"Modem Wi-Fi kanalını değiştirdi, bu an tüm cihazlarda internet kesilir. Modem ayarından kanalı sabitle");
+		}
+		else if(signal >= 0 && signal < WEAK_SIGNAL)
 		{
 			// A fading signal is fixed by distance, whatever the band
 			wchar_t text[256];
