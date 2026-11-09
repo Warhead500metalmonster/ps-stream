@@ -49,7 +49,7 @@
 
 // Below this rate we are outside what chiaki-ng offers, so a console that refuses to start
 // gets a second try with it.
-#define APP_VERSION "0.1.34"
+#define APP_VERSION "0.1.35"
 #define UPDATE_RECHECK_MS (6 * 60 * 60 * 1000)
 #define UPDATE_TRIES 6
 #define UPDATE_RETRY_MS 20000
@@ -68,6 +68,9 @@
 #define PROBE_DELAY_MS 200
 #define PROBE_SLOW_DELAY_MS 5000
 #define PROBE_SLOW_AFTER_MS 300000
+// A resting PS5 answers the search at once, so without this the checks ran about 5 times a second,
+// each with a broadcast. Waking takes 10 s or more anyway.
+#define PROBE_STANDBY_DELAY_MS 1000
 // Asking every address on the network for the PS5 makes Windows send an ARP broadcast for each.
 // All 254 at once was a burst of hundreds of broadcasts, slow on Wi-Fi and seen as an attack by some
 // routers, which then cut the PC off. So the search asks a few at a time, starts only after the
@@ -2059,7 +2062,7 @@ static DWORD WINAPI worker_main(void *arg)
 					else
 						set_status(waited < RETRY_FAST_WINDOW_MS ? L"PS5'e bağlanılıyor..." : L"PS5'e ulaşılamıyor. Açık mı? Denemeye devam ediyorum");
 					waiting = true;
-					retry_at = GetTickCount() + (waited < PROBE_SLOW_AFTER_MS ? PROBE_DELAY_MS : PROBE_SLOW_DELAY_MS);
+					retry_at = GetTickCount() + (waited >= PROBE_SLOW_AFTER_MS ? PROBE_SLOW_DELAY_MS : g.ps5_standby ? PROBE_STANDBY_DELAY_MS : PROBE_DELAY_MS);
 					continue;
 				}
 				if(open)
