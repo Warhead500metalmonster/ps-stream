@@ -49,7 +49,7 @@
 
 // Below this rate we are outside what chiaki-ng offers, so a console that refuses to start
 // gets a second try with it.
-#define APP_VERSION "0.1.33"
+#define APP_VERSION "0.1.34"
 #define UPDATE_RECHECK_MS (6 * 60 * 60 * 1000)
 #define UPDATE_TRIES 6
 #define UPDATE_RETRY_MS 20000
@@ -68,7 +68,15 @@
 #define PROBE_DELAY_MS 200
 #define PROBE_SLOW_DELAY_MS 5000
 #define PROBE_SLOW_AFTER_MS 300000
-#define PROBES_PER_SWEEP 15
+// Asking every address on the network for the PS5 makes Windows send an ARP broadcast for each.
+// All 254 at once was a burst of hundreds of broadcasts, slow on Wi-Fi and seen as an attack by some
+// routers, which then cut the PC off. So the search asks a few at a time, starts only after the
+// usual ways failed for a while, and rests after asking them all.
+#define SWEEP_AFTER_PROBES 20
+#define SWEEP_REST_MS 600000
+#define SWEEP_SLOW_PER_ROUND 4
+#define SWEEP_FAST_PER_ROUND 8
+#define SWEEP_GAP_MS 10
 #define PROBE_TIMEOUT_MS 800
 #define PROBE_LONG_TIMEOUT_MS 3000
 #define PROBES_PER_LONG_WAIT 5
@@ -1679,9 +1687,14 @@ static void wifi_tune(bool on)
 	WlanFreeMemory(list);
 }
 
+static uint32_t sweep_next = 1; // next host part the sweep asks
+static DWORD sweep_done_at; // when the last full sweep ended, 0 before one has
+static bool sweep_ever_done;
+
 // Asks for the console on the known address first, then on the whole network, so a PS5 that got a
-// new address from the router is found again. Returns false if no PS5 answered.
-static bool ps5_search(const char *prefer, int rounds, bool sweep, char *ip, size_t ip_size, bool *standby, char *host_id, size_t host_id_size)
+// new address from the router is found again. sweep_per_round addresses of each network are also
+// asked one by one each round, 0 for none. Returns false if no PS5 answered.
+static bool ps5_search(const char *prefer, int rounds, int sweep_per_round, char *ip, size_t ip_size, bool *standby, char *host_id, size_t host_id_size)
 {
 	SOCKET s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
 	if(s == INVALID_SOCKET)
@@ -1718,22 +1731,26 @@ static bool ps5_search(const char *prefer, int rounds, bool sweep, char *ip, siz
 			sendto(s, msg, sizeof(msg) - 1, 0, (struct sockaddr *)&to, sizeof(to));
 		}
 		// Many routers drop broadcasts between Wi-Fi devices, but pass a message sent to one address
-		if(sweep && round % 5 == 0)
+		for(int k = 0; k < sweep_per_round; k++)
 		{
 			for(DWORD i = 0; i < table->dwNumEntries; i++)
 			{
 				uint32_t addr = ntohl(table->table[i].dwAddr);
 				if(!addr || (addr >> 24) == 127 || (addr >> 16) == 0xA9FE)
 					continue;
-				for(uint32_t host_part = 1; host_part < 255; host_part++)
-				{
-					struct sockaddr_in to = { 0 };
-					to.sin_family = AF_INET;
-					to.sin_port = htons(9302);
-					to.sin_addr.s_addr = htonl((addr & 0xFFFFFF00) | host_part);
-					sendto(s, msg, sizeof(msg) - 1, 0, (struct sockaddr *)&to, sizeof(to));
-				}
+				struct sockaddr_in to = { 0 };
+				to.sin_family = AF_INET;
+				to.sin_port = htons(9302);
+				to.sin_addr.s_addr = htonl((addr & 0xFFFFFF00) | sweep_next);
+				sendto(s, msg, sizeof(msg) - 1, 0, (struct sockaddr *)&to, sizeof(to));
 			}
+			if(++sweep_next == 255)
+			{
+				sweep_next = 1;
+				sweep_done_at = GetTickCount();
+				sweep_ever_done = true;
+			}
+			Sleep(SWEEP_GAP_MS);
 		}
 		// Read every answer of this round, so a second PS5 at home can't win over the known one
 		while(true)
@@ -1889,7 +1906,7 @@ static DWORD WINAPI worker_main(void *arg)
 				char host[256], ip[64] = "", id[16] = "";
 				bool standby = false;
 				host_get(host, sizeof(host));
-				if(ps5_search(host, 2, false, ip, sizeof(ip), &standby, id, sizeof(id)) && strcmp(ip, host) == 0 && id[0])
+				if(ps5_search(host, 2, 0, ip, sizeof(ip), &standby, id, sizeof(id)) && strcmp(ip, host) == 0 && id[0])
 				{
 					snprintf(g.host_id, sizeof(g.host_id), "%s", id);
 					config_set("host_id", id);
@@ -2003,7 +2020,8 @@ static DWORD WINAPI worker_main(void *arg)
 				if(!open)
 				{
 					char id[16] = "";
-					bool answered = ps5_search(host, 1, probes % PROBES_PER_SWEEP == 1, ip, sizeof(ip), &standby, id, sizeof(id));
+					bool sweep = probes >= SWEEP_AFTER_PROBES && (!sweep_ever_done || GetTickCount() - sweep_done_at >= SWEEP_REST_MS);
+					bool answered = ps5_search(host, 1, sweep ? SWEEP_SLOW_PER_ROUND : 0, ip, sizeof(ip), &standby, id, sizeof(id));
 					if(answered && strcmp(ip, host) != 0)
 					{
 						if(g.host_id[0] && id[0] && _stricmp(g.host_id, id) != 0)
@@ -2261,7 +2279,7 @@ static DWORD WINAPI find_ps5_thread(void *arg)
 		snprintf(ip, sizeof(ip), "%s", typed);
 	}
 	else
-		found = ps5_search(typed, 50, true, ip, sizeof(ip), &standby, NULL, 0);
+		found = ps5_search(typed, 50, SWEEP_FAST_PER_ROUND, ip, sizeof(ip), &standby, NULL, 0);
 	if(found)
 	{
 		SetDlgItemTextA(g.hwnd, ID_HOST, ip);
