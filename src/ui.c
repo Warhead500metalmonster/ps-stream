@@ -1719,16 +1719,23 @@ static void connection_watch(void)
 	if(now - ui.weak_checked_at < WEAK_WINDOW_MS)
 		return;
 	int lost = g.video_lost_total - ui.weak_lost, drops = g.audio_dropouts - ui.weak_drops;
-	LONG gap = InterlockedExchange(&g.audio_gap_max, 0);
+	LONG gap = InterlockedExchange(&g.audio_gap_max, 0), drained = InterlockedExchange(&g.audio_drained, 0);
+	LONG presses = InterlockedExchange(&g.pad_presses, 0);
 	LONG signal = g.wifi_signal, channel = g.wifi_channel;
 	char wifi[48] = "";
 	if(signal >= 0)
 		snprintf(wifi, sizeof(wifi), ", Wi-Fi signal %ld%% on channel %ld", (long)signal, (long)channel);
+	char caught_up[48] = "";
+	if(drained)
+		snprintf(caught_up, sizeof(caught_up), ", sound caught up by %ld ms", (long)drained * 10);
+	char pad[32] = "";
+	if(presses)
+		snprintf(pad, sizeof(pad), ", %ld gamepad presses", (long)presses);
 	// The longest wait between sounds tells Wi-Fi bursts apart from a PC that was too busy, and the
 	// signal tells a fading link apart from a crowded one
-	if(lost || drops || ui.loss_peak > 0)
-		CHIAKI_LOGI(&g.log, "Connection in the last %d s: %d lost frames, %d audio dropouts, packet loss peak %.0f%%, longest sound gap %ld ms%s%s",
-				WEAK_WINDOW_MS / 1000, lost, drops, ui.loss_peak * 100, (long)gap, wifi, IsWindowVisible(g.hwnd) && !IsIconic(g.hwnd) ? "" : ", window hidden");
+	if(lost || drops || ui.loss_peak > 0 || presses)
+		CHIAKI_LOGI(&g.log, "Connection in the last %d s: %d lost frames, %d audio dropouts, packet loss peak %.0f%%, longest sound gap %ld ms%s%s%s%s",
+				WEAK_WINDOW_MS / 1000, lost, drops, ui.loss_peak * 100, (long)gap, caught_up, pad, wifi, IsWindowVisible(g.hwnd) && !IsIconic(g.hwnd) ? "" : ", window hidden");
 	ui.loss_peak = 0;
 	ui.weak_lost = g.video_lost_total;
 	ui.weak_drops = g.audio_dropouts;

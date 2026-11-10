@@ -49,7 +49,7 @@
 
 // Below this rate we are outside what chiaki-ng offers, so a console that refuses to start
 // gets a second try with it.
-#define APP_VERSION "0.1.38"
+#define APP_VERSION "0.1.39"
 #define UPDATE_RECHECK_MS (6 * 60 * 60 * 1000)
 #define UPDATE_TRIES 6
 #define UPDATE_RETRY_MS 20000
@@ -97,6 +97,17 @@
 #define AUDIO_TARGET_MAX_MS 100
 #define AUDIO_TARGET_STEP_MS 10
 #define AUDIO_TARGET_DECAY_MS 60000
+// The PS5 sends sound in bursts for the first seconds of a stream: across real sessions, half of the
+// first dropouts came in the first 3 s. Until then the buffer is as large as the buffer setting, up to
+// 150 ms, with twice the setting before a backlog is thrown away.
+#define AUDIO_WARMUP_MS 8000
+#define AUDIO_WARMUP_TARGET_MS 150
+// Afterwards the extra backlog is played away by skipping a 10 ms piece of near silence now and then,
+// so the sound doesn't stay further behind the picture than it needs to
+#define AUDIO_DRAIN_SLACK_MS 20
+#define AUDIO_DRAIN_GAP_MS 100
+#define AUDIO_DRAIN_LOUD_GAP_MS 1000
+#define AUDIO_QUIET_PEAK 1000
 #define RECONNECT_MS 1500
 // The PS5 sends sound a hundred times a second, silence included. Nothing at all for this long means
 // it dropped the stream without saying so, and only a new connection brings it back.
@@ -203,6 +214,9 @@ static struct {
 	DWORD audio_last_dropout, connected_at;
 	volatile DWORD last_rx; // when the PS5 last sent sound or a picture
 	DWORD audio_rx_at; // when the last sound arrived, 0 at the start of a session
+	DWORD audio_first_at, audio_drained_at; // first sound of this session, last skipped piece
+	volatile LONG audio_drained; // 10 ms pieces skipped to catch up since the last connection report
+	volatile LONG pad_presses; // gamepad presses sent since the last connection report
 	volatile LONG audio_gap_max; // longest wait between two sounds since the last connection report
 	volatile LONG audio_dropouts, video_fps10, video_lost_total, ps5_standby;
 	char update_tag[32];
@@ -381,6 +395,8 @@ static void audio_frame_cb(int16_t *buf, size_t samples_count, void *user)
 		SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
 	}
 	DWORD arrived = GetTickCount();
+	if(!g.audio_rx_at)
+		g.audio_first_at = arrived;
 	if(g.audio_rx_at && (LONG)(arrived - g.audio_rx_at) > g.audio_gap_max)
 		g.audio_gap_max = (LONG)(arrived - g.audio_rx_at);
 	g.audio_rx_at = arrived;
@@ -430,7 +446,10 @@ static void audio_frame_cb(int16_t *buf, size_t samples_count, void *user)
 	// Two thirds leaves room for a burst before the backlog check below throws everything away.
 	// Real sessions on weak Wi-Fi kept dropping out at the old half.
 	int target_max = s.buffer_ms * 2 / 3 < AUDIO_TARGET_MAX_MS ? s.buffer_ms * 2 / 3 : AUDIO_TARGET_MAX_MS;
-	if(queued > (Uint32)s.buffer_ms * bytes_per_ms)
+	bool warming = now - g.audio_first_at < AUDIO_WARMUP_MS;
+	int target = warming ? (s.buffer_ms < AUDIO_WARMUP_TARGET_MS ? s.buffer_ms : AUDIO_WARMUP_TARGET_MS)
+		: g.audio_target_ms > target_max ? target_max : g.audio_target_ms;
+	if(queued > (Uint32)(warming ? 2 * s.buffer_ms : s.buffer_ms) * bytes_per_ms)
 	{
 		// Wi-Fi bursts pile up here; dropping the backlog keeps sound in sync with the TV
 		SDL_ClearQueuedAudio(g.audio_dev);
@@ -454,6 +473,22 @@ static void audio_frame_cb(int16_t *buf, size_t samples_count, void *user)
 	{
 		g.audio_target_ms -= AUDIO_TARGET_STEP_MS;
 		g.audio_last_dropout = now;
+	}
+	else if(!warming && !g.audio_waiting && queued > (Uint32)(target + AUDIO_DRAIN_SLACK_MS) * bytes_per_ms
+		&& now - g.audio_drained_at >= AUDIO_DRAIN_GAP_MS)
+	{
+		int peak = 0;
+		for(size_t i = 0; i < count && peak < AUDIO_QUIET_PEAK; i++)
+			peak = buf[i] > peak ? buf[i] : -buf[i] > peak ? -buf[i] : peak;
+		// A piece with sound in it goes only now and then, and the next one fades in so it doesn't click
+		if(peak < AUDIO_QUIET_PEAK || now - g.audio_drained_at >= AUDIO_DRAIN_LOUD_GAP_MS)
+		{
+			if(peak >= AUDIO_QUIET_PEAK)
+				g.audio_fade_pos = 0;
+			g.audio_drained_at = now;
+			InterlockedIncrement(&g.audio_drained);
+			return;
+		}
 	}
 	// Starting from silence on a loud sample makes a click, so ramp up over 10 ms
 	int fade_frames = g.audio_rate / 100;
@@ -479,7 +514,7 @@ static void audio_frame_cb(int16_t *buf, size_t samples_count, void *user)
 				buf[frame * g.audio_channels + c] = (int16_t)(buf[frame * g.audio_channels + c] * g.audio_fade_pos / fade_frames);
 	}
 	SDL_QueueAudio(g.audio_dev, buf, (Uint32)(count * sizeof(int16_t)));
-	if(g.audio_waiting && SDL_GetQueuedAudioSize(g.audio_dev) >= (Uint32)(g.audio_target_ms < target_max ? g.audio_target_ms : target_max) * bytes_per_ms)
+	if(g.audio_waiting && SDL_GetQueuedAudioSize(g.audio_dev) >= (Uint32)target * bytes_per_ms)
 	{
 		SDL_PauseAudioDevice(g.audio_dev, 0);
 		g.audio_waiting = false;
@@ -914,6 +949,16 @@ static DWORD WINAPI video_thread_main(void *arg)
 			{
 				if(e.type == SDL_QUIT)
 					PostMessageW(g.hwnd, WM_APP_VIDEO_CLOSED, 0, 0);
+				else if(e.type == SDL_WINDOWEVENT && e.window.event == SDL_WINDOWEVENT_MAXIMIZED && !fullscreen)
+				{
+					// A maximized window is never 16:9 with the taskbar and title bar taking room, so the
+					// picture had bars at the sides. Maximize goes full screen instead; F11 or Esc comes back.
+					SDL_RestoreWindow(window);
+					fullscreen = true;
+					SDL_SetWindowFullscreen(window, SDL_WINDOW_FULLSCREEN_DESKTOP);
+					CHIAKI_LOGI(&g.log, "Video window maximized, going full screen");
+					dirty = true;
+				}
 				else if(e.type == SDL_WINDOWEVENT || e.type == SDL_RENDER_TARGETS_RESET)
 					dirty = true;
 				else if(e.type == SDL_RENDER_DEVICE_RESET)
@@ -1436,14 +1481,35 @@ static DWORD WINAPI gamepad_main(void *arg)
 					SDL_GameControllerRumble(pads[i], (Uint16)(g.rumble_left * 257), (Uint16)(g.rumble_right * 257), PAD_RUMBLE_MS);
 
 		// The session can end at any moment, and the library rejects a repeat of the same state itself
-		bool live = false;
+		bool live = false, sender = false;
 		EnterCriticalSection(&g.pad_lock);
 		if(g.session_live && g.connected)
 		{
 			chiaki_session_set_controller_state(&g.session, &state);
 			live = true;
+			sender = g.session.stream_connection.feedback_sender_active;
 		}
 		LeaveCriticalSection(&g.pad_lock);
+		// Says once a session where a press went, so a pad that "does nothing" can be told apart from
+		// one the PS5 never heard about
+		static bool told;
+		static uint32_t last_buttons;
+		bool pressed = state.buttons & ~last_buttons;
+		last_buttons = state.buttons;
+		if(!live)
+			told = false;
+		else if(pressed && name[0])
+		{
+			InterlockedIncrement(&g.pad_presses);
+			if(!told)
+			{
+				told = true;
+				if(sender)
+					CHIAKI_LOGI(&g.log, "Gamepad press sent to the PS5 (buttons %#x)", (unsigned)state.buttons);
+				else
+					CHIAKI_LOGW(&g.log, "Gamepad press not sent: this connection has no controller on the PS5");
+			}
+		}
 		SDL_Delay(live ? PAD_POLL_MS : PAD_IDLE_POLL_MS);
 	}
 	for(int i = 0; i < PAD_MAX; i++)
