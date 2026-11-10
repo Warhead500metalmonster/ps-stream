@@ -65,6 +65,12 @@ jobs:
         # Also writes THIRD-PARTY-NOTICES.txt for the zip
         run: ./build.sh
 
+      # sdl2-compat shows a message box when SDL3.dll is missing, which would hang here, hence the limit
+      - name: Check the package starts
+        shell: pwsh
+        timeout-minutes: 3
+        run: python -I scripts/check_dist.py dist
+
       - name: Package
         run: python -I scripts/package.py "v${{ steps.version.outputs.version }}"
 
