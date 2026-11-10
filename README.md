@@ -10,7 +10,18 @@
 </p>
 
 <p align="center">
-  <a href="../../releases/latest"><b>Download for Windows</b></a>
+  <a href="../../releases/latest"><img alt="Latest release" src="https://img.shields.io/github/v/release/Warhead500metalmonster/ps-stream?style=flat-square&label=release&color=0070d1"></a>
+  <a href="../../releases"><img alt="Downloads" src="https://img.shields.io/github/downloads/Warhead500metalmonster/ps-stream/total?style=flat-square&color=0070d1"></a>
+  <a href="../../actions/workflows/release.yml"><img alt="Build" src="https://img.shields.io/github/actions/workflow/status/Warhead500metalmonster/ps-stream/release.yml?branch=main&style=flat-square&label=build"></a>
+  <img alt="Windows 10 and 11" src="https://img.shields.io/badge/Windows-10%20%7C%2011-555?style=flat-square">
+  <a href="LICENSE"><img alt="License: AGPL-3.0" src="https://img.shields.io/badge/license-AGPL--3.0-555?style=flat-square"></a>
+</p>
+
+<p align="center">
+  <a href="../../releases/latest"><b>⬇ Download for Windows</b></a>
+  &nbsp;·&nbsp; <a href="#getting-started">Getting started</a>
+  &nbsp;·&nbsp; <a href="#features">Features</a>
+  &nbsp;·&nbsp; <a href="#legal">Legal</a>
 </p>
 
 ![PS Stream with audio on](docs/play.png)
@@ -22,9 +33,9 @@ If you play on a TV and use Discord on your PC, the usual way to get game audio 
 ## Features
 
 - **Audio-only mode.** Video isn't decoded, and the PS5 is asked for the smallest stream.
-- **Video on demand.** Turn video on when you want to stream to Discord, and pick the "PS Stream - Video" window there. Press `F11` in that window for full screen. Turning video on or off reconnects, which takes about 8 seconds because the PS5 needs that long to let go of the old connection. The app opens the way you left it, so starting with video doesn't cost that wait.
+- **Video on demand.** Turn video on when you want to stream to Discord, and pick the "PS Stream - Video" window there. Press `F11` in that window, or maximize it, for full screen. Turning video on or off reconnects, which takes about 8 seconds because the PS5 needs that long to let go of the old connection. The app opens the way you left it, so starting with video doesn't cost that wait.
 - **Simple by default.** Two big buttons, an **Audio only** choice, and five quality presets from 360p at 0.5 Mbps to 1080p 60 FPS at 50 Mbps. To set resolution, frame rate, bitrate and codec yourself, use **Custom** or **Advanced settings**.
-- **Built for weak Wi-Fi.** Pauses Windows' background Wi-Fi scans while connected, uses an audio buffer that adapts to jitter, and keeps your PC awake. On lossy Wi-Fi it keeps resending what got lost, asks the PS5 again for a fresh picture when one is lost on the way, and reconnects by itself if the stream goes silent for 15 seconds. On 2.4 GHz, the weak-connection warning names a 5 GHz network your PC already knows, if one is in reach.
+- **Built for weak Wi-Fi.** Pauses Windows' background Wi-Fi scans while connected, uses an audio buffer that adapts to jitter and starts larger to ride out the bursty first seconds of a stream, and keeps your PC awake. On lossy Wi-Fi it keeps resending what got lost, asks the PS5 again for a fresh picture when one is lost on the way, and reconnects by itself if the stream goes silent for 15 seconds. On 2.4 GHz, the weak-connection warning names a 5 GHz network your PC already knows, if one is in reach.
 - **Audio controls.** Choose the output device and maximum delay, and change the volume right on the Play page.
 - **Live connection numbers.** Press **Details** to see connection time, ping, audio dropouts, video frame rate and lost frames.
 - **Connects by itself.** Checks for the PS5 about once a second and connects as soon as it answers. If the PS5 is in rest mode, the app sends it a wake-up signal. You can turn that off with **Wake PS5** in Settings. It also finds the console again if the router gives it a new address.
@@ -100,10 +111,39 @@ pacman -S --needed make mingw-w64-x86_64-gcc mingw-w64-x86_64-cmake mingw-w64-x8
 
 With [Git](https://git-scm.com/) on your `PATH`, run `build.cmd`. It downloads chiaki-ng v1.10.0, applies `patches/chiaki-ps-stream.patch` and builds the app.
 
-## Credits and license
+Releases are built by GitHub Actions from the code in this repository ([`.github/workflows/release.yml`](.github/workflows/release.yml)). Every push is built to check that it compiles, and pushing a tag such as `v0.1.40` publishes that version. The tag has to match `APP_VERSION` in `src/main.c`, and `release-notes/v0.1.40.md` has to exist.
+
+## Credits
 
 PS Stream is built on [chiaki-ng](https://github.com/chiaki-ng/chiaki-ng)'s Remote Play library. It also uses SDL2, FFmpeg, Opus, OpenSSL, curl and json-c.
 
-Licensed under the [GNU AGPL v3 with the OpenSSL exception](LICENSE), the same license as chiaki-ng.
+## Legal
 
-PS Stream isn't affiliated with or endorsed by Sony Interactive Entertainment. PlayStation, PS5 and DualSense are trademarks of Sony Interactive Entertainment Inc.
+### License
+
+PS Stream is free software under the [GNU Affero General Public License v3 with the OpenSSL exception](LICENSE), the same license as chiaki-ng. You may use, study, share and change it. If you share a changed version, or run one for others over a network, you have to offer its source code under the same license.
+
+### No warranty
+
+PS Stream is provided "as is", without any warranty, to the extent the law allows. The authors aren't liable for any damage or loss from using it. Sections 15 and 16 of the [license](LICENSE) have the full terms.
+
+### Trademarks
+
+PS Stream is an independent, unofficial project. It isn't affiliated with, endorsed, sponsored or approved by Sony Interactive Entertainment. PlayStation, PS5, PlayStation Network, Remote Play and DualSense are trademarks or registered trademarks of Sony Interactive Entertainment Inc. Xbox is a trademark of Microsoft Corporation. Other names belong to their owners and are used only to describe compatibility.
+
+### PlayStation Network terms
+
+Using an unofficial client may go against the PlayStation Network Terms of Service. You're responsible for how you use your account. See [Is it safe for my account?](#is-it-safe-for-my-account)
+
+### Privacy
+
+PS Stream has no analytics, ads or tracking, and doesn't collect any data about you.
+
+- **Your PS5:** the app talks to your console over your local network only.
+- **Sony:** when you pair, you sign in on Sony's own page in your browser, and your password goes only to Sony. To catch Sony's redirect address, the app looks at your browser's address bar and the clipboard until pairing finishes, and at nothing else. Sony returns your account ID, which the app keeps to connect.
+- **GitHub:** the app asks GitHub for the latest version number and downloads updates from it. GitHub sees your IP address, like any website. No account or console data is sent.
+- **On your PC:** the PS5 address, your account ID, the pairing keys, your settings and a log are stored in `%APPDATA%\PSStream`. They never leave your PC. Delete that folder to remove them.
+
+### Third-party software
+
+The download includes libraries under their own licenses, among them FFmpeg (GPL), SDL2 (zlib), OpenSSL (Apache 2.0), Opus (BSD), curl (curl license) and json-c (MIT). `THIRD-PARTY-NOTICES.txt` in the download lists each one with its version, license and full license text, and says where to get the source code.

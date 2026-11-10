@@ -24,4 +24,6 @@ cp "$BUILD/ps-stream.exe" "$DIST/PS Stream.exe"
 ldd "$BUILD/ps-stream.exe" | awk '$3 ~ /mingw64/ {print $3}' | sort -u | xargs -I{} cp {} "$DIST/"
 (cd "$SRC/src" && windres launcher.rc -O coff -o "$BUILD/launcher.o")
 gcc -O2 -municode -mwindows -static "$SRC/src/launcher.c" "$BUILD/launcher.o" -o "$SRC/PS Stream.exe"
+# The download zip carries the licenses of the libraries in dist
+bash "$SRC/scripts/third_party_notices.sh" "$CHIAKI"
 echo "Hazir: $SRC/PS Stream.exe"

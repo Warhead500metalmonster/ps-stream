@@ -8,6 +8,8 @@ out = os.path.join(root, 'release', f'PS-Stream-{version}-windows-x64.zip')
 with zipfile.ZipFile(out, 'w', zipfile.ZIP_DEFLATED, compresslevel=9) as z:
     z.write(os.path.join(root, 'PS Stream.exe'), 'PS Stream/PS Stream.exe')
     z.write(os.path.join(root, 'LICENSE'), 'PS Stream/LICENSE.txt')
+    # Written by scripts/third_party_notices.sh; the zip ships libraries whose licenses ask for this
+    z.write(os.path.join(root, 'THIRD-PARTY-NOTICES.txt'), 'PS Stream/THIRD-PARTY-NOTICES.txt')
     for name in sorted(os.listdir(os.path.join(root, 'dist'))):
         z.write(os.path.join(root, 'dist', name), f'PS Stream/dist/{name}')
 print(out)
