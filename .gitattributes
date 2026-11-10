@@ -1,0 +1,4 @@
+# Git for Windows turns LF into CRLF on checkout by default. The patch has to stay byte for byte as
+# it is to apply to chiaki-ng, and the shell scripts run under bash.
+*.patch -text
+*.sh text eol=lf
