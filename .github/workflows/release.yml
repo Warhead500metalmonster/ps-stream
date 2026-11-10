@@ -1,0 +1,94 @@
+# Builds PS Stream on GitHub, so every release comes from the code in this repo, built the same way.
+#
+# Every push to main and every pull request is built to check that it compiles.
+# Pushing a tag like v0.1.40 also publishes it: the tag must match APP_VERSION in src/main.c, and
+# release-notes/v0.1.40.md must exist. A tag can only be pushed once, so two people can't publish
+# the same version number.
+name: Build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - uses: msys2/setup-msys2@ec48f7c5447b3140e2b088413ae3a55687bccb6e # v2.33.0
+        with:
+          msystem: MINGW64
+          update: true
+          install: >-
+            git make
+            mingw-w64-x86_64-gcc mingw-w64-x86_64-cmake mingw-w64-x86_64-ninja mingw-w64-x86_64-pkgconf
+            mingw-w64-x86_64-curl mingw-w64-x86_64-json-c mingw-w64-x86_64-libevent mingw-w64-x86_64-miniupnpc
+            mingw-w64-x86_64-openssl mingw-w64-x86_64-opus mingw-w64-x86_64-protobuf mingw-w64-x86_64-python
+            mingw-w64-x86_64-python-protobuf mingw-w64-x86_64-SDL2 mingw-w64-x86_64-ffmpeg mingw-w64-x86_64-speexdsp
+
+      - name: Check the version
+        id: version
+        run: |
+          version=$(sed -n 's/^#define APP_VERSION "\(.*\)"$/\1/p' src/main.c)
+          echo "App version: $version"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            tag="${GITHUB_REF#refs/tags/}"
+            [ "$tag" = "v$version" ] || { echo "::error::Tag $tag doesn't match APP_VERSION $version in src/main.c"; exit 1; }
+            [ -s "release-notes/$tag.md" ] || { echo "::error::release-notes/$tag.md is missing"; exit 1; }
+          fi
+
+      - name: Build
+        # Also writes THIRD-PARTY-NOTICES.txt for the zip
+        run: ./build.sh
+
+      - name: Package
+        run: python -I scripts/package.py "v${{ steps.version.outputs.version }}"
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: PS-Stream-v${{ steps.version.outputs.version }}-windows-x64
+          path: release/PS-Stream-v${{ steps.version.outputs.version }}-windows-x64.zip
+          if-no-files-found: error
+
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          path: out
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="${GITHUB_REF#refs/tags/}"
+          zip=$(find out -name "PS-Stream-$tag-windows-x64.zip")
+          [ -n "$zip" ] || { echo "::error::The zip wasn't built"; exit 1; }
+          sha256sum "$zip"
+          gh release create "$tag" "$zip" --title "PS Stream $tag" --notes-file "release-notes/$tag.md" --latest
+          # The app only installs a file whose checksum GitHub lists, so check it's there and right
+          want=$(sha256sum "$zip" | cut -d' ' -f1)
+          got=$(gh release view "$tag" --json assets --jq '.assets[0].digest')
+          echo "GitHub lists $got"
+          [ "$got" = "sha256:$want" ] || { echo "::error::Checksum on GitHub doesn't match the zip"; exit 1; }
