@@ -26,4 +26,14 @@ for name, flag, needed in (('video', 0x20, True), ('gamepad', 0x2000, True), ('a
     print(f'SDL {name}:', 'ok' if started else 'failed, ' + sdl.SDL_GetError().decode(errors='replace'))
     ok = ok and (started or not needed)
 sdl.SDL_Quit()
+# Unsigned files without these details were taken for a trojan by Defender's machine-learning check
+import ctypes.wintypes as wt
+for exe in (os.path.join(dist, 'PS Stream.exe'), os.path.join(os.path.dirname(dist), 'PS Stream.exe')):
+    size = ctypes.windll.version.GetFileVersionInfoSizeW(exe, None)
+    info = ctypes.create_string_buffer(max(size, 1))
+    text = ctypes.c_void_p(); length = wt.UINT()
+    found = size and ctypes.windll.version.GetFileVersionInfoW(exe, 0, size, info) and \
+        ctypes.windll.version.VerQueryValueW(info, r'\StringFileInfo\040904b0\FileVersion', ctypes.byref(text), ctypes.byref(length))
+    print(exe, 'version', ctypes.wstring_at(text, length.value - 1) if found else 'MISSING')
+    ok = ok and bool(found)
 sys.exit(0 if ok else 1)

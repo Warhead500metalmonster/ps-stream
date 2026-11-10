@@ -97,6 +97,18 @@ If the new version doesn't start, the old files go back and the old version keep
 - 360p is the lowest resolution. A PS5 refused 144p when tested.
 - Rates below 2 Mbps are outside what chiaki-ng offers. If the console refuses one, the app falls back to 2 Mbps.
 
+## Windows Defender says it's a trojan
+
+PS Stream isn't signed, because a code-signing certificate costs money every year. Microsoft Defender sometimes guesses that a new unsigned program is harmful and reports it as something like `Trojan:Win32/Bearfoos.A!ml`. The `!ml` at the end means the guess came from machine learning, not from finding known malware. Every release is built on GitHub from the code in this repository, which you can read, and the app checks every update against the checksum GitHub lists before installing it.
+
+If Defender removes `PS Stream.exe`:
+
+1. Open **Windows Security > Virus & threat protection > Protection history**.
+2. Open the PS Stream entry, choose **Actions**, then **Restore** (or **Allow on device**).
+3. If the app still doesn't start, download the latest zip from [Releases](../../releases/latest) and extract it over the old folder. Your pairing and settings stay.
+
+To help others, you can report the file as safe at [Microsoft's submission page](https://www.microsoft.com/en-us/wdsi/filesubmission): choose **Home customer**, then **Incorrectly detected as malware/malicious**.
+
 ## Is it safe for my account?
 
 This is an unofficial client, and Sony doesn't support it. It connects the same way as other open-source Remote Play clients such as chiaki-ng, and it doesn't modify your console or games. I don't know of any account bans caused by this, but I can't promise there is no risk, and using unofficial clients may conflict with PlayStation Network's terms. Use it at your own risk.

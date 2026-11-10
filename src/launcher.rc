@@ -1,1 +1,5 @@
 1 ICON "app.ico"
+
+#define PS_FILE_DESCRIPTION "PS Stream launcher"
+#define PS_FILE_NAME "PS Stream.exe"
+#include "version.rc"

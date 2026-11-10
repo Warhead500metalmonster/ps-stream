@@ -28,7 +28,9 @@ if grep -q "SDL3" "$DIST/SDL2.dll"; then
 	echo "SDL2.dll is sdl2-compat, which needs SDL3.dll. Install the real SDL2 2.32.10 (see .github/workflows/release.yml)." >&2
 	exit 1
 fi
-(cd "$SRC/src" && windres launcher.rc -O coff -o "$BUILD/launcher.o")
+VERSION=$(sed -n 's/^#define APP_VERSION "\([0-9]*\.[0-9]*\.[0-9]*\)"$/\1/p' "$SRC/src/main.c")
+IFS=. read -r V1 V2 V3 <<< "$VERSION"
+(cd "$SRC/src" && windres -DPSV_MAJOR=$V1 -DPSV_MINOR=$V2 -DPSV_PATCH=$V3 launcher.rc -O coff -o "$BUILD/launcher.o")
 gcc -O2 -municode -mwindows -static "$SRC/src/launcher.c" "$BUILD/launcher.o" -o "$SRC/PS Stream.exe"
 # The download zip carries the licenses of the libraries in dist
 bash "$SRC/scripts/third_party_notices.sh" "$CHIAKI"

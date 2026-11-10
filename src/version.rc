@@ -1,0 +1,38 @@
+// Who made the file and which version it is, shown under Properties > Details. An exe without this,
+// unsigned and new, was taken for a trojan by Microsoft Defender's machine-learning check.
+// PSV_MAJOR, PSV_MINOR and PSV_PATCH come from APP_VERSION in main.c, through the build. The text
+// form is made here, since quotes get lost on the way from CMake to windres.
+#include <winver.h>
+#define PSV_TEXT_(x) #x
+#define PSV_TEXT(x) PSV_TEXT_(x)
+#define PSV_STRING PSV_TEXT(PSV_MAJOR.PSV_MINOR.PSV_PATCH)
+
+VS_VERSION_INFO VERSIONINFO
+FILEVERSION PSV_MAJOR, PSV_MINOR, PSV_PATCH, 0
+PRODUCTVERSION PSV_MAJOR, PSV_MINOR, PSV_PATCH, 0
+FILEFLAGSMASK VS_FFI_FILEFLAGSMASK
+FILEFLAGS 0
+FILEOS VOS_NT_WINDOWS32
+FILETYPE VFT_APP
+FILESUBTYPE VFT2_UNKNOWN
+BEGIN
+	BLOCK "StringFileInfo"
+	BEGIN
+		BLOCK "040904b0"
+		BEGIN
+			VALUE "CompanyName", "PS Stream contributors"
+			VALUE "FileDescription", PS_FILE_DESCRIPTION
+			VALUE "FileVersion", PSV_STRING
+			VALUE "InternalName", PS_FILE_NAME
+			VALUE "OriginalFilename", PS_FILE_NAME
+			VALUE "ProductName", "PS Stream"
+			VALUE "ProductVersion", PSV_STRING
+			VALUE "LegalCopyright", "Free software under the GNU AGPL v3"
+			VALUE "Comments", "Unofficial PS5 Remote Play client built on chiaki-ng. Source: https://github.com/Warhead500metalmonster/ps-stream"
+		END
+	END
+	BLOCK "VarFileInfo"
+	BEGIN
+		VALUE "Translation", 0x409, 1200
+	END
+END
