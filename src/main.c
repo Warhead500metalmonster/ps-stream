@@ -49,7 +49,7 @@
 
 // Below this rate we are outside what chiaki-ng offers, so a console that refuses to start
 // gets a second try with it.
-#define APP_VERSION "0.1.40"
+#define APP_VERSION "0.1.41"
 #define UPDATE_RECHECK_MS (6 * 60 * 60 * 1000)
 #define UPDATE_TRIES 6
 #define UPDATE_RETRY_MS 20000
@@ -92,11 +92,16 @@
 #define SAFE_KBPS 2000
 #define RES_MIN 1
 #define RETRY_MS 5000
-// Audio waits for this much backlog before playing; each dropout raises it, quiet minutes lower it
+// Audio waits for this much backlog before playing; each dropout raises it, quiet minutes lower it.
+// Real sessions had sound arrive with 150 to 300 ms gaps and no loss at all, several times a minute,
+// and a buffer held to 100 ms dropped out at every one. Up to 300 ms covers most of them; on Wi-Fi
+// that doesn't need it, the buffer stays small.
 #define AUDIO_TARGET_MIN_MS 30
-#define AUDIO_TARGET_MAX_MS 100
+#define AUDIO_TARGET_MAX_MS 300
 #define AUDIO_TARGET_STEP_MS 10
 #define AUDIO_TARGET_DECAY_MS 60000
+// The "Max delay" setting: a backlog past it is thrown away, and the buffer grows to two thirds of it
+#define AUDIO_BUFFER_DEFAULT_MS 400
 // The PS5 sends sound in bursts for the first seconds of a stream: across real sessions, half of the
 // first dropouts came in the first 3 s. Until then the buffer is as large as the buffer setting, up to
 // 150 ms, with twice the setting before a backlog is thrown away.
@@ -397,6 +402,7 @@ static void audio_frame_cb(int16_t *buf, size_t samples_count, void *user)
 	DWORD arrived = GetTickCount();
 	if(!g.audio_rx_at)
 		g.audio_first_at = arrived;
+	LONG gap = g.audio_rx_at ? (LONG)(arrived - g.audio_rx_at) : 0;
 	if(g.audio_rx_at && (LONG)(arrived - g.audio_rx_at) > g.audio_gap_max)
 		g.audio_gap_max = (LONG)(arrived - g.audio_rx_at);
 	g.audio_rx_at = arrived;
@@ -447,8 +453,9 @@ static void audio_frame_cb(int16_t *buf, size_t samples_count, void *user)
 	// Real sessions on weak Wi-Fi kept dropping out at the old half.
 	int target_max = s.buffer_ms * 2 / 3 < AUDIO_TARGET_MAX_MS ? s.buffer_ms * 2 / 3 : AUDIO_TARGET_MAX_MS;
 	bool warming = now - g.audio_first_at < AUDIO_WARMUP_MS;
-	int target = warming ? (s.buffer_ms < AUDIO_WARMUP_TARGET_MS ? s.buffer_ms : AUDIO_WARMUP_TARGET_MS)
-		: g.audio_target_ms > target_max ? target_max : g.audio_target_ms;
+	int learned = g.audio_target_ms > target_max ? target_max : g.audio_target_ms;
+	int warm = s.buffer_ms < AUDIO_WARMUP_TARGET_MS ? s.buffer_ms : AUDIO_WARMUP_TARGET_MS;
+	int target = warming && warm > learned ? warm : learned;
 	if(queued > (Uint32)(warming ? 2 * s.buffer_ms : s.buffer_ms) * bytes_per_ms)
 	{
 		// Wi-Fi bursts pile up here; dropping the backlog keeps sound in sync with the TV
@@ -465,8 +472,12 @@ static void audio_frame_cb(int16_t *buf, size_t samples_count, void *user)
 		InterlockedIncrement(&g.audio_dropouts);
 		if(g.audio_target_ms < target_max)
 		{
-			g.audio_target_ms += AUDIO_TARGET_STEP_MS;
-			CHIAKI_LOGI(&g.log, "Audio dropout, buffer now %d ms", g.audio_target_ms);
+			// Straight to the gap that just ran it dry, instead of one small step per dropout
+			int grown = g.audio_target_ms + AUDIO_TARGET_STEP_MS;
+			if(gap > grown)
+				grown = (int)gap;
+			g.audio_target_ms = grown < target_max ? grown : target_max;
+			CHIAKI_LOGI(&g.log, "Audio dropout after a %ld ms gap, buffer now %d ms", (long)gap, g.audio_target_ms);
 		}
 	}
 	else if(now - g.audio_last_dropout > AUDIO_TARGET_DECAY_MS && g.audio_target_ms > AUDIO_TARGET_MIN_MS)
@@ -2411,7 +2422,16 @@ static void config_load(void)
 	s->hw = config_int("hw", 1, 0, 1);
 	s->ao_kbps = config_int("ao_kbps", 500, 100, 2000);
 	s->volume = config_int("volume", 100, 0, 200);
-	s->buffer_ms = config_int("buffer_ms", 150, 40, 500);
+	s->buffer_ms = config_int("buffer_ms", AUDIO_BUFFER_DEFAULT_MS, 40, 500);
+	// Up to v0.1.40 the buffer never passed 100 ms whatever this was set to, so the old default of
+	// 150 moves to the new one once. A value someone picked themselves stays.
+	if(config_int("buffer_v", 0, 0, 9) < 1)
+	{
+		if(s->buffer_ms == 150)
+			s->buffer_ms = AUDIO_BUFFER_DEFAULT_MS;
+		config_set_int("buffer_ms", s->buffer_ms);
+		config_set_int("buffer_v", 1);
+	}
 	// Starting at the smallest buffer meant crackling for the first seconds of every session until it
 	// grew back. One step under what the last session needed lets it shrink again if the link got better.
 	int learned = config_int("audio_target", 0, AUDIO_TARGET_MIN_MS, AUDIO_TARGET_MAX_MS);
@@ -2763,7 +2783,23 @@ static void update_begin(void);
 
 static void update_auto(void)
 {
-	if(!g.update_ready || g.update_busy || !update_available_here() || config_int("update_fails", 0, 0, 100) >= UPDATE_AUTO_MAX_FAILS)
+	if(!g.update_ready || g.update_busy || !update_available_here())
+		return;
+	// The limit on failed tries is for the version that failed. After v0.1.39 couldn't start, v0.1.40
+	// had to be installed by hand, because the count stood in the way of every version after it.
+	static char checked_tag[32];
+	if(strcmp(checked_tag, g.update_tag) != 0)
+	{
+		snprintf(checked_tag, sizeof(checked_tag), "%s", g.update_tag);
+		char tried[32] = "";
+		config_read(L"settings", "update_tried", tried, sizeof(tried));
+		if(strcmp(tried, g.update_tag) != 0 && config_int("update_fails", 0, 0, 100))
+		{
+			CHIAKI_LOGI(&g.log, "%s didn't install before, %s gets its own tries", tried[0] ? tried : "An update", g.update_tag);
+			config_set_int("update_fails", 0);
+		}
+	}
+	if(config_int("update_fails", 0, 0, 100) >= UPDATE_AUTO_MAX_FAILS)
 		return;
 	// Just updated and still not the newest means the release itself is wrong. Installing it again
 	// would loop, so this counts as a failed try instead.
@@ -2866,6 +2902,7 @@ static void update_begin(void)
 	if(InterlockedExchange(&g.update_busy, 1))
 		return;
 	g.update_percent = 0;
+	config_write(L"settings", "update_tried", g.update_tag);
 	set_status(L"Güncelleme indiriliyor...");
 	CloseHandle(CreateThread(NULL, 0, update_download_main, NULL, 0, NULL));
 }
