@@ -49,7 +49,7 @@
 
 // Below this rate we are outside what chiaki-ng offers, so a console that refuses to start
 // gets a second try with it.
-#define APP_VERSION "0.1.42"
+#define APP_VERSION "0.1.43"
 #define UPDATE_RECHECK_MS (6 * 60 * 60 * 1000)
 #define UPDATE_TRIES 6
 #define UPDATE_RETRY_MS 20000
@@ -214,7 +214,7 @@ static struct {
 	ChiakiOpusDecoder opus;
 	SDL_AudioDeviceID audio_dev;
 	uint32_t audio_channels, audio_rate;
-	bool audio_waiting;
+	bool audio_waiting, audio_trimming;
 	int audio_target_ms;
 	DWORD audio_last_dropout, connected_at;
 	volatile DWORD last_rx; // when the PS5 last sent sound or a picture
@@ -458,10 +458,26 @@ static void audio_frame_cb(int16_t *buf, size_t samples_count, void *user)
 	int target = warming && warm > learned ? warm : learned;
 	if(queued > (Uint32)(warming ? 2 * s.buffer_ms : s.buffer_ms) * bytes_per_ms)
 	{
-		// Wi-Fi bursts pile up here; dropping the backlog keeps sound in sync with the TV
-		SDL_ClearQueuedAudio(g.audio_dev);
-		SDL_PauseAudioDevice(g.audio_dev, 1);
-		g.audio_waiting = true;
+		// Wi-Fi bursts pile up here, after a gap: everything held back arrives at once. Throwing the
+		// whole backlog away and refilling cost a second silence right after the gap's own. The sound
+		// that's queued plays on instead, and what arrives is left out until the backlog is back down.
+		if(g.audio_waiting)
+			SDL_ClearQueuedAudio(g.audio_dev);
+		else if(!g.audio_trimming)
+		{
+			g.audio_trimming = true;
+			CHIAKI_LOGI(&g.log, "Audio backlog of %u ms after a burst, trimming to %d ms", (unsigned)(queued / bytes_per_ms), target);
+		}
+	}
+	if(g.audio_trimming)
+	{
+		if(!g.audio_waiting && queued > (Uint32)target * bytes_per_ms)
+		{
+			InterlockedIncrement(&g.audio_drained);
+			return;
+		}
+		g.audio_trimming = false;
+		g.audio_fade_pos = 0; // the sound jumps ahead here, so ramp in
 	}
 	else if(!g.audio_waiting && queued == 0)
 	{
