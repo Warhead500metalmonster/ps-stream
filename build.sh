@@ -22,6 +22,12 @@ DIST="$SRC/dist"
 mkdir -p "$DIST"
 cp "$BUILD/ps-stream.exe" "$DIST/PS Stream.exe"
 ldd "$BUILD/ps-stream.exe" | awk '$3 ~ /mingw64/ {print $3}' | sort -u | xargs -I{} cp {} "$DIST/"
+# sdl2-compat is an SDL2.dll that loads SDL3.dll only when the app starts, so ldd can't see that it's
+# missing; v0.1.39 shipped it and never started. Only the real SDL2 goes out.
+if grep -q "SDL3" "$DIST/SDL2.dll"; then
+	echo "SDL2.dll is sdl2-compat, which needs SDL3.dll. Install the real SDL2 2.32.10 (see .github/workflows/release.yml)." >&2
+	exit 1
+fi
 (cd "$SRC/src" && windres launcher.rc -O coff -o "$BUILD/launcher.o")
 gcc -O2 -municode -mwindows -static "$SRC/src/launcher.c" "$BUILD/launcher.o" -o "$SRC/PS Stream.exe"
 # The download zip carries the licenses of the libraries in dist

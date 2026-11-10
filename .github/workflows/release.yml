@@ -38,7 +38,16 @@ jobs:
             mingw-w64-x86_64-gcc mingw-w64-x86_64-cmake mingw-w64-x86_64-ninja mingw-w64-x86_64-pkgconf
             mingw-w64-x86_64-curl mingw-w64-x86_64-json-c mingw-w64-x86_64-libevent mingw-w64-x86_64-miniupnpc
             mingw-w64-x86_64-openssl mingw-w64-x86_64-opus mingw-w64-x86_64-protobuf mingw-w64-x86_64-python
-            mingw-w64-x86_64-python-protobuf mingw-w64-x86_64-SDL2 mingw-w64-x86_64-ffmpeg mingw-w64-x86_64-speexdsp
+            mingw-w64-x86_64-python-protobuf mingw-w64-x86_64-ffmpeg mingw-w64-x86_64-speexdsp
+
+      # MSYS2 now gives sdl2-compat for SDL2: an SDL2.dll that loads SDL3.dll at run time. That build of
+      # v0.1.39 showed "Failed loading SDL3 library" and never started. The app is made and tested with
+      # the real SDL2, so that one is put back, from MSYS2's own repository (pacman checks its signature).
+      - name: Use the real SDL2
+        run: |
+          pacman -Rdd --noconfirm mingw-w64-x86_64-sdl2-compat 2>/dev/null || true
+          pacman -U --noconfirm https://repo.msys2.org/mingw/mingw64/mingw-w64-x86_64-SDL2-2.32.10-1-any.pkg.tar.zst
+          pacman -Qi mingw-w64-x86_64-SDL2 | grep -E '^(Name|Version)'
 
       - name: Check the version
         id: version
