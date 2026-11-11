@@ -49,7 +49,7 @@
 
 // Below this rate we are outside what chiaki-ng offers, so a console that refuses to start
 // gets a second try with it.
-#define APP_VERSION "0.1.43"
+#define APP_VERSION "0.1.44"
 #define UPDATE_RECHECK_MS (6 * 60 * 60 * 1000)
 #define UPDATE_TRIES 6
 #define UPDATE_RETRY_MS 20000
@@ -98,6 +98,10 @@
 // that doesn't need it, the buffer stays small.
 #define AUDIO_TARGET_MIN_MS 30
 #define AUDIO_TARGET_MAX_MS 300
+// With video off, the picture is on the TV and only the sound comes to the PC, so it can trail a
+// little more. Real audio-only sessions had sound arrive in 0.5 to 1.4 s pieces; the user chose
+// half a second over the dropouts. A Max delay set below the default still wins.
+#define AUDIO_ONLY_TARGET_MAX_MS 500
 #define AUDIO_TARGET_STEP_MS 10
 #define AUDIO_TARGET_DECAY_MS 60000
 // The "Max delay" setting: a backlog past it is thrown away, and the buffer grows to two thirds of it
@@ -214,7 +218,7 @@ static struct {
 	ChiakiOpusDecoder opus;
 	SDL_AudioDeviceID audio_dev;
 	uint32_t audio_channels, audio_rate;
-	bool audio_waiting, audio_trimming;
+	bool audio_waiting, audio_trimming, audio_only;
 	int audio_target_ms;
 	DWORD audio_last_dropout, connected_at;
 	volatile DWORD last_rx; // when the PS5 last sent sound or a picture
@@ -452,11 +456,17 @@ static void audio_frame_cb(int16_t *buf, size_t samples_count, void *user)
 	// Two thirds leaves room for a burst before the backlog check below throws everything away.
 	// Real sessions on weak Wi-Fi kept dropping out at the old half.
 	int target_max = s.buffer_ms * 2 / 3 < AUDIO_TARGET_MAX_MS ? s.buffer_ms * 2 / 3 : AUDIO_TARGET_MAX_MS;
+	int backlog_max = s.buffer_ms;
+	if(g.audio_only && s.buffer_ms >= AUDIO_BUFFER_DEFAULT_MS)
+	{
+		target_max = AUDIO_ONLY_TARGET_MAX_MS;
+		backlog_max = AUDIO_ONLY_TARGET_MAX_MS * 3 / 2 > s.buffer_ms ? AUDIO_ONLY_TARGET_MAX_MS * 3 / 2 : s.buffer_ms;
+	}
 	bool warming = now - g.audio_first_at < AUDIO_WARMUP_MS;
 	int learned = g.audio_target_ms > target_max ? target_max : g.audio_target_ms;
 	int warm = s.buffer_ms < AUDIO_WARMUP_TARGET_MS ? s.buffer_ms : AUDIO_WARMUP_TARGET_MS;
 	int target = warming && warm > learned ? warm : learned;
-	if(queued > (Uint32)(warming ? 2 * s.buffer_ms : s.buffer_ms) * bytes_per_ms)
+	if(queued > (Uint32)(warming ? 2 * backlog_max : backlog_max) * bytes_per_ms)
 	{
 		// Wi-Fi bursts pile up here, after a gap: everything held back arrives at once. Throwing the
 		// whole backlog away and refilling cost a second silence right after the gap's own. The sound
@@ -1637,6 +1647,7 @@ static bool session_start(bool video, const Settings *s, bool safe)
 	g.connected = 0;
 	g.ended = 0;
 	g.audio_dropouts = 0;
+	g.audio_only = !video;
 	g.audio_rx_at = 0;
 	g.video_fps10 = 0;
 	g.video_lost_total = 0;
@@ -2450,7 +2461,7 @@ static void config_load(void)
 	}
 	// Starting at the smallest buffer meant crackling for the first seconds of every session until it
 	// grew back. One step under what the last session needed lets it shrink again if the link got better.
-	int learned = config_int("audio_target", 0, AUDIO_TARGET_MIN_MS, AUDIO_TARGET_MAX_MS);
+	int learned = config_int("audio_target", 0, AUDIO_TARGET_MIN_MS, AUDIO_ONLY_TARGET_MAX_MS);
 	g.audio_target_ms = learned - AUDIO_TARGET_STEP_MS > AUDIO_TARGET_MIN_MS ? learned - AUDIO_TARGET_STEP_MS : AUDIO_TARGET_MIN_MS;
 	s->loss_pct = config_int("loss_pct", 5, 1, 20);
 	s->reconnect = config_int("reconnect", 1, 0, 1);
