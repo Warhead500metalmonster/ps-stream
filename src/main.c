@@ -29,6 +29,8 @@
 #include <libavutil/frame.h>
 #include <libavutil/hwcontext.h>
 #include <libavutil/hwcontext_d3d11va.h>
+#include <libavutil/log.h>
+#include <libavcodec/avcodec.h>
 #include <d3d11_1.h>
 #include <dxgi.h>
 
@@ -49,7 +51,7 @@
 
 // Below this rate we are outside what chiaki-ng offers, so a console that refuses to start
 // gets a second try with it.
-#define APP_VERSION "1.0.0"
+#define APP_VERSION "1.0.1"
 #define UPDATE_RECHECK_MS (6 * 60 * 60 * 1000)
 #define UPDATE_TRIES 6
 #define UPDATE_RETRY_MS 20000
@@ -606,6 +608,11 @@ typedef struct {
 	UINT in_slice[GPU_VIEWS];
 	int in_count, src_w, src_h, out_w, out_h;
 	HWND hwnd;
+	// The picture alone, copied out of the decoder's padded texture (see gpu_visible)
+	ID3D11Texture2D *crop;
+	ID3D11VideoProcessorInputView *crop_in;
+	int crop_w, crop_h;
+	bool crop_failed;
 } GpuView;
 
 static void gpu_views_clear(GpuView *v)
@@ -613,11 +620,16 @@ static void gpu_views_clear(GpuView *v)
 	for(int i = 0; i < v->in_count; i++)
 		ID3D11VideoProcessorInputView_Release(v->in[i]);
 	v->in_count = 0;
+	if(v->crop_in)
+		ID3D11VideoProcessorInputView_Release(v->crop_in);
+	v->crop_in = NULL;
 }
 
 static void gpu_close(GpuView *v)
 {
 	gpu_views_clear(v);
+	if(v->crop)
+		ID3D11Texture2D_Release(v->crop);
 	if(v->out)
 		ID3D11VideoProcessorOutputView_Release(v->out);
 	if(v->vp)
@@ -796,6 +808,70 @@ static ID3D11VideoProcessorInputView *gpu_input(GpuView *v, ID3D11Texture2D *tex
 	return view;
 }
 
+// The decoder's textures are taller than the picture: 720p can come in a 736-row texture, 1080p in
+// 1088 rows, 1080p H.265 in 1152. A source rectangle should keep the extra rows out, but some
+// drivers ignore it, and a real PS5 stream showed a green band with garbage along the bottom. So
+// the picture alone is copied into a texture of its own size, and that is what gets drawn.
+// Must be called with the device lock held. Returns NULL to draw the decoder's texture as before.
+static ID3D11VideoProcessorInputView *gpu_visible(GpuView *v, const AVFrame *f, ID3D11Texture2D *tex, UINT slice)
+{
+#ifdef PSSTREAM_TEST
+	if(GetEnvironmentVariableW(L"PSSTREAM_TEST_NO_CROP", NULL, 0))
+		return NULL;
+#endif
+	if(v->crop_failed)
+		return NULL;
+	D3D11_TEXTURE2D_DESC td;
+	ID3D11Texture2D_GetDesc(tex, &td);
+	if(td.Width <= (UINT)f->width && td.Height <= (UINT)f->height)
+		return NULL; // no padding to keep out
+	if(v->crop && (v->crop_w != f->width || v->crop_h != f->height))
+	{
+		if(v->crop_in)
+			ID3D11VideoProcessorInputView_Release(v->crop_in);
+		v->crop_in = NULL;
+		ID3D11Texture2D_Release(v->crop);
+		v->crop = NULL;
+	}
+	if(!v->crop)
+	{
+		D3D11_TEXTURE2D_DESC cd = { .Width = (UINT)f->width, .Height = (UINT)f->height, .MipLevels = 1, .ArraySize = 1,
+			.Format = td.Format, .SampleDesc = { 1, 0 }, .Usage = D3D11_USAGE_DEFAULT };
+		UINT binds[2] = { D3D11_BIND_DECODER, 0 };
+		for(int i = 0; i < 2 && !v->crop; i++)
+		{
+			cd.BindFlags = binds[i];
+			if(FAILED(ID3D11Device_CreateTexture2D(v->hw->device, &cd, NULL, &v->crop)))
+				v->crop = NULL;
+		}
+		if(!v->crop)
+		{
+			v->crop_failed = true;
+			CHIAKI_LOGW(&g.log, "Video: couldn't make a %dx%d texture for the picture, drawing the decoder's %ux%u one", f->width, f->height, td.Width, td.Height);
+			return NULL;
+		}
+		v->crop_w = f->width;
+		v->crop_h = f->height;
+		CHIAKI_LOGI(&g.log, "Video: decoder texture is %ux%u, drawing only the %dx%d picture", td.Width, td.Height, f->width, f->height);
+	}
+	if(!v->crop_in)
+	{
+		D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC desc = { .ViewDimension = D3D11_VPIV_DIMENSION_TEXTURE2D };
+		if(FAILED(ID3D11VideoDevice_CreateVideoProcessorInputView(v->vdev, (ID3D11Resource *)v->crop, v->vpe, &desc, &v->crop_in)))
+		{
+			v->crop_in = NULL;
+			v->crop_failed = true;
+			CHIAKI_LOGW(&g.log, "Video: the GPU can't draw from a copy of the picture, drawing the decoder's texture");
+			return NULL;
+		}
+	}
+	// Planar formats copy in whole chroma pairs, so the box stays on even rows and columns
+	D3D11_BOX box = { 0, 0, 0, (UINT)f->width & ~1u, (UINT)f->height & ~1u, 1 };
+	ID3D11DeviceContext_CopySubresourceRegion(v->hw->device_context, (ID3D11Resource *)v->crop, 0, 0, 0, 0,
+		(ID3D11Resource *)tex, slice * td.MipLevels, &box);
+	return v->crop_in;
+}
+
 static bool gpu_draw(GpuView *v, const AVFrame *f)
 {
 #ifdef PSSTREAM_TEST
@@ -808,7 +884,9 @@ static bool gpu_draw(GpuView *v, const AVFrame *f)
 		return true; // minimized, nothing to draw into
 	v->hw->lock(v->hw->lock_ctx);
 	bool ok = gpu_prepare(v, f, client.right, client.bottom);
-	ID3D11VideoProcessorInputView *in = ok ? gpu_input(v, (ID3D11Texture2D *)f->data[0], (UINT)(intptr_t)f->data[1]) : NULL;
+	ID3D11VideoProcessorInputView *in = ok ? gpu_visible(v, f, (ID3D11Texture2D *)f->data[0], (UINT)(intptr_t)f->data[1]) : NULL;
+	if(ok && !in)
+		in = gpu_input(v, (ID3D11Texture2D *)f->data[0], (UINT)(intptr_t)f->data[1]);
 	if(in)
 	{
 		D3D11_VIDEO_PROCESSOR_STREAM stream = { .Enable = TRUE, .pInputSurface = in };
@@ -1043,6 +1121,9 @@ static DWORD WINAPI video_thread_main(void *arg)
 					tex_h = f->height;
 					video_shape_set(window, &pic_shape, tex_w, tex_h);
 					CHIAKI_LOGI(&g.log, "Video: %dx%d, hardware decoding, drawn on the GPU", tex_w, tex_h);
+					AVCodecContext *cc = g.decoder.codec_context;
+					if(cc)
+						CHIAKI_LOGI(&g.log, "Video stream: %s, coded %dx%d, shown %dx%d", cc->codec ? cc->codec->name : "?", cc->coded_width, cc->coded_height, cc->width, cc->height);
 				}
 				av_frame_free(&last);
 				last = f;
@@ -1185,8 +1266,30 @@ static DWORD WINAPI video_thread_main(void *arg)
 	return 0;
 }
 
+// FFmpeg's own warnings, like a slice it couldn't decode, otherwise go nowhere. A band of garbage
+// along the bottom of a real PS5 stream couldn't be explained without them. Limited per video start.
+#define FFMPEG_LOG_MAX 40
+static volatile LONG ffmpeg_log_count;
+static void ffmpeg_log_cb(void *avcl, int level, const char *fmt, va_list vl)
+{
+	if(level > AV_LOG_WARNING)
+		return;
+	LONG n = InterlockedIncrement(&ffmpeg_log_count);
+	if(n > FFMPEG_LOG_MAX)
+		return;
+	char line[256];
+	int prefix = 1;
+	av_log_format_line(avcl, level, fmt, vl, line, sizeof(line), &prefix);
+	size_t len = strlen(line);
+	while(len && (line[len - 1] == '\n' || line[len - 1] == '\r'))
+		line[--len] = 0;
+	CHIAKI_LOGW(&g.log, "FFmpeg: %s%s", line, n == FFMPEG_LOG_MAX ? " (no more FFmpeg lines until video restarts)" : "");
+}
+
 static bool video_start(ChiakiCodec codec, unsigned int fps, bool hw)
 {
+	InterlockedExchange(&ffmpeg_log_count, 0);
+	av_log_set_callback(ffmpeg_log_cb);
 	ChiakiErrorCode err = CHIAKI_ERR_UNKNOWN;
 	if(hw)
 		err = chiaki_ffmpeg_decoder_init(&g.decoder, &g.log, codec, fps, "d3d11va", NULL, frame_available_cb, NULL);
