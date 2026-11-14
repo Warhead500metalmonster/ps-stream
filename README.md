@@ -63,14 +63,6 @@ You only pair once. After that, audio starts when you open the app, and you can 
 
 ![Pairing page](docs/pair.png)
 
-## Keeping your DualSense on the PS5
-
-If you pair the app with the same PSN account you play on, the DualSense stops working on the PS5 while the app is connected.
-
-To play with the DualSense on the PS5, pair the app with a **second PSN account** on the console. Your DualSense keeps working, and you don't need a controller on the PC.
-
-The **DualSense on PS5** setting under **Advanced settings** stops the app from announcing a virtual controller, but this doesn't fix the problem on its own. It's on by default. Turn it off if connecting fails.
-
 ## Settings
 
 ![Settings page](docs/settings.png)
