@@ -574,7 +574,7 @@ static int preset_lower(const Settings *s)
 {
 	int best = -1;
 	for(int i = 0; i < PRESET_COUNT; i++)
-		if(presets[i].kbps < s->kbps)
+		if(preset_at(i)->kbps < s->kbps)
 			best = i;
 	return best;
 }
@@ -598,10 +598,10 @@ static void preset_select(int i)
 {
 	bool audio_only = g.want_audio && !g.want_video;
 	Settings s = settings_get();
-	s.res = presets[i].res;
-	s.fps = presets[i].fps;
-	s.kbps = presets[i].kbps;
-	s.h265 = presets[i].h265;
+	s.res = preset_at(i)->res;
+	s.fps = preset_at(i)->fps;
+	s.kbps = preset_at(i)->kbps;
+	s.h265 = preset_at(i)->h265;
 	settings_commit(&s);
 	if(audio_only)
 		toggle(UI_VIDEO);
@@ -610,7 +610,7 @@ static void preset_select(int i)
 static int preset_match(const Settings *s)
 {
 	for(int i = 0; i < PRESET_COUNT; i++)
-		if(presets[i].res == s->res && presets[i].fps == s->fps && presets[i].kbps == s->kbps && presets[i].h265 == s->h265)
+		if(preset_at(i)->res == s->res && preset_at(i)->fps == s->fps && preset_at(i)->kbps == s->kbps && preset_at(i)->h265 == s->h265)
 			return i;
 	return PRESET_COUNT; // "custom"
 }
@@ -753,7 +753,17 @@ static void page_play(void)
 	swprintf(info, 128, L"%dp  ·  %d FPS  ·  %ls  ·  %ls", resolutions[s.res].height, s.fps, rate, s.h265 ? L"H.265" : L"H.264");
 	card_info(vx + 22, cy + 146, cw - 44, info, COLOR(95, 0, 0, 0));
 
-	static const wchar_t *const subs[] = { L"360p, 0,5 Mbps", L"360p, 2 Mbps", L"720p, 6 Mbps", L"1080p 60, 20 Mbps", L"1080p 60, 50 Mbps" };
+	// Built from the presets, which depend on whether this PC decodes H.265
+	wchar_t subs[PRESET_COUNT][40];
+	for(int i = 0; i < PRESET_COUNT; i++)
+	{
+		wchar_t r[32];
+		if(preset_at(i)->kbps % 1000)
+			bitrate_text(r, 32, preset_at(i)->kbps);
+		else
+			swprintf(r, 32, L"%d Mbps", preset_at(i)->kbps / 1000);
+		swprintf(subs[i], 40, L"%dp%ls, %ls", resolutions[preset_at(i)->res].height, preset_at(i)->fps == 60 ? L" 60" : L"", r);
+	}
 	bool audio_only = g.want_audio && !g.want_video;
 	int current = audio_only ? -1 : preset_match(&s);
 	float gap = 8, w = (UI_W - 48 - gap * 6) / 7, y = 420 + extra, h = 74;

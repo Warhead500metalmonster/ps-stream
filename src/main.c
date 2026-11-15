@@ -51,7 +51,7 @@
 
 // Below this rate we are outside what chiaki-ng offers, so a console that refuses to start
 // gets a second try with it.
-#define APP_VERSION "1.0.1"
+#define APP_VERSION "1.1.0"
 #define UPDATE_RECHECK_MS (6 * 60 * 60 * 1000)
 #define UPDATE_TRIES 6
 #define UPDATE_RETRY_MS 20000
@@ -221,6 +221,7 @@ static struct {
 	SDL_AudioDeviceID audio_dev;
 	uint32_t audio_channels, audio_rate;
 	bool audio_waiting, audio_trimming, audio_only;
+	bool hevc_hw; // presets use H.265, see presets_hevc
 	int audio_target_ms;
 	DWORD audio_last_dropout, connected_at;
 	volatile DWORD last_rx; // when the PS5 last sent sound or a picture
@@ -2533,6 +2534,62 @@ static int hotkey_load(const char *key, int fallback)
 	return hotkey;
 }
 
+// H.265 gives the same picture as H.264 in about 60% of the data, and on weak Wi-Fi less data means
+// less lost. So the 720p and 1080p presets use it wherever the graphics card decodes it, and fall
+// back to H.264 where it doesn't. 360p stays H.264, where the saving is small.
+static const Preset presets_hevc[] = {
+	{ 1, 30, 500, 0 },
+	{ 1, 30, 2000, 0 },
+	{ 3, 30, 3500, 1 },
+	{ 4, 60, 12000, 1 },
+	{ 4, 60, 50000, 1 },
+};
+
+static const Preset *preset_at(int i)
+{
+	return g.hevc_hw ? &presets_hevc[i] : &presets[i];
+}
+
+// Whether the graphics card that decodes video can decode H.265 itself
+static bool hevc_hw_supported(void)
+{
+	static const GUID hevc_main = { 0x5b11d51b, 0x2f4c, 0x4452, { 0xbc, 0xc3, 0x09, 0xf2, 0xa1, 0x16, 0x0c, 0xc0 } };
+	ID3D11Device *dev = NULL;
+	ID3D11VideoDevice *vdev = NULL;
+	BOOL ok = FALSE;
+	if(SUCCEEDED(D3D11CreateDevice(NULL, D3D_DRIVER_TYPE_HARDWARE, NULL, D3D11_CREATE_DEVICE_VIDEO_SUPPORT, NULL, 0, D3D11_SDK_VERSION, &dev, NULL, NULL))
+		&& SUCCEEDED(ID3D11Device_QueryInterface(dev, &IID_ID3D11VideoDevice, (void **)&vdev)))
+	{
+		if(FAILED(ID3D11VideoDevice_CheckVideoDecoderFormat(vdev, &hevc_main, DXGI_FORMAT_NV12, &ok)))
+			ok = FALSE;
+	}
+	if(vdev)
+		ID3D11VideoDevice_Release(vdev);
+	if(dev)
+		ID3D11Device_Release(dev);
+	return ok;
+}
+
+// Settings left on a preset follow it to the codec this PC can decode, both ways, so a preset picked
+// before H.265 presets existed, or on another graphics card, still reads as that preset
+static void presets_follow_codec(Settings *s)
+{
+	for(int i = 0; i < PRESET_COUNT; i++)
+	{
+		const Preset *other = g.hevc_hw ? &presets[i] : &presets_hevc[i], *now = preset_at(i);
+		if(other->res == s->res && other->fps == s->fps && other->kbps == s->kbps && other->h265 == s->h265
+			&& (now->kbps != s->kbps || now->h265 != s->h265))
+		{
+			CHIAKI_LOGI(&g.log, "Quality preset %d moves to %s at %d kbps", i, now->h265 ? "H.265" : "H.264", now->kbps);
+			s->kbps = now->kbps;
+			s->h265 = now->h265;
+			config_set_int("kbps", s->kbps);
+			config_set_int("h265", s->h265);
+			return;
+		}
+	}
+}
+
 static void config_load(void)
 {
 	char regist[64], morning[64];
@@ -2544,12 +2601,15 @@ static void config_load(void)
 		&& hex_decode(morning, g.morning, sizeof(g.morning));
 
 	Settings *s = &g.settings;
-	const Preset *p = &presets[PRESET_DEFAULT];
+	const Preset *p = &presets[PRESET_DEFAULT]; // H.264 values here; presets_follow_codec moves them once hw is known
 	s->res = config_int("res", p->res, RES_MIN, RES_COUNT - 1);
 	s->fps = config_int("fps", p->fps, 30, 60) == 60 ? 60 : 30;
 	s->kbps = config_int("kbps", p->kbps, 500, 100000);
 	s->h265 = config_int("h265", p->h265, 0, 1);
 	s->hw = config_int("hw", 1, 0, 1);
+	g.hevc_hw = s->hw && hevc_hw_supported();
+	CHIAKI_LOGI(&g.log, "H.265 hardware decoding %s", g.hevc_hw ? "available, presets use it" : "not available, presets use H.264");
+	presets_follow_codec(s);
 	s->ao_kbps = config_int("ao_kbps", 500, 100, 2000);
 	s->volume = config_int("volume", 100, 0, 200);
 	s->buffer_ms = config_int("buffer_ms", AUDIO_BUFFER_DEFAULT_MS, 40, 500);
