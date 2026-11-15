@@ -1,8 +1,6 @@
 <p align="center">
-  <img src="docs/icon.png" width="96" alt="PS Stream icon">
+  <img src="docs/banner.svg" width="100%" alt="PS Stream: PS5 Remote Play for Windows, built for weak Wi-Fi">
 </p>
-
-<h1 align="center">PS Stream</h1>
 
 <p align="center">
   A PS5 Remote Play client for Windows that lets you turn audio and video on and off separately.<br>
@@ -37,6 +35,7 @@ If you play on a TV and use Discord on your PC, the usual way to get game audio 
 - **Simple by default.** Two big buttons, an **Audio only** choice, and five quality presets from 360p at 0.5 Mbps to 1080p 60 FPS at 50 Mbps. To set resolution, frame rate, bitrate and codec yourself, use **Custom** or **Advanced settings**.
 - **Less data for the same picture.** Where your graphics card decodes H.265, the 720p and 1080p presets use it: **Balanced** is 720p at 3.5 Mbps and **High** is 1080p 60 at 12 Mbps, instead of 6 and 20 Mbps with H.264, for about the same picture. Less data over the Wi-Fi means less of it gets lost. On a PC without H.265 decoding, the presets stay H.264.
 - **Built for weak Wi-Fi.** Made for people who can't use a cable or 5 GHz. Pauses Windows' background Wi-Fi scans while connected and keeps your PC awake. The audio buffer grows to the gaps your Wi-Fi actually has, up to 0.3 s with video and 0.5 s in audio only, and shrinks again when the Wi-Fi calms down. After a stall, it catches up without a second silence. On lossy Wi-Fi it keeps resending what got lost, asks the PS5 again for a fresh picture when one is lost on the way, and reconnects by itself if the stream goes silent for 15 seconds. It tells you when the router changes its Wi-Fi channel.
+- **Tells you which side of the Wi-Fi is the problem.** The stream crosses Wi-Fi twice, from the PS5 to the modem and from the modem to your PC. While connected, the app checks the PC's side once a second with a tiny ping to the modem. When the video stutters, it says whether your PC's Wi-Fi is fine and the trouble is between the PS5 and the modem, and after 2 minutes of it, that restarting the modem usually fixes it.
 - **Audio controls.** Choose the output device and maximum delay, and change the volume right on the Play page.
 - **Live connection numbers.** Press **Details** to see connection time, ping, audio dropouts, video frame rate and lost frames.
 - **Connects by itself.** Checks for the PS5 about once a second and connects as soon as it answers. If the PS5 is in rest mode, the app sends it a wake-up signal. You can turn that off with **Wake PS5** in Settings. It also finds the console again if the router gives it a new address.

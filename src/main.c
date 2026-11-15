@@ -40,6 +40,7 @@
 #include <shellapi.h>
 #include <shlobj.h>
 #include <iphlpapi.h>
+#include <icmpapi.h>
 #include <wlanapi.h>
 #define Off UiaOff // uiautomationcore.h clashes with an enum from the Wi-Fi headers
 #include <uiautomation.h>
@@ -51,7 +52,7 @@
 
 // Below this rate we are outside what chiaki-ng offers, so a console that refuses to start
 // gets a second try with it.
-#define APP_VERSION "1.1.1"
+#define APP_VERSION "1.2.0"
 #define UPDATE_RECHECK_MS (6 * 60 * 60 * 1000)
 #define UPDATE_TRIES 6
 #define UPDATE_RETRY_MS 20000
@@ -232,6 +233,9 @@ static struct {
 	DWORD audio_first_at, audio_drained_at; // first sound of this session, last skipped piece
 	volatile LONG audio_drained; // 10 ms pieces skipped to catch up since the last connection report
 	volatile LONG pad_presses; // gamepad presses sent since the last connection report
+	// Pings to the modem since the last connection report: the PC's own Wi-Fi leg, apart from the PS5's
+	volatile LONG modem_sent, modem_lost, modem_max_ms;
+	volatile LONG modem_answers; // replies this session; a modem that never answers says nothing either way
 	volatile LONG audio_gap_max; // longest wait between two sounds since the last connection report
 	volatile LONG audio_dropouts, video_fps10, video_lost_total, ps5_standby;
 	char update_tag[32];
@@ -2241,6 +2245,68 @@ static DWORD WINAPI network_watch_main(void *arg)
 	return 0;
 }
 
+#define MODEM_PING_MS 1000
+#define MODEM_PING_TIMEOUT_MS 500
+
+// While connected, pings the modem once a second. The stream crosses Wi-Fi twice, PS5 to modem and
+// modem to PC; Discord on the same PC kept working while the stream fell apart, and only this tells
+// those two legs apart. A ping is 32 bytes, nothing next to the stream.
+static DWORD WINAPI modem_ping_main(void *arg)
+{
+	(void)arg;
+	HANDLE icmp = IcmpCreateFile();
+	if(icmp == INVALID_HANDLE_VALUE)
+		return 0;
+	IPAddr gateway = 0;
+	bool was_live = false;
+	char data[32] = "PS Stream";
+	char reply[sizeof(ICMP_ECHO_REPLY) + sizeof(data) + 8];
+	while(!g.quit)
+	{
+		bool live = (g.want_audio || g.want_video) && g.connected;
+		if(!live)
+		{
+			was_live = false;
+			Sleep(MODEM_PING_MS);
+			continue;
+		}
+		if(!was_live)
+		{
+			// The route to any internet address leaves through the modem; no packet is sent to find it
+			MIB_IPFORWARDROW route;
+			gateway = GetBestRoute(inet_addr("1.1.1.1"), 0, &route) == NO_ERROR ? route.dwForwardNextHop : 0;
+			InterlockedExchange(&g.modem_answers, 0);
+			struct in_addr a = { .s_addr = gateway };
+			CHIAKI_LOGI(&g.log, "Modem checks: %s", gateway ? inet_ntoa(a) : "no modem address found");
+			was_live = true;
+		}
+		if(!gateway)
+		{
+			Sleep(MODEM_PING_MS);
+			continue;
+		}
+		DWORD t0 = GetTickCount();
+		DWORD n = IcmpSendEcho(icmp, gateway, data, sizeof(data), NULL, reply, sizeof(reply), MODEM_PING_TIMEOUT_MS);
+		ICMP_ECHO_REPLY *r = (ICMP_ECHO_REPLY *)reply;
+		InterlockedIncrement(&g.modem_sent);
+		if(n && r->Status == IP_SUCCESS)
+		{
+			InterlockedIncrement(&g.modem_answers);
+			LONG ms = (LONG)r->RoundTripTime;
+			LONG old;
+			while(ms > (old = g.modem_max_ms) && InterlockedCompareExchange(&g.modem_max_ms, ms, old) != old)
+				;
+		}
+		else
+			InterlockedIncrement(&g.modem_lost);
+		DWORD spent = GetTickCount() - t0;
+		if(spent < MODEM_PING_MS)
+			Sleep(MODEM_PING_MS - spent);
+	}
+	IcmpCloseHandle(icmp);
+	return 0;
+}
+
 static bool ps5_wake_send(void);
 static void config_set(const char *key, const char *value);
 
@@ -2264,6 +2330,7 @@ static DWORD WINAPI worker_main(void *arg)
 	int probes = 0, wake_tries = 0;
 	bool may_wake = true, id_checked = false;
 	CloseHandle(CreateThread(NULL, 0, network_watch_main, NULL, 0, NULL));
+	CloseHandle(CreateThread(NULL, 0, modem_ping_main, NULL, 0, NULL));
 	while(true)
 	{
 		DWORD timeout = INFINITE;

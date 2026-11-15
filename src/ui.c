@@ -16,6 +16,11 @@
 #define WEAK_LOST_FRAMES 30
 #define WEAK_DROPOUTS 3
 #define WEAK_REPEAT_MS 300000
+// Weak windows in a row before saying a modem restart is what helps: 2 minutes, longer than a passing burst
+#define WEAK_STREAK_MODEM 4
+// The PC's leg counts as fine at most this many lost pings in 30 and no reply slower than this
+#define MODEM_OK_LOST 2
+#define MODEM_OK_MS 150
 #define WIFI_MOVED_RECENT_MS 90000 // a router's channel move this recent explains a dropout
 // A test copy must never find, or be stopped by, the copy someone is using
 #ifdef PSSTREAM_TEST
@@ -72,7 +77,7 @@ static struct {
 	double anim_last;
 	int timer_ticks;
 	bool details, advanced, was_live, weak, volume_unsaved;
-	int weak_lost, weak_drops;
+	int weak_lost, weak_drops, weak_streak;
 	double loss_peak; // highest packet loss seen in the current window, for the log
 	DWORD weak_checked_at, weak_shown_at;
 	bool pad_seen; // a gamepad is plugged in while the gamepad setting is off
@@ -1756,6 +1761,9 @@ static void connection_watch(void)
 		ui.weak_lost = g.video_lost_total;
 		ui.weak_drops = g.audio_dropouts;
 		ui.weak_checked_at = GetTickCount();
+		InterlockedExchange(&g.modem_sent, 0);
+		InterlockedExchange(&g.modem_lost, 0);
+		InterlockedExchange(&g.modem_max_ms, 0);
 		// A new connection may be at a quality the Wi-Fi can't carry, and has to be able to say so
 		// even when the last one warned a minute ago
 		if(live)
@@ -1806,34 +1814,59 @@ static void connection_watch(void)
 	char pad[32] = "";
 	if(presses)
 		snprintf(pad, sizeof(pad), ", %ld gamepad presses", (long)presses);
+	LONG modem_sent = InterlockedExchange(&g.modem_sent, 0), modem_lost = InterlockedExchange(&g.modem_lost, 0);
+	LONG modem_max = InterlockedExchange(&g.modem_max_ms, 0);
+	bool modem_known = modem_sent >= 10 && g.modem_answers > 0;
+	bool pc_leg_ok = modem_known && modem_lost <= MODEM_OK_LOST && modem_max <= MODEM_OK_MS;
+	char modem[64] = "";
+	if(modem_known)
+		snprintf(modem, sizeof(modem), ", modem ping lost %ld of %ld, slowest %ld ms", (long)modem_lost, (long)modem_sent, (long)modem_max);
 	// The longest wait between sounds tells Wi-Fi bursts apart from a PC that was too busy, and the
 	// signal tells a fading link apart from a crowded one
 	if(lost || drops || ui.loss_peak > 0 || presses)
-		CHIAKI_LOGI(&g.log, "Connection in the last %d s: %d lost frames, %d audio dropouts, packet loss peak %.0f%%, longest sound gap %ld ms%s%s%s%s",
-				WEAK_WINDOW_MS / 1000, lost, drops, ui.loss_peak * 100, (long)gap, caught_up, pad, wifi, IsWindowVisible(g.hwnd) && !IsIconic(g.hwnd) ? "" : ", window hidden");
+		CHIAKI_LOGI(&g.log, "Connection in the last %d s: %d lost frames, %d audio dropouts, packet loss peak %.0f%%, longest sound gap %ld ms%s%s%s%s%s",
+				WEAK_WINDOW_MS / 1000, lost, drops, ui.loss_peak * 100, (long)gap, caught_up, pad, wifi, modem, IsWindowVisible(g.hwnd) && !IsIconic(g.hwnd) ? "" : ", window hidden");
 	ui.loss_peak = 0;
 	ui.weak_lost = g.video_lost_total;
 	ui.weak_drops = g.audio_dropouts;
 	ui.weak_checked_at = now;
 	bool was_weak = ui.weak;
 	ui.weak = false;
-	if((lost >= WEAK_LOST_FRAMES || drops >= WEAK_DROPOUTS) && (!ui.weak_shown_at || now - ui.weak_shown_at > WEAK_REPEAT_MS))
+	bool weak_now = lost >= WEAK_LOST_FRAMES || drops >= WEAK_DROPOUTS;
+	ui.weak_streak = weak_now ? ui.weak_streak + 1 : 0;
+	// Two minutes of it is no passing burst. The 2.4 GHz modems this is for slow down after hours and a
+	// restart brings them back, while a lower quality didn't; the user saw exactly that.
+	bool long_bad = ui.weak_streak == WEAK_STREAK_MODEM;
+	if(weak_now && (long_bad || !ui.weak_shown_at || now - ui.weak_shown_at > WEAK_REPEAT_MS))
 	{
-		CHIAKI_LOGI(&g.log, "Weak connection warning shown");
+		CHIAKI_LOGI(&g.log, "Weak connection warning shown%s%s", long_bad ? ", 2 minutes in a row" : "",
+				!modem_known ? "" : pc_leg_ok ? ", PC to modem fine" : ", PC to modem weak too");
 		ui.weak = true;
 		ui.weak_shown_at = now;
 		// Channels 1 to 14 are 2.4 GHz, where neighbours and microwaves cause most of the loss
 		bool slow_band = g.wifi_channel >= 1 && g.wifi_channel <= 14;
 		Settings now_settings = settings_get();
 		// The video is often full screen with this window away in the tray
-		if(g.want_video && (!IsWindowVisible(g.hwnd) || IsIconic(g.hwnd)))
+		if(!long_bad && g.want_video && (!IsWindowVisible(g.hwnd) || IsIconic(g.hwnd)))
 			tray_note(L"Görüntü takılıyor. Kaliteyi düşürmek için PS Stream'i aç");
 		wchar_t better[33];
 		EnterCriticalSection(&g.lock);
 		wcscpy(better, g.wifi_5ghz);
 		LeaveCriticalSection(&g.lock);
 		LONG moved_at = g.wifi_moved_at;
-		if(moved_at && GetTickCount() - (DWORD)moved_at < WIFI_MOVED_RECENT_MS)
+		if(long_bad)
+		{
+			if(g.want_video && (!IsWindowVisible(g.hwnd) || IsIconic(g.hwnd)))
+				tray_note(L"Bağlantı 2 dakikadır kötü. Modemi kapatıp açmak genelde düzeltir");
+			set_status(pc_leg_ok ? L"Bağlantı 2 dakikadır kötü. Bilgisayarın Wi-Fi'ı sağlam, sorun PS5 ile modem arasında. Modemi kapatıp açmak genelde düzeltir"
+					: L"Bağlantı 2 dakikadır kötü. Modemi kapatıp açmak genelde düzeltir");
+		}
+		else if(pc_leg_ok && g.want_video && preset_lower(&now_settings) >= 0)
+			set_status(L"Görüntü takılıyor. Bilgisayarın Wi-Fi'ı sağlam, sorun PS5 ile modem arasında. \"Kaliteyi düşür\" yardımcı olur");
+		else if(pc_leg_ok)
+			set_status(g.want_video ? L"Görüntü takılıyor. Bilgisayarın Wi-Fi'ı sağlam, sorun PS5 ile modem arasında. PS5'i modeme yaklaştırmak iyi gelir"
+					: L"Ses kesiliyor. Bilgisayarın Wi-Fi'ı sağlam, sorun PS5 ile modem arasında. PS5'i modeme yaklaştırmak iyi gelir");
+		else if(moved_at && GetTickCount() - (DWORD)moved_at < WIFI_MOVED_RECENT_MS)
 		{
 			// Neither distance nor band helps here: the router cut everyone off to change channel
 			set_status(slow_band ? L"Modem Wi-Fi kanalını değiştirdi, bu an tüm cihazlarda internet kesilir. Modem ayarından kanalı 1, 6 veya 11'e sabitle"
@@ -2469,6 +2502,12 @@ static DWORD WINAPI ui_test_main(void *arg)
 		Sleep(800);
 		g.connected = 1; // the warning only counts while connected, and no PS5 is here
 		Sleep(700);
+		if(GetEnvironmentVariableW(L"PSSTREAM_TEST_MODEM", NULL, 0))
+		{
+			// Long enough for the modem checks to count, and the fourth bad window in a row
+			Sleep(12000);
+			ui.weak_streak = WEAK_STREAK_MODEM - 1;
+		}
 		ui.weak_checked_at -= WEAK_WINDOW_MS;
 		g.wifi_channel = 6;
 		if(GetEnvironmentVariableW(L"PSSTREAM_TEST_5GHZ", NULL, 0))

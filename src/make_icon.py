@@ -1,7 +1,20 @@
-# Draws app.ico: python -I make_icon.py (standard library only)
+# Draws app.ico and the 256 px preview: python -I make_icon.py (standard library only)
+# The mark is a Wi-Fi sign whose dot is a play button, since the app is built for weak Wi-Fi.
 import math, os, struct, zlib
 
+NIGHT_TOP, NIGHT_BOTTOM = (40, 36, 98), (10, 12, 36)
+CYAN, VIOLET = (54, 214, 255), (150, 92, 255)
+WHITE = (255, 255, 255)
+CENTER = (0.5, 0.735)          # where the Wi-Fi arcs come from
+ARCS = (0.205, 0.335, 0.465)   # radii, inner to outer
+ARC_WIDTH = 0.072
+ARC_HALF_ANGLE = math.radians(44)
+# Play button in place of the dot, slightly right of center so it looks centered
+TRIANGLE = ((0.445, 0.652), (0.445, 0.818), (0.588, 0.735))
+TRIANGLE_ROUND = 0.018
+
 def lerp(a, b, t):
+    t = min(max(t, 0.0), 1.0)
     return tuple(a[i] + (b[i] - a[i]) * t for i in range(3))
 
 def inside_rounded(x, y, r):
@@ -9,30 +22,43 @@ def inside_rounded(x, y, r):
     dy = max(abs(y - 0.5) - (0.5 - r), 0)
     return dx * dx + dy * dy <= r * r
 
-def inside_triangle(x, y):
-    # Play triangle with softly rounded corners
-    ax, ay, bx, by, cx, cy = 0.20, 0.27, 0.20, 0.73, 0.55, 0.50
-    def edge(px, py, qx, qy):
-        length = math.hypot(qx - px, qy - py)
-        return ((qx - px) * (y - py) - (qy - py) * (x - px)) / length
-    r = 0.03
-    return edge(ax, ay, bx, by) <= -r + 0.06 and edge(bx, by, cx, cy) <= -r + 0.06 and edge(cx, cy, ax, ay) <= -r + 0.06
+def segment_distance(px, py, ax, ay, bx, by):
+    vx, vy = bx - ax, by - ay
+    t = max(0.0, min(1.0, ((px - ax) * vx + (py - ay) * vy) / (vx * vx + vy * vy)))
+    return math.hypot(px - ax - t * vx, py - ay - t * vy)
 
-def in_arc(x, y, radius, width):
-    dx, dy = x - 0.46, y - 0.5
-    if dx <= 0 or abs(math.atan2(dy, dx)) > 0.72:
-        return False
-    return abs(math.hypot(dx, dy) - radius) <= width / 2
+def triangle_distance(x, y):
+    (ax, ay), (bx, by), (cx, cy) = TRIANGLE
+    def side(px, py, qx, qy):
+        return (qx - px) * (y - py) - (qy - py) * (x - px)
+    s1, s2, s3 = side(ax, ay, bx, by), side(bx, by, cx, cy), side(cx, cy, ax, ay)
+    if (s1 <= 0 and s2 <= 0 and s3 <= 0) or (s1 >= 0 and s2 >= 0 and s3 >= 0):
+        return 0.0
+    return min(segment_distance(x, y, ax, ay, bx, by), segment_distance(x, y, bx, by, cx, cy),
+               segment_distance(x, y, cx, cy, ax, ay))
+
+def arc_distance(x, y, radius):
+    # Distance to an arc opening upward, with round ends
+    dx, dy = x - CENTER[0], CENTER[1] - y
+    angle = math.atan2(dx, dy)  # 0 straight up
+    if abs(angle) <= ARC_HALF_ANGLE:
+        return abs(math.hypot(dx, dy) - radius)
+    end = math.copysign(ARC_HALF_ANGLE, angle)
+    ex, ey = CENTER[0] + radius * math.sin(end), CENTER[1] - radius * math.cos(end)
+    return math.hypot(x - ex, y - ey)
 
 def color(x, y):
-    if not inside_rounded(x, y, 0.2):
+    if not inside_rounded(x, y, 0.22):
         return None
-    if inside_triangle(x, y):
-        return (255, 255, 255)
-    if in_arc(x, y, 0.20, 0.06) or in_arc(x, y, 0.33, 0.06):
-        return (250, 176, 48)
-    t = (x + y) / 2
-    return lerp((58, 124, 255), (16, 34, 120), t)
+    if triangle_distance(x, y) <= TRIANGLE_ROUND:
+        return WHITE
+    for radius in ARCS:
+        if arc_distance(x, y, radius) <= ARC_WIDTH / 2:
+            return lerp(CYAN, VIOLET, (x - 0.18) / 0.64)
+    base = lerp(NIGHT_TOP, NIGHT_BOTTOM, y)
+    # A soft glow behind the sign
+    glow = max(0.0, 1 - math.hypot(x - CENTER[0], (y - 0.55) * 1.2) / 0.55)
+    return lerp(base, (70, 60, 170), glow * glow * 0.55)
 
 def render(size):
     ss = 4
@@ -66,4 +92,6 @@ for size, image in zip(sizes, images):
 here = os.path.dirname(os.path.abspath(__file__))
 open(os.path.join(here, 'app.ico'), 'wb').write(out + b''.join(images))
 open(os.path.join(here, 'app_preview.png'), 'wb').write(images[-1])
+open(os.path.join(here, '..', 'docs', 'icon.png'), 'wb').write(images[-1])
+open(os.path.join(here, 'preview_32.png'), 'wb').write(render(32)) if os.environ.get('ICON_SMALL_PREVIEW') else None
 print('ok')
