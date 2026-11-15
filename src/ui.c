@@ -56,7 +56,7 @@
 #define ICON_STEP_CODE L"\uE8D7"
 
 enum { UI_NONE, UI_NAV0, UI_NAV1, UI_NAV2, UI_AUDIO, UI_VIDEO, UI_MUTE, UI_LOWER, UI_HK_MUTE, UI_DETAILS, UI_ADVANCED, UI_SIMPLE, UI_APPLY, UI_FIND, UI_LOGIN, UI_ACCOUNT_CLEAR, UI_PAIR, UI_REPAIR,
-	UI_DEVICE, UI_HK_AUDIO, UI_HK_VIDEO, UI_HW, UI_RECONNECT, UI_CONTROLLER, UI_WIFI, UI_AUTOSTART, UI_AUTOWAKE, UI_GAMEPAD, UI_WINSTART, UI_TRAY, UI_QUICK_VOLUME, UI_WAKE, UI_UPDATE_NOW, UI_OPEN_LOGS, UI_OPEN_REPO, UI_BITRATE, UI_AO_BITRATE, UI_VOLUME, UI_BUFFER, UI_LOSS, UI_AUDIO_ONLY, UI_TOUR_SKIP, UI_TOUR_BACK, UI_TOUR_NEXT, UI_TOUR_AGAIN,
+	UI_DEVICE, UI_HK_AUDIO, UI_HK_VIDEO, UI_HW, UI_RECONNECT, UI_CONTROLLER, UI_WIFI, UI_AUTOSTART, UI_AUTOWAKE, UI_GAMEPAD, UI_WINSTART, UI_TRAY, UI_QUICK_VOLUME, UI_WAKE, UI_UPDATE_NOW, UI_OPEN_LOGS, UI_OPEN_REPO, UI_BITRATE, UI_AO_BITRATE, UI_VOLUME, UI_BUFFER, UI_LOSS, UI_AUDIO_ONLY, UI_TOUR_SKIP, UI_TOUR_BACK, UI_TOUR_NEXT, UI_TOUR_AGAIN, UI_PAD_ON,
 	UI_PRESET0 = 46, UI_RES0 = 52, UI_FPS0 = 60, UI_CODEC0 = 65, UI_LANG0 = 80, UI_MAX = 96 };
 
 static struct {
@@ -75,6 +75,8 @@ static struct {
 	int weak_lost, weak_drops;
 	double loss_peak; // highest packet loss seen in the current window, for the log
 	DWORD weak_checked_at, weak_shown_at;
+	bool pad_seen; // a gamepad is plugged in while the gamepad setting is off
+	DWORD pad_checked_at, pad_offer_at;
 	HICON logo;
 	UINT taskbar_created;
 	bool in_tray;
@@ -567,6 +569,31 @@ static void mute_toggle(void)
 {
 	g.muted = !g.muted;
 	set_status(g.muted ? L"Ses kısıldı. Bağlantı açık, açınca hemen geri gelir" : L"Ses geri açıldı");
+}
+
+#define PAD_CHECK_MS 2000
+#define PAD_OFFER_MS 60000
+
+// With the gamepad setting off nothing listens for pads, so one plugged in simply did nothing and
+// nothing said why. Windows' own device list answers without starting SDL's gamepad support.
+static bool pad_plugged_in(void)
+{
+	RAWINPUTDEVICELIST list[64];
+	UINT count = 64;
+	UINT n = GetRawInputDeviceList(list, &count, sizeof(list[0]));
+	if(n == (UINT)-1)
+		return false;
+	for(UINT i = 0; i < n; i++)
+	{
+		RID_DEVICE_INFO info;
+		UINT size = sizeof(info);
+		info.cbSize = sizeof(info);
+		// Usage page 1 is "generic desktop"; 4 is a joystick and 5 a gamepad
+		if(list[i].dwType == RIM_TYPEHID && GetRawInputDeviceInfoW(list[i].hDevice, RIDI_DEVICEINFO, &info, &size) != (UINT)-1
+				&& info.hid.usUsagePage == 1 && (info.hid.usUsage == 4 || info.hid.usUsage == 5))
+			return true;
+	}
+	return false;
 }
 
 // The next step down for someone whose Wi-Fi can't keep up. Returns -1 at the bottom.
@@ -1286,6 +1313,18 @@ static void status_bar(void)
 		if(pill_button(UI_WAKE, L"PS5'i uyandır", x + w - 164, y + 7, 154, 34, true, true))
 			CloseHandle(CreateThread(NULL, 0, ps5_wake_thread, NULL, 0, NULL));
 	}
+	else if(ui.pad_offer_at && !current.gamepad && GetTickCount() - ui.pad_offer_at < PAD_OFFER_MS)
+	{
+		tw -= 170;
+		if(pill_button(UI_PAD_ON, L"Gamepad'i aç", x + w - 164, y + 7, 154, 34, true, true))
+		{
+			ui.pad_offer_at = 0;
+			current.gamepad = 1;
+			settings_commit(&current);
+			CHIAKI_LOGI(&g.log, "Gamepad setting turned on from the offer");
+			set_status(L"Gamepad açıldı. Kol aranıyor...");
+		}
+	}
 	else if(ui.weak && g.want_video)
 	{
 		tw -= 170;
@@ -1717,9 +1756,35 @@ static void connection_watch(void)
 		ui.weak_lost = g.video_lost_total;
 		ui.weak_drops = g.audio_dropouts;
 		ui.weak_checked_at = GetTickCount();
+		// A new connection may be at a quality the Wi-Fi can't carry, and has to be able to say so
+		// even when the last one warned a minute ago
+		if(live)
+			ui.weak_shown_at = 0;
 	}
 	update_auto();
 	DWORD now = GetTickCount();
+	if(now - ui.pad_checked_at >= PAD_CHECK_MS)
+	{
+		ui.pad_checked_at = now;
+		bool seen = !settings_get().gamepad && pad_plugged_in();
+		if(seen && !ui.pad_seen)
+		{
+			CHIAKI_LOGI(&g.log, "A gamepad is plugged in while the gamepad setting is off, offering to turn it on");
+			ui.pad_offer_at = now ? now : 1;
+			set_status(L"Gamepad algılandı. PS5'i onunla oynamak için \"Gamepad'i aç\"a bas");
+		}
+		else if(!seen && ui.pad_offer_at)
+		{
+			ui.pad_offer_at = 0;
+			ui_frame();
+		}
+		ui.pad_seen = seen;
+	}
+	if(ui.pad_offer_at && now - ui.pad_offer_at >= PAD_OFFER_MS)
+	{
+		ui.pad_offer_at = 0;
+		ui_frame();
+	}
 	if(!live)
 		return;
 	// Sampled here too, since in audio only there are no video stats to carry it
@@ -1759,6 +1824,10 @@ static void connection_watch(void)
 		ui.weak_shown_at = now;
 		// Channels 1 to 14 are 2.4 GHz, where neighbours and microwaves cause most of the loss
 		bool slow_band = g.wifi_channel >= 1 && g.wifi_channel <= 14;
+		Settings now_settings = settings_get();
+		// The video is often full screen with this window away in the tray
+		if(g.want_video && (!IsWindowVisible(g.hwnd) || IsIconic(g.hwnd)))
+			tray_note(L"Görüntü takılıyor. Kaliteyi düşürmek için PS Stream'i aç");
 		wchar_t better[33];
 		EnterCriticalSection(&g.lock);
 		wcscpy(better, g.wifi_5ghz);
@@ -1786,6 +1855,9 @@ static void connection_watch(void)
 					: L"Ses kesiliyor. Bilgisayar 2.4 GHz'de; \"%ls\" 5 GHz ağına bağlanmak çok iyi gelir"), better);
 			set_status(text);
 		}
+		else if(g.want_video && preset_lower(&now_settings) >= 0)
+			// What helps right away on any Wi-Fi, and the button for it is next to this text
+			set_status(L"Görüntü takılıyor. Wi-Fi bu kaliteyi taşıyamıyor; \"Kaliteyi düşür\" görüntüyü akıcı yapar");
 		else if(g.want_video)
 			set_status(slow_band ? L"Görüntü takılıyor. Bilgisayar 2.4 GHz Wi-Fi'de, 5 GHz ağa geçmek çok iyi gelir" : L"Bağlantı zayıf, görüntü kare kaybediyor");
 		else
@@ -2395,6 +2467,8 @@ static DWORD WINAPI ui_test_main(void *arg)
 	if(GetEnvironmentVariableW(L"PSSTREAM_TEST_WEAK", NULL, 0))
 	{
 		Sleep(800);
+		g.connected = 1; // the warning only counts while connected, and no PS5 is here
+		Sleep(700);
 		ui.weak_checked_at -= WEAK_WINDOW_MS;
 		g.wifi_channel = 6;
 		if(GetEnvironmentVariableW(L"PSSTREAM_TEST_5GHZ", NULL, 0))
@@ -2407,6 +2481,7 @@ static DWORD WINAPI ui_test_main(void *arg)
 		test_click(UI_LOWER);
 		Settings after = settings_get();
 		CHIAKI_LOGI(&g.log, "[lower quality] kbps %d to %d, weak=%d", before.kbps, after.kbps, ui.weak);
+		g.connected = 0;
 		Sleep(2600);
 		ui.weak = true; // Now at the lowest quality, so the button offers audio only
 		Sleep(100);

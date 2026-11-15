@@ -51,7 +51,7 @@
 
 // Below this rate we are outside what chiaki-ng offers, so a console that refuses to start
 // gets a second try with it.
-#define APP_VERSION "1.1.0"
+#define APP_VERSION "1.1.1"
 #define UPDATE_RECHECK_MS (6 * 60 * 60 * 1000)
 #define UPDATE_TRIES 6
 #define UPDATE_RETRY_MS 20000
@@ -125,6 +125,9 @@
 #define STALL_MS 15000
 #define AUDIO_REOPEN_MS 2000
 #define IN_USE_QUIET_MS 15000
+// The PS5 frees Remote Play 6 to 8 s after our own last connection. Asking every second instead of
+// every two gets back in up to a second sooner.
+#define RETRY_IN_USE_MS 1000
 // After "Server shutting down" the PS5's Remote Play server stays up a few more seconds. Trying
 // then got "in use" or hung for up to 51 s; when the PS5 stayed on it took 12 s or more anyway.
 #define RETRY_AFTER_SHUTDOWN_MS 6000
@@ -942,6 +945,23 @@ static LRESULT CALLBACK video_sizing_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM
 		GetWindowRect(hwnd, &win);
 		GetClientRect(hwnd, &client);
 		int frame_w = (win.right - win.left) - client.right, frame_h = (win.bottom - win.top) - client.bottom;
+		// No taller than the screen has room for, or the bottom of the picture ends up under the taskbar
+		MONITORINFO mi = { sizeof(mi) };
+		if(GetMonitorInfoW(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST), &mi))
+		{
+			int max_h = mi.rcWork.bottom - mi.rcWork.top, max_w = MulDiv(max_h - frame_h, pic->cx, pic->cy) + frame_w;
+			if(wp == WMSZ_TOP && r->bottom - r->top > max_h)
+				r->top = r->bottom - max_h;
+			else if(wp == WMSZ_BOTTOM && r->bottom - r->top > max_h)
+				r->bottom = r->top + max_h;
+			else if(wp != WMSZ_TOP && wp != WMSZ_BOTTOM && r->right - r->left > max_w)
+			{
+				if(wp == WMSZ_LEFT || wp == WMSZ_TOPLEFT || wp == WMSZ_BOTTOMLEFT)
+					r->left = r->right - max_w;
+				else
+					r->right = r->left + max_w;
+			}
+		}
 		if(wp == WMSZ_TOP || wp == WMSZ_BOTTOM)
 			r->right = r->left + MulDiv(r->bottom - r->top - frame_h, pic->cx, pic->cy) + frame_w;
 		else
@@ -956,6 +976,45 @@ static LRESULT CALLBACK video_sizing_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM
 	return DefSubclassProc(hwnd, msg, wp, lp);
 }
 
+// A window as wide as the screen is taller than the screen once the title bar is added, so the bottom
+// of the picture sat under the taskbar. This makes it small enough to show whole, and moves it back
+// onto the screen if it was made smaller.
+static void video_fit_screen(SDL_Window *window, int pic_w, int pic_h)
+{
+	SDL_SysWMinfo info;
+	SDL_VERSION(&info.version);
+	if(pic_w <= 0 || pic_h <= 0 || (SDL_GetWindowFlags(window) & (SDL_WINDOW_FULLSCREEN | SDL_WINDOW_MAXIMIZED | SDL_WINDOW_MINIMIZED))
+			|| !SDL_GetWindowWMInfo(window, &info))
+		return;
+	HWND hwnd = info.info.win.window;
+	MONITORINFO mi = { sizeof(mi) };
+	RECT win, client;
+	if(!GetMonitorInfoW(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST), &mi) || !GetWindowRect(hwnd, &win) || !GetClientRect(hwnd, &client))
+		return;
+	int frame_w = (win.right - win.left) - client.right, frame_h = (win.bottom - win.top) - client.bottom;
+	int room_w = mi.rcWork.right - mi.rcWork.left - frame_w, room_h = mi.rcWork.bottom - mi.rcWork.top - frame_h;
+	int max_w = MulDiv(room_h, pic_w, pic_h);
+	if(max_w > room_w)
+		max_w = room_w;
+	if(max_w < 320 || client.right <= max_w)
+		return;
+	CHIAKI_LOGI(&g.log, "Video window %ldx%ld is bigger than the screen has room for, now %dx%d", client.right, client.bottom, max_w, MulDiv(max_w, pic_h, pic_w));
+	SDL_SetWindowSize(window, max_w, MulDiv(max_w, pic_h, pic_w));
+	if(!GetWindowRect(hwnd, &win))
+		return;
+	int x = win.left, y = win.top;
+	if(win.right > mi.rcWork.right)
+		x -= win.right - mi.rcWork.right;
+	if(win.bottom > mi.rcWork.bottom)
+		y -= win.bottom - mi.rcWork.bottom;
+	if(x < mi.rcWork.left)
+		x = mi.rcWork.left;
+	if(y < mi.rcWork.top)
+		y = mi.rcWork.top;
+	if(x != win.left || y != win.top)
+		SetWindowPos(hwnd, NULL, x, y, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+}
+
 // Called when the stream's size is known or changes: brings a plain window to the picture's shape
 static void video_shape_set(SDL_Window *window, SIZE *shape, int w, int h)
 {
@@ -968,6 +1027,7 @@ static void video_shape_set(SDL_Window *window, SIZE *shape, int w, int h)
 	int want = (int)((long long)win_w * h / w);
 	if(abs(want - win_h) > 1)
 		SDL_SetWindowSize(window, win_w, want);
+	video_fit_screen(window, w, h);
 }
 
 static double now_ms(void)
@@ -1012,6 +1072,7 @@ static DWORD WINAPI video_thread_main(void *arg)
 		SDL_VERSION(&info.version);
 		if(SDL_GetWindowWMInfo(window, &info) && SetWindowSubclass(info.info.win.window, video_sizing_proc, 1, (DWORD_PTR)&pic_shape))
 			video_hwnd = info.info.win.window;
+		video_fit_screen(window, pic_shape.cx, pic_shape.cy);
 	}
 	GpuView gpu;
 	bool on_gpu = window && gpu_open(&gpu, window, g.decoder.hw_device_ctx);
@@ -2317,6 +2378,8 @@ static DWORD WINAPI worker_main(void *arg)
 					int delay = early ? RETRY_FAST_MS : RETRY_MAX_MS;
 					if(reason == CHIAKI_QUIT_REASON_STREAM_CONNECTION_REMOTE_SHUTDOWN && delay < RETRY_AFTER_SHUTDOWN_MS)
 						delay = RETRY_AFTER_SHUTDOWN_MS;
+					if(reason == CHIAKI_QUIT_REASON_SESSION_REQUEST_RP_IN_USE && GetTickCount() - trying_since < IN_USE_QUIET_MS)
+						delay = RETRY_IN_USE_MS;
 					retry_at = GetTickCount() + delay;
 					const wchar_t *text = quit_reason_text(reason);
 					if(wcscmp(text, L"Bağlantı yok, tekrar deneniyor...") == 0)
