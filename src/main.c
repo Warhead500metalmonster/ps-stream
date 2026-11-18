@@ -52,7 +52,7 @@
 
 // Below this rate we are outside what chiaki-ng offers, so a console that refuses to start
 // gets a second try with it.
-#define APP_VERSION "1.2.1"
+#define APP_VERSION "1.3.0"
 #define UPDATE_RECHECK_MS (6 * 60 * 60 * 1000)
 #define UPDATE_TRIES 6
 #define UPDATE_RETRY_MS 20000
@@ -240,6 +240,8 @@ static struct {
 	volatile LONG audio_dropouts, video_fps10, video_lost_total, ps5_standby;
 	char update_tag[32];
 	volatile LONG network_changed, regist_rejected, muted, session_live, rumble_new, rumble_left, rumble_right;
+	volatile LONG rumble_ms; // how long the last rumble lasts unless a newer one replaces it
+	volatile LONG haptics_logged; // the first DualSense vibration of a session was logged
 	CRITICAL_SECTION pad_lock, sdl_lock;
 	wchar_t pad_name[64];
 	int regist_tries;
@@ -1464,37 +1466,60 @@ static int16_t pad_stronger(int16_t a, int b)
 }
 
 // Xbox pads hide their guide button from programs, and most have no touchpad, so button pairs stand in:
-// Back + Start is the PS button, and Back + Y is the touchpad. The pair's single buttons wait a moment,
-// so pressing a pair doesn't also press Share or Options.
+// Back + Start is the PS button, and Back + Y is the touchpad. Back and Start alone wait a moment, so
+// pressing a pair doesn't also press Share or Options. A quick tap ends before that moment is over, and
+// it used to be lost: Options did nothing unless held. It is now sent briefly once the button is let go.
+#define PAD_TAP_MS 80
 static void pad_apply_chords(uint32_t *buttons)
 {
-	static DWORD held_since;
-	static bool held;
+	static DWORD held_since, tap_until;
+	static bool held, passed, chord_used;
+	static uint32_t seen, tap, chord;
 	const uint32_t back = CHIAKI_CONTROLLER_BUTTON_SHARE, start = CHIAKI_CONTROLLER_BUTTON_OPTIONS, y = CHIAKI_CONTROLLER_BUTTON_PYRAMID;
-	if((*buttons & back) && (*buttons & start))
-	{
-		*buttons = (*buttons & ~(back | start)) | CHIAKI_CONTROLLER_BUTTON_PS;
-		held = false;
-		return;
-	}
-	if((*buttons & back) && (*buttons & y))
-	{
-		*buttons = (*buttons & ~(back | y)) | CHIAKI_CONTROLLER_BUTTON_TOUCHPAD;
-		held = false;
-		return;
-	}
-	if(!(*buttons & (back | start)))
-	{
-		held = false;
-		return;
-	}
-	if(!held)
+	DWORD now = GetTickCount();
+	uint32_t pair = *buttons & (back | start);
+	if(pair && !held)
 	{
 		held = true;
-		held_since = GetTickCount();
+		held_since = now;
+		passed = chord_used = false;
+		seen = 0;
 	}
-	if(GetTickCount() - held_since < PAD_CHORD_DELAY_MS)
-		*buttons &= ~(back | start);
+	if((*buttons & back) && (*buttons & start))
+	{
+		chord = CHIAKI_CONTROLLER_BUTTON_PS;
+		*buttons = (*buttons & ~(back | start)) | chord;
+		chord_used = true;
+	}
+	else if((*buttons & back) && (*buttons & y))
+	{
+		chord = CHIAKI_CONTROLLER_BUTTON_TOUCHPAD;
+		*buttons = (*buttons & ~(back | y)) | chord;
+		chord_used = true;
+	}
+	else if(pair)
+	{
+		seen |= pair;
+		if(chord_used)
+			*buttons = (*buttons & ~(back | start)) | chord; // a pair let go one button at a time stays one press
+		else if(now - held_since < PAD_CHORD_DELAY_MS)
+			*buttons &= ~(back | start);
+		else
+			passed = true;
+	}
+	else if(held)
+	{
+		if(!chord_used && !passed && seen)
+		{
+			tap = seen;
+			tap_until = now + PAD_TAP_MS;
+		}
+		held = false;
+	}
+	if(tap && (LONG)(tap_until - now) > 0)
+		*buttons |= tap;
+	else
+		tap = 0;
 }
 
 #ifdef PSSTREAM_TEST
@@ -1684,7 +1709,7 @@ static DWORD WINAPI gamepad_main(void *arg)
 		if(InterlockedExchange(&g.rumble_new, 0))
 			for(int i = 0; i < PAD_MAX; i++)
 				if(pads[i])
-					SDL_GameControllerRumble(pads[i], (Uint16)(g.rumble_left * 257), (Uint16)(g.rumble_right * 257), PAD_RUMBLE_MS);
+					SDL_GameControllerRumble(pads[i], (Uint16)(g.rumble_left * 257), (Uint16)(g.rumble_right * 257), g.rumble_ms ? (Uint32)g.rumble_ms : PAD_RUMBLE_MS);
 
 		// The session can end at any moment, and the library rejects a repeat of the same state itself
 		bool live = false, sender = false;
@@ -1747,6 +1772,7 @@ static void session_event_cb(ChiakiEvent *event, void *user)
 		case CHIAKI_EVENT_RUMBLE:
 			g.rumble_left = event->rumble.left;
 			g.rumble_right = event->rumble.right;
+			g.rumble_ms = PAD_RUMBLE_MS;
 			g.rumble_new = 1;
 			break;
 		case CHIAKI_EVENT_QUIT:
@@ -1786,6 +1812,44 @@ static void host_set(const char *host)
 	LeaveCriticalSection(&g.lock);
 }
 
+// The haptics strength below which nothing is felt, as chiaki-ng uses it
+#define HAPTICS_MIN_STRENGTH 100
+// Each haptics piece covers 10 ms; a little longer keeps a steady vibration from stuttering
+#define HAPTICS_RUMBLE_MS 60
+
+// A DualSense gets its vibration as a sound wave rather than rumble commands. An Xbox or other pad can
+// only rumble, so the wave's loudness on each side becomes the rumble strength, as chiaki-ng does it.
+static void haptics_frame_cb(uint8_t *buf, size_t buf_size, void *user)
+{
+	(void)user;
+	const size_t sample = 2 * sizeof(int16_t);
+	if(buf_size < sample || buf_size % sample)
+		return;
+	size_t count = buf_size / sample;
+	uint32_t sum_l = 0, sum_r = 0;
+	for(size_t i = 0; i < count; i++)
+	{
+		int16_t l, r;
+		memcpy(&l, buf + i * sample, sizeof(l));
+		memcpy(&r, buf + i * sample + sizeof(l), sizeof(r));
+		sum_l += (uint32_t)abs(l) * 2;
+		sum_r += (uint32_t)abs(r) * 2;
+	}
+	uint32_t left = sum_l / count, right = sum_r / count;
+	left = left > HAPTICS_MIN_STRENGTH ? (left > 65535 ? 65535 : left) : 0;
+	right = right > HAPTICS_MIN_STRENGTH ? (right > 65535 ? 65535 : right) : 0;
+	LONG l8 = (LONG)((left + 256) / 257), r8 = (LONG)((right + 256) / 257);
+	// Quiet pieces only matter when they end a vibration
+	if(!l8 && !r8 && !g.rumble_left && !g.rumble_right)
+		return;
+	if((l8 || r8) && !InterlockedExchange(&g.haptics_logged, 1))
+		CHIAKI_LOGI(&g.log, "PS5 vibration reached the gamepad");
+	g.rumble_left = l8;
+	g.rumble_right = r8;
+	g.rumble_ms = HAPTICS_RUMBLE_MS;
+	g.rumble_new = 1;
+}
+
 static bool session_start(bool video, const Settings *s, bool safe)
 {
 	ChiakiCodec codec = s->h265 ? CHIAKI_CODEC_H265 : CHIAKI_CODEC_H264;
@@ -1803,6 +1867,10 @@ static bool session_start(bool video, const Settings *s, bool safe)
 	info.enable_idr_on_fec_failure = true;
 	// A gamepad on the PC needs the virtual controller the DualSense setting hides
 	info.disable_controller = s->no_controller && !s->gamepad;
+	// PS5 games turn a DualShock 4 away ("PS5 games can't be played with a DUALSHOCK 4"), and that is
+	// what the PS5 was told a PC pad is. Only the home screen and PS4 games took its presses. chiaki-ng
+	// always says DualSense for a PS5.
+	info.enable_dualsense = !info.disable_controller;
 	info.audio_video_disabled = video ? 0 : CHIAKI_VIDEO_DISABLED;
 
 	chiaki_opus_decoder_init(&g.opus, &g.log);
@@ -1836,6 +1904,13 @@ static bool session_start(bool video, const Settings *s, bool safe)
 	ChiakiAudioSink sink;
 	chiaki_opus_decoder_get_sink(&g.opus, &sink);
 	chiaki_session_set_audio_sink(&g.session, &sink);
+	if(info.enable_dualsense)
+	{
+		g.haptics_logged = 0;
+		ChiakiAudioSink haptics = { 0 };
+		haptics.frame_cb = haptics_frame_cb;
+		chiaki_session_set_haptics_sink(&g.session, &haptics);
+	}
 	if(video)
 		chiaki_session_set_video_sample_cb(&g.session, video_sample_cb, &g.decoder);
 
@@ -1847,9 +1922,9 @@ static bool session_start(bool video, const Settings *s, bool safe)
 		goto error;
 	}
 	InterlockedExchange(&g.session_live, 1);
-	CHIAKI_LOGI(&g.log, "Session started: %ux%u@%u %u kbps, video %s, controller %s",
+	CHIAKI_LOGI(&g.log, "Session started: %ux%u@%u %u kbps, video %s, controller %s%s",
 			g.session.connect_info.video_profile.width, g.session.connect_info.video_profile.height,
-			g.session.connect_info.video_profile.max_fps, g.session.connect_info.video_profile.bitrate, video ? "on" : "off", info.disable_controller ? "hidden" : "announced");
+			g.session.connect_info.video_profile.max_fps, g.session.connect_info.video_profile.bitrate, video ? "on" : "off", info.disable_controller ? "hidden" : "announced", info.enable_dualsense ? " as a DualSense" : "");
 	return true;
 
 error:
