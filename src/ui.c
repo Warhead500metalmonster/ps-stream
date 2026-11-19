@@ -2643,6 +2643,52 @@ static DWORD WINAPI demo_main(void *arg)
 	PostMessageW(g.hwnd, WM_CLOSE, 0, 0);
 	return 0;
 }
+
+// Sound as weak Wi-Fi delivers it in video sessions: 10 ms pieces on time, then every 3 s nothing for
+// 300 to 400 ms and everything held back at once, as in the GTA 6 sessions of 2026-11-19
+static DWORD WINAPI audio_gap_test_main(void *arg)
+{
+	(void)arg;
+	g.want_audio = 1;
+	audio_settings_cb(2, 48000, NULL);
+	int16_t quiet[480 * 2] = { 0 };
+	static const int gaps[] = { 300, 350, 400, 250, 380 };
+	LONG drained = 0, dropouts = 0;
+	double queued_sum = 0;
+	int queued_n = 0;
+	DWORD start = GetTickCount(), next = start;
+	int piece = 0, held = 0;
+	while(GetTickCount() - start < 45000 && !g.quit)
+	{
+		int cycle = piece / 300;
+		int in_cycle = piece % 300;
+		int gap_pieces = gaps[cycle % 5] / 10;
+		if(in_cycle >= 300 - gap_pieces)
+			held++;
+		else
+		{
+			for(; held > 0; held--)
+				audio_frame_cb(quiet, 480, NULL);
+			audio_frame_cb(quiet, 480, NULL);
+		}
+		piece++;
+		next += 10;
+		DWORD now = GetTickCount();
+		if((LONG)(next - now) > 0)
+			Sleep(next - now);
+		if(piece % 10 == 0 && g.audio_dev)
+		{
+			queued_sum += SDL_GetQueuedAudioSize(g.audio_dev) / 192.0;
+			queued_n++;
+		}
+		drained += InterlockedExchange(&g.audio_drained, 0);
+	}
+	dropouts = g.audio_dropouts;
+	CHIAKI_LOGI(&g.log, "Audio gap test: %ld dropouts, %ld pieces of sound skipped, buffer %d ms, sound behind by %.0f ms on average",
+		dropouts, drained, g.audio_target_ms, queued_n ? queued_sum / queued_n : 0.0);
+	PostMessageW(g.hwnd, WM_CLOSE, 0, 0);
+	return 0;
+}
 #endif
 
 // A crash leaves no trace otherwise, and the log is the first thing to look at
@@ -2793,6 +2839,11 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmd, int show)
 		g.test_hidden = !GetEnvironmentVariableW(L"PSSTREAM_TEST_SHOW_VIDEO", NULL, 0);
 		thread_main = demo_main;
 		thread_arg = argv[2];
+	}
+	else if(argc == 2 && wcscmp(argv[1], L"--audio-gap-test") == 0)
+	{
+		g.test_hidden = true;
+		thread_main = audio_gap_test_main;
 	}
 	else if(argc == 3 && wcscmp(argv[1], L"--ui-test") == 0)
 	{

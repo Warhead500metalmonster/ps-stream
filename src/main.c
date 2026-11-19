@@ -52,7 +52,7 @@
 
 // Below this rate we are outside what chiaki-ng offers, so a console that refuses to start
 // gets a second try with it.
-#define APP_VERSION "1.3.1"
+#define APP_VERSION "1.3.2"
 #define UPDATE_RECHECK_MS (6 * 60 * 60 * 1000)
 #define UPDATE_TRIES 6
 #define UPDATE_RETRY_MS 20000
@@ -105,6 +105,12 @@
 // little more. Real audio-only sessions had sound arrive in 0.5 to 1.4 s pieces; the user chose
 // half a second over the dropouts. A Max delay set below the default still wins.
 #define AUDIO_ONLY_TARGET_MAX_MS 500
+// With video on and the Max delay setting left at its default, the buffer can grow this far. In the
+// GTA 6 sessions of 2026-11-19 sound arrived after 300 to 400 ms gaps several times a minute, past
+// the 266 ms the default allowed, so it dropped out and then threw away the burst that followed.
+// It only grows this far on Wi-Fi that has such gaps, and shrinks again in quiet minutes.
+#define AUDIO_VIDEO_TARGET_MAX_MS 400
+#define AUDIO_VIDEO_BACKLOG_MAX_MS 650
 #define AUDIO_TARGET_STEP_MS 10
 #define AUDIO_TARGET_DECAY_MS 60000
 // The "Max delay" setting: a backlog past it is thrown away, and the buffer grows to two thirds of it
@@ -473,6 +479,11 @@ static void audio_frame_cb(int16_t *buf, size_t samples_count, void *user)
 	{
 		target_max = AUDIO_ONLY_TARGET_MAX_MS;
 		backlog_max = AUDIO_ONLY_TARGET_MAX_MS * 3 / 2 > s.buffer_ms ? AUDIO_ONLY_TARGET_MAX_MS * 3 / 2 : s.buffer_ms;
+	}
+	else if(s.buffer_ms == AUDIO_BUFFER_DEFAULT_MS)
+	{
+		target_max = AUDIO_VIDEO_TARGET_MAX_MS;
+		backlog_max = AUDIO_VIDEO_BACKLOG_MAX_MS;
 	}
 	bool warming = now - g.audio_first_at < AUDIO_WARMUP_MS;
 	int learned = g.audio_target_ms > target_max ? target_max : g.audio_target_ms;
