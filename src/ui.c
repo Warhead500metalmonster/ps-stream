@@ -79,6 +79,8 @@ static struct {
 	bool details, advanced, was_live, weak, volume_unsaved;
 	int weak_lost, weak_drops, weak_streak;
 	double loss_peak; // highest packet loss seen in the current window, for the log
+	ULONG64 wifi_in, wifi_out; // bytes the PC's Wi-Fi had moved at the last window, for the log
+	DWORD wifi_at;
 	DWORD weak_checked_at, weak_shown_at;
 	bool pad_seen; // a gamepad is plugged in while the gamepad setting is off
 	DWORD pad_checked_at, pad_offer_at;
@@ -1741,6 +1743,42 @@ static void tray_note(const wchar_t *text)
 	CHIAKI_LOGI(&g.log, "Tray note: %s", shown ? "shown" : "failed");
 }
 
+// What the PC's Wi-Fi carried in all, both ways, since the last window. The stream is only part of
+// the download, so a much bigger download or any big upload (a Discord stream, a game update) tells
+// that the PC itself is taking the Wi-Fi time the PS5 stream needs.
+static void wifi_traffic(char *out, size_t size, DWORD now)
+{
+	MIB_IF_TABLE2 *table = NULL;
+	if(GetIfTable2(&table) != NO_ERROR)
+		return;
+	ULONG64 in = 0, out_bytes = 0;
+	bool found = false;
+	for(ULONG i = 0; i < table->NumEntries; i++)
+	{
+		MIB_IF_ROW2 *row = &table->Table[i];
+		if(row->Type != IF_TYPE_IEEE80211 || row->OperStatus != IfOperStatusUp || !row->InterfaceAndOperStatusFlags.HardwareInterface)
+			continue;
+		in += row->InOctets;
+		out_bytes += row->OutOctets;
+		found = true;
+	}
+	FreeMibTable(table);
+	if(!found)
+		return;
+	ULONG64 old_in = ui.wifi_in, old_out = ui.wifi_out;
+	DWORD elapsed = now - ui.wifi_at;
+	ui.wifi_in = in;
+	ui.wifi_out = out_bytes;
+	ui.wifi_at = now;
+	// Only over about one window: the first one has nothing to compare with, and an adapter that
+	// reconnected starts counting again
+	if(!old_in || elapsed < WEAK_WINDOW_MS / 2 || elapsed > WEAK_WINDOW_MS * 2 || in < old_in || out_bytes < old_out)
+		return;
+	ULONG64 din = in - old_in, dout = out_bytes - old_out;
+	double secs = elapsed / 1000.0;
+	snprintf(out, size, ", PC Wi-Fi down %.1f Mbps, up %.1f Mbps", din * 8 / secs / 1e6, dout * 8 / secs / 1e6);
+}
+
 // Runs from the half-second timer, whether the window is showing or not.
 static void connection_watch(void)
 {
@@ -1801,6 +1839,8 @@ static void connection_watch(void)
 		ui.loss_peak = loss;
 	if(now - ui.weak_checked_at < WEAK_WINDOW_MS)
 		return;
+	char traffic[64] = "";
+	wifi_traffic(traffic, sizeof(traffic), now);
 	int lost = g.video_lost_total - ui.weak_lost, drops = g.audio_dropouts - ui.weak_drops;
 	LONG gap = InterlockedExchange(&g.audio_gap_max, 0), drained = InterlockedExchange(&g.audio_drained, 0);
 	LONG presses = InterlockedExchange(&g.pad_presses, 0);
@@ -1824,8 +1864,8 @@ static void connection_watch(void)
 	// The longest wait between sounds tells Wi-Fi bursts apart from a PC that was too busy, and the
 	// signal tells a fading link apart from a crowded one
 	if(lost || drops || ui.loss_peak > 0 || presses)
-		CHIAKI_LOGI(&g.log, "Connection in the last %d s: %d lost frames, %d audio dropouts, packet loss peak %.0f%%, longest sound gap %ld ms%s%s%s%s%s",
-				WEAK_WINDOW_MS / 1000, lost, drops, ui.loss_peak * 100, (long)gap, caught_up, pad, wifi, modem, IsWindowVisible(g.hwnd) && !IsIconic(g.hwnd) ? "" : ", window hidden");
+		CHIAKI_LOGI(&g.log, "Connection in the last %d s: %d lost frames, %d audio dropouts, packet loss peak %.0f%%, longest sound gap %ld ms%s%s%s%s%s%s",
+				WEAK_WINDOW_MS / 1000, lost, drops, ui.loss_peak * 100, (long)gap, caught_up, pad, wifi, modem, traffic, IsWindowVisible(g.hwnd) && !IsIconic(g.hwnd) ? "" : ", window hidden");
 	ui.loss_peak = 0;
 	ui.weak_lost = g.video_lost_total;
 	ui.weak_drops = g.audio_dropouts;
@@ -2657,6 +2697,8 @@ static DWORD WINAPI audio_gap_test_main(void *arg)
 	double queued_sum = 0;
 	int queued_n = 0;
 	DWORD start = GetTickCount(), next = start;
+	char traffic[64] = "";
+	wifi_traffic(traffic, sizeof(traffic), start);
 	int piece = 0, held = 0;
 	while(GetTickCount() - start < 45000 && !g.quit)
 	{
@@ -2684,6 +2726,8 @@ static DWORD WINAPI audio_gap_test_main(void *arg)
 		drained += InterlockedExchange(&g.audio_drained, 0);
 	}
 	dropouts = g.audio_dropouts;
+	wifi_traffic(traffic, sizeof(traffic), GetTickCount());
+	CHIAKI_LOGI(&g.log, "Wi-Fi traffic during the test%s", traffic);
 	CHIAKI_LOGI(&g.log, "Audio gap test: %ld dropouts, %ld pieces of sound skipped, buffer %d ms, sound behind by %.0f ms on average",
 		dropouts, drained, g.audio_target_ms, queued_n ? queued_sum / queued_n : 0.0);
 	PostMessageW(g.hwnd, WM_CLOSE, 0, 0);
