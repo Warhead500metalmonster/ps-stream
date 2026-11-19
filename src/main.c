@@ -52,7 +52,7 @@
 
 // Below this rate we are outside what chiaki-ng offers, so a console that refuses to start
 // gets a second try with it.
-#define APP_VERSION "1.3.3"
+#define APP_VERSION "1.3.4"
 #define UPDATE_RECHECK_MS (6 * 60 * 60 * 1000)
 #define UPDATE_TRIES 6
 #define UPDATE_RETRY_MS 20000
@@ -634,6 +634,8 @@ typedef struct {
 	ID3D11VideoProcessorInputView *crop_in;
 	int crop_w, crop_h;
 	bool crop_failed;
+	UINT vendor; // PCI vendor of the GPU the decoder runs on
+	bool vsr_logged;
 } GpuView;
 
 static void gpu_views_clear(GpuView *v)
@@ -685,6 +687,9 @@ static bool gpu_open(GpuView *v, SDL_Window *window, AVBufferRef *device)
 		&& SUCCEEDED(ID3D11Device_QueryInterface(v->hw->device, &IID_IDXGIDevice, (void **)&dxgi))
 		&& SUCCEEDED(IDXGIDevice_GetAdapter(dxgi, &adapter))
 		&& SUCCEEDED(IDXGIAdapter_GetParent(adapter, &IID_IDXGIFactory, (void **)&factory));
+	DXGI_ADAPTER_DESC adesc;
+	if(ok && SUCCEEDED(IDXGIAdapter_GetDesc(adapter, &adesc)))
+		v->vendor = adesc.VendorId;
 	if(ok && FAILED(ID3D11VideoContext_QueryInterface(v->vctx, &IID_ID3D11VideoContext1, (void **)&v->vctx1)))
 		v->vctx1 = NULL;
 	if(ok)
@@ -734,6 +739,32 @@ static RECT gpu_fit(int src_w, int src_h, int out_w, int out_h)
 	return r;
 }
 
+#define VENDOR_NVIDIA 0x10de
+
+// On an RTX card the driver's Video Super Resolution enlarges the picture with the tensor cores and
+// cleans up the blocky, blurry parts compression leaves, instead of a plain stretch. A 720p stream on
+// a 1080p screen comes out much sharper. It works when "RTX video enhancement" is on in the NVIDIA
+// settings, and the driver leaves the picture as it was on cards that don't have it.
+static void gpu_super_resolution(GpuView *v, int src_w, int src_h, int dest_w, int dest_h)
+{
+	if(v->vendor != VENDOR_NVIDIA)
+		return;
+#ifdef PSSTREAM_TEST
+	if(GetEnvironmentVariableW(L"PSSTREAM_TEST_NO_VSR", NULL, 0))
+		return;
+#endif
+	// The extension mpv and Chromium use: version 1, method 2 (super resolution), on
+	static const GUID nvidia_ppe = { 0xd43ce1b3, 0x1f4b, 0x48ac, { 0xba, 0xee, 0xc3, 0xc2, 0x53, 0x75, 0xe6, 0xf7 } };
+	struct { UINT version, method, enable; } vsr = { 1, 2, 1 };
+	HRESULT hr = ID3D11VideoContext_VideoProcessorSetStreamExtension(v->vctx, v->vp, 0, &nvidia_ppe, sizeof(vsr), &vsr);
+	if(!v->vsr_logged)
+	{
+		v->vsr_logged = true;
+		CHIAKI_LOGI(&g.log, "NVIDIA RTX Video Super Resolution for %dx%d drawn at %dx%d: %s (0x%08lx)",
+				src_w, src_h, dest_w, dest_h, SUCCEEDED(hr) ? "on" : "not available", (unsigned long)hr);
+	}
+}
+
 // Must be called with the device lock held
 static bool gpu_prepare(GpuView *v, const AVFrame *f, int out_w, int out_h)
 {
@@ -775,6 +806,7 @@ static bool gpu_prepare(GpuView *v, const AVFrame *f, int out_w, int out_h)
 		ID3D11VideoContext_VideoProcessorSetStreamSourceRect(v->vctx, v->vp, 0, TRUE, &src);
 		RECT dest = gpu_fit(f->width, f->height, out_w, out_h);
 		ID3D11VideoContext_VideoProcessorSetStreamDestRect(v->vctx, v->vp, 0, TRUE, &dest);
+		gpu_super_resolution(v, f->width, f->height, dest.right - dest.left, dest.bottom - dest.top);
 		v->src_w = f->width;
 		v->src_h = f->height;
 	}
