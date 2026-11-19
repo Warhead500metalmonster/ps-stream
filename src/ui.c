@@ -2639,6 +2639,20 @@ static DWORD WINAPI ui_test_main(void *arg)
 }
 
 // Plays an Annex B H.264 file (one AUD per access unit) and silence through the real video and audio paths.
+// Whether an access unit holds an I frame: an IDR or CRA NAL for H.265, an IDR slice for H.264
+static bool demo_frame_is_intra(const uint8_t *p, long size, bool hevc)
+{
+	for(long i = 0; i + 4 < size; i++)
+	{
+		if(p[i] || p[i + 1] || p[i + 2] != 1)
+			continue;
+		int type = hevc ? (p[i + 3] >> 1 & 0x3f) : (p[i + 3] & 0x1f);
+		if(hevc ? (type >= 16 && type <= 21) : type == 5)
+			return true;
+	}
+	return false;
+}
+
 static DWORD WINAPI demo_main(void *arg)
 {
 	FILE *f = _wfopen((const wchar_t *)arg, L"rb");
@@ -2662,6 +2676,10 @@ static DWORD WINAPI demo_main(void *arg)
 	CHIAKI_LOGI(&g.log, "Demo video %s: %s", hevc ? "H.265" : "H.264", started ? "started" : "failed to start");
 	long start = 0;
 	int count = 0;
+	char drop_text[8] = "0";
+	GetEnvironmentVariableA("PSSTREAM_TEST_DROP_EVERY", drop_text, sizeof(drop_text));
+	int drop_every = atoi(drop_text);
+	bool damaged = false;
 	char shot[MAX_PATH];
 	for(long i = 4; i <= size - 5 && !g.quit; i++)
 	{
@@ -2669,7 +2687,14 @@ static DWORD WINAPI demo_main(void *arg)
 			&& (hevc ? (data[i + 4] >> 1 & 0x3f) == 35 : (data[i + 4] & 0x1f) == 9);
 		if(i != size - 5 && !aud)
 			continue;
-		chiaki_ffmpeg_decoder_video_sample_cb(data + start, i - start, 0, false, &g.decoder);
+		// A lost frame every so many: from that count on frames are marked as built on it until the next
+		// I frame, as the video receiver marks them. They are still fed whole: the receiver hands the
+		// decoder a stand-in reference, so the decoder gets every frame there too.
+		if(drop_every && count > 0 && count % drop_every == 0)
+			damaged = true;
+		if(demo_frame_is_intra(data + start, i - start, hevc))
+			damaged = false;
+		chiaki_ffmpeg_decoder_video_sample_cb(data + start, i - start, 0, damaged, &g.decoder);
 		audio_frame_cb(silence, 480, NULL);
 		start = i;
 		if(++count == 45 && GetEnvironmentVariableA("PSSTREAM_TEST_SHOT", shot, sizeof(shot)))
@@ -2677,6 +2702,7 @@ static DWORD WINAPI demo_main(void *arg)
 		Sleep(1000 / fps);
 	}
 	CHIAKI_LOGI(&g.log, "Demo finished, frames fed: %d, queued audio bytes: %u", count, SDL_GetQueuedAudioSize(g.audio_dev));
+	CHIAKI_LOGI(&g.log, "Demo damaged pictures held back: %ld", (long)g.damaged_held);
 	Sleep(300);
 	video_stop();
 	free(data);

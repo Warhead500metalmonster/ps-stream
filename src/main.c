@@ -52,7 +52,7 @@
 
 // Below this rate we are outside what chiaki-ng offers, so a console that refuses to start
 // gets a second try with it.
-#define APP_VERSION "1.3.4"
+#define APP_VERSION "1.3.5"
 #define UPDATE_RECHECK_MS (6 * 60 * 60 * 1000)
 #define UPDATE_TRIES 6
 #define UPDATE_RETRY_MS 20000
@@ -247,6 +247,7 @@ static struct {
 	char update_tag[32];
 	volatile LONG network_changed, regist_rejected, muted, session_live, rumble_new, rumble_left, rumble_right;
 	volatile LONG rumble_ms; // how long the last rumble lasts unless a newer one replaces it
+	volatile LONG damaged_held; // smeared pictures not shown, the last whole one kept up instead
 	volatile LONG haptics_logged; // the first DualSense vibration of a session was logged
 	CRITICAL_SECTION pad_lock, sdl_lock;
 	wchar_t pad_name[64];
@@ -589,6 +590,9 @@ static void audio_frame_cb(int16_t *buf, size_t samples_count, void *user)
 #define DECODER_STALL_FRAMES 10
 #define DECODER_STALL_MS 700
 #define DECODER_STALL_RETRY_MS 1500
+// Longest the last whole picture stays up while the ones coming are built on a lost frame. The PS5
+// usually sends a whole one within half a second of being asked.
+#define DAMAGED_HOLD_MS 1000
 
 static bool video_sample_cb(uint8_t *buf, size_t buf_size, int32_t frames_lost, bool frame_recovered, void *user)
 {
@@ -1144,6 +1148,7 @@ static DWORD WINAPI video_thread_main(void *arg)
 	bool fullscreen = false;
 	LONG pictures = 0, stall_fed = g.frames_fed, stall_pictures = 0, stall_asks = 0;
 	double stall_since = now_ms(), stall_asked_at = 0;
+	double damaged_since = 0; // when pictures built on a lost frame started coming, 0 while they're whole
 	while((renderer || on_gpu) && !g.video_stop)
 	{
 		// Frames going in with no picture coming out: ask the PS5 for a fresh picture to start from,
@@ -1211,6 +1216,22 @@ static DWORD WINAPI video_thread_main(void *arg)
 			AVFrame *f = frame.frame;
 			if(f)
 				pictures++;
+			// A picture decoded against a lost frame comes out smeared, and so does every one built on it
+			// until the PS5 sends something whole: that was the oil-painting look of the GTA 6 sessions of
+			// 2026-11-19. The last whole picture stays up instead, but not for long, as a picture that
+			// moves on smeared is still better than one that stands still.
+			if(f && (f->decode_error_flags & 1) && (last || texture))
+			{
+				if(!damaged_since)
+					damaged_since = now_ms();
+				if(now_ms() - damaged_since < DAMAGED_HOLD_MS)
+				{
+					av_frame_free(&f);
+					InterlockedIncrement(&g.damaged_held);
+				}
+			}
+			else if(f)
+				damaged_since = 0;
 			stat_pull += now_ms() - t0;
 			stat_lost += lost;
 			if(f && on_gpu && f->format != AV_PIX_FMT_D3D11)
