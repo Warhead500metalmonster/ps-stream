@@ -52,7 +52,7 @@
 
 // Below this rate we are outside what chiaki-ng offers, so a console that refuses to start
 // gets a second try with it.
-#define APP_VERSION "1.3.0"
+#define APP_VERSION "1.3.1"
 #define UPDATE_RECHECK_MS (6 * 60 * 60 * 1000)
 #define UPDATE_TRIES 6
 #define UPDATE_RETRY_MS 20000
@@ -2742,10 +2742,12 @@ static int hotkey_load(const char *key, int fallback)
 // H.265 gives the same picture as H.264 in about 60% of the data, and on weak Wi-Fi less data means
 // less lost. So the 720p and 1080p presets use it wherever the graphics card decodes it, and fall
 // back to H.264 where it doesn't. 360p stays H.264, where the saving is small.
+// Balanced keeps the 6 Mbps of its H.264 version: at 3.5 Mbps the PS5 sent at most 2 Mbps, and a
+// detailed game like GTA 6 turned blurry. H.265 spends the same data on a cleaner picture instead.
 static const Preset presets_hevc[] = {
 	{ 1, 30, 500, 0 },
 	{ 1, 30, 2000, 0 },
-	{ 3, 30, 3500, 1 },
+	{ 3, 30, 6000, 1 },
 	{ 4, 60, 12000, 1 },
 	{ 4, 60, 50000, 1 },
 };
@@ -2779,10 +2781,14 @@ static bool hevc_hw_supported(void)
 // before H.265 presets existed, or on another graphics card, still reads as that preset
 static void presets_follow_codec(Settings *s)
 {
+	// Balanced as 1.2.0 to 1.3.0 had it moves to today's Balanced too
+	static const Preset old_balanced = { 3, 30, 3500, 1 };
 	for(int i = 0; i < PRESET_COUNT; i++)
 	{
 		const Preset *other = g.hevc_hw ? &presets[i] : &presets_hevc[i], *now = preset_at(i);
-		if(other->res == s->res && other->fps == s->fps && other->kbps == s->kbps && other->h265 == s->h265
+		bool was_balanced = i == PRESET_DEFAULT && old_balanced.res == s->res && old_balanced.fps == s->fps
+			&& old_balanced.kbps == s->kbps && old_balanced.h265 == s->h265;
+		if((was_balanced || (other->res == s->res && other->fps == s->fps && other->kbps == s->kbps && other->h265 == s->h265))
 			&& (now->kbps != s->kbps || now->h265 != s->h265))
 		{
 			CHIAKI_LOGI(&g.log, "Quality preset %d moves to %s at %d kbps", i, now->h265 ? "H.265" : "H.264", now->kbps);
