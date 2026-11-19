@@ -52,7 +52,7 @@
 
 // Below this rate we are outside what chiaki-ng offers, so a console that refuses to start
 // gets a second try with it.
-#define APP_VERSION "1.3.5"
+#define APP_VERSION "1.3.6"
 #define UPDATE_RECHECK_MS (6 * 60 * 60 * 1000)
 #define UPDATE_TRIES 6
 #define UPDATE_RETRY_MS 20000
@@ -1928,7 +1928,12 @@ static bool session_start(bool video, const Settings *s, bool safe)
 	profile_set(&info.video_profile, s->res, s->fps, s->kbps, codec, safe);
 	info.video_profile_auto_downgrade = true;
 	info.packet_loss_max = s->loss_pct / 100.0;
-	info.enable_idr_on_fec_failure = true;
+	// A frame Wi-Fi left too broken to repair used to stop the picture until the PS5 sent a whole new
+	// one. In the GTA 6 session of 2026-11-19 that happened 42 times, often for over a second and once
+	// for 10 s. The frames after it are now decoded anyway: the PS5, told of the broken frame, mostly builds
+	// the next ones on an undamaged one within 0.1 s, and the ones built on the broken frame are held
+	// back for up to a second (see DAMAGED_HOLD_MS) while a whole picture is asked for.
+	info.enable_idr_on_fec_failure = false;
 	// A gamepad on the PC needs the virtual controller the DualSense setting hides
 	info.disable_controller = s->no_controller && !s->gamepad;
 	// PS5 games turn a DualShock 4 away ("PS5 games can't be played with a DUALSHOCK 4"), and that is
