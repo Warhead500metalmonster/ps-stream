@@ -50,10 +50,10 @@ index 16bad78..ca12ad5 100644
  	bool video_queue_initialized;
  	int64_t video_queue_head_wait_start_us;
 diff --git a/lib/include/chiaki/videoreceiver.h b/lib/include/chiaki/videoreceiver.h
-index a340b5d..55b65cc 100644
+index a340b5d..23875b3 100644
 --- a/lib/include/chiaki/videoreceiver.h
 +++ b/lib/include/chiaki/videoreceiver.h
-@@ -34,9 +34,16 @@ typedef struct chiaki_video_receiver_t
+@@ -34,9 +34,20 @@ typedef struct chiaki_video_receiver_t
  	int32_t frames_lost;
  	int32_t frames_lost_total;
  	int32_t reference_frames[16];
@@ -61,6 +61,10 @@ index a340b5d..55b65cc 100644
 +	bool picture_damaged; // the last frame passed on was decoded against a lost or damaged one
 +	int32_t damaged_frames; // frames passed on as damaged in the current stretch, for the log
 +	uint64_t damaged_since_ms;
++	int32_t last_packet_index; // highest video packet index seen, -1 for none
++	int32_t skipped_from, skipped_to; // the last frames the PS5 left out on purpose, -1 for none
++	int32_t skips_logged; // skips logged in the current minute, to keep the log readable
++	uint64_t skips_minute_ms;
  	ChiakiBitstream bitstream;
  	ChiakiMutex waiting_for_idr_mutex;
  	bool waiting_for_idr;
@@ -515,7 +519,7 @@ index 5cee13c..3d47c2a 100644
  			chiaki_takion_send_raw(send_buffer->takion, packet->buf, packet->buf_size);
  			packet->tries++;
 diff --git a/lib/src/videoreceiver.c b/lib/src/videoreceiver.c
-index ed3cc76..7190710 100644
+index ed3cc76..61b7dac 100644
 --- a/lib/src/videoreceiver.c
 +++ b/lib/src/videoreceiver.c
 @@ -3,16 +3,36 @@
@@ -577,7 +581,7 @@ index ed3cc76..7190710 100644
  static bool have_ref_frame(ChiakiVideoReceiver *video_receiver, int32_t frame)
  {
  	for(int i=0; i<16; i++)
-@@ -51,9 +80,16 @@ CHIAKI_EXPORT void chiaki_video_receiver_init(ChiakiVideoReceiver *video_receive
+@@ -51,9 +80,21 @@ CHIAKI_EXPORT void chiaki_video_receiver_init(ChiakiVideoReceiver *video_receive
  	video_receiver->frames_lost = 0;
  	video_receiver->frames_lost_total = 0;
  	memset(video_receiver->reference_frames, -1, sizeof(video_receiver->reference_frames));
@@ -585,6 +589,11 @@ index ed3cc76..7190710 100644
 +	video_receiver->picture_damaged = false;
 +	video_receiver->damaged_frames = 0;
 +	video_receiver->damaged_since_ms = 0;
++	video_receiver->last_packet_index = -1;
++	video_receiver->skipped_from = -1;
++	video_receiver->skipped_to = -1;
++	video_receiver->skips_logged = 0;
++	video_receiver->skips_minute_ms = 0;
  	chiaki_bitstream_init(&video_receiver->bitstream, video_receiver->log, video_receiver->session->connect_info.video_profile.codec);
  	chiaki_mutex_init(&video_receiver->waiting_for_idr_mutex, false);
  	video_receiver->waiting_for_idr = false;
@@ -594,16 +603,57 @@ index ed3cc76..7190710 100644
  	chiaki_mutex_init(&video_receiver->frames_lost_mutex, false);
  }
  
-@@ -162,7 +198,7 @@ CHIAKI_EXPORT void chiaki_video_receiver_av_packet(ChiakiVideoReceiver *video_re
+@@ -113,6 +154,16 @@ CHIAKI_EXPORT void chiaki_video_receiver_stream_info(ChiakiVideoReceiver *video_
+ 
+ CHIAKI_EXPORT void chiaki_video_receiver_av_packet(ChiakiVideoReceiver *video_receiver, ChiakiTakionAVPacket *packet)
+ {
++	// Video packets are numbered one after another across frames, so a jump in frame numbers with no
++	// jump in packet numbers means the PS5 never sent those frames: its encoder leaves frames out when
++	// the bitrate it allows itself is tight. Nothing was lost then, and reporting it as corrupt only made
++	// the PS5 lower the bitrate further and send big fresh pictures, which made it leave out more.
++	bool packets_contiguous = video_receiver->last_packet_index >= 0
++		&& packet->packet_index == (ChiakiSeqNum16)(video_receiver->last_packet_index + 1);
++	if(video_receiver->last_packet_index < 0
++		|| chiaki_seq_num_16_gt(packet->packet_index, (ChiakiSeqNum16)video_receiver->last_packet_index))
++		video_receiver->last_packet_index = packet->packet_index;
++
+ 	// old frame?
+ 	ChiakiSeqNum16 frame_index = packet->frame_index;
+ 	ChiakiErrorCode err = CHIAKI_ERR_SUCCESS;
+@@ -161,10 +212,28 @@ CHIAKI_EXPORT void chiaki_video_receiver_av_packet(ChiakiVideoReceiver *video_re
+ 		if(chiaki_seq_num_16_gt(frame_index, next_frame_expected)
  			&& !(frame_index == 1 && video_receiver->frame_index_cur < 0)) // ok for frame 1
  		{
- 			CHIAKI_LOGW(video_receiver->log, "Detected missing or corrupt frame(s) from %d to %d", next_frame_expected, (int)frame_index);
+-			CHIAKI_LOGW(video_receiver->log, "Detected missing or corrupt frame(s) from %d to %d", next_frame_expected, (int)frame_index);
 -			err = stream_connection_send_corrupt_frame(&video_receiver->session->stream_connection, next_frame_expected, frame_index - 1);
-+			err = video_receiver_report_corrupt(video_receiver, next_frame_expected, frame_index - 1);
- 			if(err != CHIAKI_ERR_SUCCESS)
- 				CHIAKI_LOGW(video_receiver->log, "Error sending corrupt frame.");
+-			if(err != CHIAKI_ERR_SUCCESS)
+-				CHIAKI_LOGW(video_receiver->log, "Error sending corrupt frame.");
++			if(packets_contiguous && packet->unit_index == 0 && video_receiver->frame_index_prev_complete == video_receiver->frame_index_cur)
++			{
++				video_receiver->skipped_from = next_frame_expected;
++				video_receiver->skipped_to = (ChiakiSeqNum16)(frame_index - 1);
++				uint64_t now = chiaki_time_now_monotonic_ms();
++				if(now - video_receiver->skips_minute_ms >= 60000)
++				{
++					if(video_receiver->skips_logged > 5)
++						CHIAKI_LOGI(video_receiver->log, "The PS5 left out frames %d more times in the last minute", (int)video_receiver->skips_logged - 5);
++					video_receiver->skips_minute_ms = now;
++					video_receiver->skips_logged = 0;
++				}
++				if(++video_receiver->skips_logged <= 5)
++					CHIAKI_LOGI(video_receiver->log, "The PS5 left out frame(s) %d to %d, nothing was lost", next_frame_expected, (int)frame_index - 1);
++			}
++			else
++			{
++				CHIAKI_LOGW(video_receiver->log, "Detected missing or corrupt frame(s) from %d to %d", next_frame_expected, (int)frame_index);
++				err = video_receiver_report_corrupt(video_receiver, next_frame_expected, frame_index - 1);
++				if(err != CHIAKI_ERR_SUCCESS)
++					CHIAKI_LOGW(video_receiver->log, "Error sending corrupt frame.");
++			}
  		}
-@@ -188,6 +224,34 @@ CHIAKI_EXPORT void chiaki_video_receiver_av_packet(ChiakiVideoReceiver *video_re
+ 
+ 		video_receiver->frame_index_cur = frame_index;
+@@ -188,6 +257,34 @@ CHIAKI_EXPORT void chiaki_video_receiver_av_packet(ChiakiVideoReceiver *video_re
  	}
  }
  
@@ -638,7 +688,7 @@ index ed3cc76..7190710 100644
  static ChiakiErrorCode chiaki_video_receiver_flush_frame(ChiakiVideoReceiver *video_receiver)
  {
  	uint8_t *frame;
-@@ -200,7 +264,7 @@ static ChiakiErrorCode chiaki_video_receiver_flush_frame(ChiakiVideoReceiver *vi
+@@ -200,7 +297,7 @@ static ChiakiErrorCode chiaki_video_receiver_flush_frame(ChiakiVideoReceiver *vi
  		if (flush_result == CHIAKI_FRAME_PROCESSOR_FLUSH_RESULT_FEC_FAILED)
  		{
  			ChiakiSeqNum16 next_frame_expected = (ChiakiSeqNum16)(video_receiver->frame_index_prev_complete + 1);
@@ -647,7 +697,7 @@ index ed3cc76..7190710 100644
  			if(video_receiver->session->connect_info.enable_idr_on_fec_failure)
  			{
  				bool waiting_for_idr = chiaki_video_receiver_get_waiting_for_idr(video_receiver);
-@@ -211,6 +275,7 @@ static ChiakiErrorCode chiaki_video_receiver_flush_frame(ChiakiVideoReceiver *vi
+@@ -211,6 +308,7 @@ static ChiakiErrorCode chiaki_video_receiver_flush_frame(ChiakiVideoReceiver *vi
  					idr_request_sent = err == CHIAKI_ERR_SUCCESS;
  					if(err == CHIAKI_ERR_SUCCESS)
  					{
@@ -655,7 +705,7 @@ index ed3cc76..7190710 100644
  						chiaki_video_receiver_set_waiting_for_idr(video_receiver, true);
  						CHIAKI_LOGI(video_receiver->log, "FEC failed, waiting for IDR frame");
  					}
-@@ -222,6 +287,7 @@ static ChiakiErrorCode chiaki_video_receiver_flush_frame(ChiakiVideoReceiver *vi
+@@ -222,6 +320,7 @@ static ChiakiErrorCode chiaki_video_receiver_flush_frame(ChiakiVideoReceiver *vi
  				else
  				{
  					CHIAKI_LOGW(video_receiver->log, "Video FEC failure, already waiting for requested IDR");
@@ -663,7 +713,7 @@ index ed3cc76..7190710 100644
  				}
  				ChiakiEvent event = { 0 };
  				event.type = CHIAKI_EVENT_VIDEO_FEC_FAILURE;
-@@ -229,7 +295,15 @@ static ChiakiErrorCode chiaki_video_receiver_flush_frame(ChiakiVideoReceiver *vi
+@@ -229,7 +328,15 @@ static ChiakiErrorCode chiaki_video_receiver_flush_frame(ChiakiVideoReceiver *vi
  				event.video_fec_failure.idr_request_sent = idr_request_sent;
  				chiaki_session_send_event(video_receiver->session, &event);
  			}
@@ -680,7 +730,7 @@ index ed3cc76..7190710 100644
  		chiaki_mutex_lock(&video_receiver->frames_lost_mutex);
  		video_receiver->frames_lost += lost;
  		video_receiver->frames_lost_total += lost;
-@@ -242,6 +316,11 @@ static ChiakiErrorCode chiaki_video_receiver_flush_frame(ChiakiVideoReceiver *vi
+@@ -242,6 +349,11 @@ static ChiakiErrorCode chiaki_video_receiver_flush_frame(ChiakiVideoReceiver *vi
  
  	bool succ = flush_result != CHIAKI_FRAME_PROCESSOR_FLUSH_RESULT_FEC_FAILED;
  	bool recovered = false;
@@ -692,7 +742,7 @@ index ed3cc76..7190710 100644
  
  	ChiakiBitstreamSlice slice;
  	if(chiaki_bitstream_slice(&video_receiver->bitstream, frame, frame_size, &slice))
-@@ -250,20 +329,29 @@ static ChiakiErrorCode chiaki_video_receiver_flush_frame(ChiakiVideoReceiver *vi
+@@ -250,21 +362,48 @@ static ChiakiErrorCode chiaki_video_receiver_flush_frame(ChiakiVideoReceiver *vi
  		{
  			if(slice.slice_type == CHIAKI_BITSTREAM_SLICE_I)
  			{
@@ -717,12 +767,32 @@ index ed3cc76..7190710 100644
  		if(slice.slice_type == CHIAKI_BITSTREAM_SLICE_P)
  		{
  			ChiakiSeqNum16 ref_frame_index = video_receiver->frame_index_cur - slice.reference_frame - 1;
+-			if(slice.reference_frame != 0xff && !have_ref_frame(video_receiver, ref_frame_index))
 +			if(slice.reference_frame != 0xff)
 +				clean = ref_frame_clean(video_receiver, ref_frame_index);
- 			if(slice.reference_frame != 0xff && !have_ref_frame(video_receiver, ref_frame_index))
++			// Built on a frame the PS5 left out: it was encoded from the frame sent before those, so
++			// pointing it there is right, and the picture comes out whole
++			bool left_out = video_receiver->skipped_from >= 0
++				&& !chiaki_seq_num_16_lt(ref_frame_index, (ChiakiSeqNum16)video_receiver->skipped_from)
++				&& !chiaki_seq_num_16_gt(ref_frame_index, (ChiakiSeqNum16)video_receiver->skipped_to);
++			if(left_out && slice.reference_frame != 0xff && !have_ref_frame(video_receiver, ref_frame_index))
++			{
++				ChiakiSeqNum16 before = (ChiakiSeqNum16)(video_receiver->skipped_from - 1);
++				unsigned back = (ChiakiSeqNum16)(video_receiver->frame_index_cur - before) - 1;
++				if(back < 16 && have_ref_frame(video_receiver, before)
++					&& chiaki_bitstream_slice_set_reference_frame(&video_receiver->bitstream, frame, frame_size, back))
++				{
++					clean = ref_frame_clean(video_receiver, before);
++					CHIAKI_LOGV(video_receiver->log, "Frame %d built on left-out frame %d, using %d", (int)video_receiver->frame_index_cur, (int)ref_frame_index, (int)before);
++				}
++				else
++					left_out = false;
++			}
++			if(!left_out && slice.reference_frame != 0xff && !have_ref_frame(video_receiver, ref_frame_index))
  			{
  				for(unsigned i=slice.reference_frame+1; i<16; i++)
-@@ -279,6 +367,8 @@ static ChiakiErrorCode chiaki_video_receiver_flush_frame(ChiakiVideoReceiver *vi
+ 				{
+@@ -279,6 +418,8 @@ static ChiakiErrorCode chiaki_video_receiver_flush_frame(ChiakiVideoReceiver *vi
  						break;
  					}
  				}
@@ -731,7 +801,7 @@ index ed3cc76..7190710 100644
  				if(!recovered)
  				{
  					succ = false;
-@@ -292,9 +382,26 @@ static ChiakiErrorCode chiaki_video_receiver_flush_frame(ChiakiVideoReceiver *vi
+@@ -292,9 +433,26 @@ static ChiakiErrorCode chiaki_video_receiver_flush_frame(ChiakiVideoReceiver *vi
  		}
  	}
  
@@ -759,7 +829,7 @@ index ed3cc76..7190710 100644
  		chiaki_mutex_lock(&video_receiver->frames_lost_mutex);
  		video_receiver->frames_lost = 0;
  		chiaki_mutex_unlock(&video_receiver->frames_lost_mutex);
-@@ -305,7 +412,7 @@ static ChiakiErrorCode chiaki_video_receiver_flush_frame(ChiakiVideoReceiver *vi
+@@ -305,7 +463,7 @@ static ChiakiErrorCode chiaki_video_receiver_flush_frame(ChiakiVideoReceiver *vi
  		}
  		else
  		{
