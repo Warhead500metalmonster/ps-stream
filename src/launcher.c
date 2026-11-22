@@ -3,12 +3,28 @@
 #include <windows.h>
 #include <wchar.h>
 
+// The same name as in main.c
+#ifdef PSSTREAM_TEST
+#define UPDATE_MUTEX L"PSStreamTestUpdating"
+#else
+#define UPDATE_MUTEX L"PSStreamUpdating"
+#endif
+
 int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmd, int show)
 {
 	(void)inst;
 	(void)prev;
 	(void)cmd;
 	(void)show;
+	// An update is swapping the files in dist, and opens the app itself when it's done
+	HANDLE updating = OpenMutexW(SYNCHRONIZE | MUTEX_MODIFY_STATE, FALSE, UPDATE_MUTEX);
+	if(updating)
+	{
+		if(WaitForSingleObject(updating, 0) == WAIT_TIMEOUT)
+			return 0;
+		ReleaseMutex(updating);
+		CloseHandle(updating);
+	}
 	wchar_t dir[MAX_PATH], app[MAX_PATH + 32], line[MAX_PATH + 40];
 	GetModuleFileNameW(NULL, dir, MAX_PATH);
 	wchar_t *slash = wcsrchr(dir, L'\\');

@@ -52,7 +52,7 @@
 
 // Below this rate we are outside what chiaki-ng offers, so a console that refuses to start
 // gets a second try with it.
-#define APP_VERSION "1.3.8"
+#define APP_VERSION "1.3.9"
 #define UPDATE_RECHECK_MS (6 * 60 * 60 * 1000)
 #define UPDATE_TRIES 6
 #define UPDATE_RETRY_MS 20000
@@ -3145,21 +3145,49 @@ static void update_asset_find(const char *json, const char *tag)
 	json_object_put(root);
 }
 
+// Held while a version swaps its files for the next. Starting the app right then used to make that
+// copy the one that ran: it deleted the files kept for going back, the updater saw its own copy quit
+// and went back, and the launcher and license files were gone. The launcher checks it too.
+#ifdef PSSTREAM_TEST
+#define UPDATE_MUTEX L"PSStreamTestUpdating"
+#else
+#define UPDATE_MUTEX L"PSStreamUpdating"
+#endif
+#define UPDATE_SWAP_WAIT_MS 180000
+#define UPDATE_SINGLE_WAIT_MS 10000
+
+// Whether an update is still swapping files after waiting this long for it
+static bool update_running(DWORD wait_ms)
+{
+	HANDLE updating = OpenMutexW(SYNCHRONIZE | MUTEX_MODIFY_STATE, FALSE, UPDATE_MUTEX);
+	if(!updating)
+		return false;
+	bool busy = WaitForSingleObject(updating, wait_ms) == WAIT_TIMEOUT;
+	if(!busy)
+		ReleaseMutex(updating);
+	CloseHandle(updating);
+	return busy;
+}
+
 // The folder holding the launcher and dist, or false when the app wasn't installed from the zip.
+// A missing launcher doesn't count against it: updates stopped for good when it was, and it is the
+// update that puts it back.
 static bool update_install_root(wchar_t *root)
 {
 	GetModuleFileNameW(NULL, root, MAX_PATH);
 	wchar_t *slash = wcsrchr(root, L'\\');
-	if(!slash)
+	if(!slash || _wcsicmp(slash + 1, L"PS Stream.exe") != 0)
 		return false;
 	*slash = 0;
+	wchar_t sdl[MAX_PATH + 16];
+	swprintf(sdl, MAX_PATH + 16, L"%ls\\SDL2.dll", root);
+	if(GetFileAttributesW(sdl) == INVALID_FILE_ATTRIBUTES)
+		return false;
 	slash = wcsrchr(root, L'\\');
 	if(!slash || _wcsicmp(slash + 1, L"dist") != 0)
 		return false;
 	*slash = 0;
-	wchar_t launcher[MAX_PATH + 32];
-	swprintf(launcher, MAX_PATH + 32, L"%ls\\PS Stream.exe", root);
-	return GetFileAttributesW(launcher) != INVALID_FILE_ATTRIBUTES;
+	return true;
 }
 
 static bool update_available_here(void)
@@ -3458,10 +3486,14 @@ static void update_roll_back(void)
 	{
 		UpdateMove *m = &update_moves[i];
 		swprintf(old, MAX_PATH + 16, L"%ls" UPDATE_OLD_SUFFIX, m->target);
-		if(m->placed)
-			DeleteFileW(m->target);
+		// Replaced, never deleted first: with the old file gone, the new one is better than none
 		if(m->had_old)
-			move_retry(old, m->target, MOVEFILE_REPLACE_EXISTING);
+		{
+			if(GetFileAttributesW(old) != INVALID_FILE_ATTRIBUTES)
+				move_retry(old, m->target, MOVEFILE_REPLACE_EXISTING);
+		}
+		else if(m->placed)
+			DeleteFileW(m->target);
 	}
 }
 
@@ -3486,6 +3518,8 @@ static void update_finish(void)
 	swprintf(staged, MAX_PATH + 32, L"%ls\\PS Stream", dir);
 	swprintf(staged_dist, MAX_PATH + 32, L"%ls\\PS Stream\\dist", dir);
 
+	// Taken before the single instance is let go, so there's no moment another copy could start in
+	HANDLE updating = CreateMutexW(NULL, TRUE, UPDATE_MUTEX);
 	if(g.single_instance)
 		CloseHandle(g.single_instance);
 	HANDLE ready = CreateEventW(NULL, TRUE, FALSE, L"PSStreamUpdated");
@@ -3515,6 +3549,11 @@ static void update_finish(void)
 			CloseHandle(pi.hThread);
 		}
 	}
+	if(updating)
+	{
+		ReleaseMutex(updating);
+		CloseHandle(updating);
+	}
 }
 
 // Clears what the previous version left behind. It may still be closing, so this tries for a while.
@@ -3523,6 +3562,9 @@ static DWORD WINAPI update_cleanup_main(void *arg)
 	(void)arg;
 	wchar_t root[MAX_PATH], dir[MAX_PATH];
 	bool installed = update_install_root(root);
+	// What's kept for going back is only waste once the update that put it there has finished
+	if(update_running(UPDATE_SWAP_WAIT_MS))
+		return 0;
 	for(int attempt = 0; attempt < 6 && !g.quit; attempt++)
 	{
 		if(attempt)
@@ -3602,6 +3644,8 @@ static DWORD WINAPI update_check_main(void *arg)
 		update_asset_find(body.data, tag);
 		snprintf(g.update_tag, sizeof(g.update_tag), "%s", tag);
 		g.update_ready = 1;
+		if(!update_available_here())
+			CHIAKI_LOGW(&g.log, "%s can't install itself here: %s", tag, g.update_url[0] ? "not a folder from the zip" : "the release has no file to install");
 		PostMessageW(g.hwnd, WM_APP_STATUS, 0, 0);
 	}
 	CHIAKI_LOGI(&g.log, "Update check: current %s, latest %s (%s)", current, tag[0] ? tag : "unknown", curl_easy_strerror(res));

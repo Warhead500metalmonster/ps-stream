@@ -77,7 +77,7 @@ The app keeps itself up to date. At startup, it asks GitHub for the latest relea
 
 When there's a newer version, the app downloads it from GitHub, checks it against the checksum GitHub lists for that file, replaces its files and restarts. Your pairing and settings stay as they are. It never interrupts a game: it installs right after the app opens, or once audio and video are both off.
 
-If the new version doesn't start, the old files go back and the old version keeps running. After three failed tries, the app stops installing that version by itself, and the **Update** button at the bottom lets you try again.
+Opening the app while it updates does nothing: the update opens it when it's done. If the new version doesn't start, the old files go back and the old version keeps running. After three failed tries, the app stops installing that version by itself, and the **Update** button at the bottom lets you try again.
 
 ## Known limitations
 

@@ -2819,9 +2819,23 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmd, int show)
 	// A second copy would fight the first one for the PS5 and the hotkeys, so show the first instead
 	if(argc < 3)
 	{
+		bool from_update = g.relaunched || g.update_failed;
 		HANDLE single = CreateMutexW(NULL, FALSE, INSTANCE_MUTEX);
+		bool taken = single && GetLastError() == ERROR_ALREADY_EXISTS;
+		// Looked at only now, as the updater takes its mutex before it lets go of this one. The
+		// update opens the app itself, so a copy started meanwhile just leaves.
+		if(!from_update && update_running(0))
+			return 0;
+		// Such a copy can still hold the mutex for a moment when the updated app starts
+		for(DWORD waited = 0; from_update && taken && waited < UPDATE_SINGLE_WAIT_MS; waited += 100)
+		{
+			CloseHandle(single);
+			Sleep(100);
+			single = CreateMutexW(NULL, FALSE, INSTANCE_MUTEX);
+			taken = single && GetLastError() == ERROR_ALREADY_EXISTS;
+		}
 		g.single_instance = single;
-		if(single && GetLastError() == ERROR_ALREADY_EXISTS)
+		if(taken)
 		{
 			HWND first = FindWindowW(WINDOW_CLASS, NULL);
 			if(first)
