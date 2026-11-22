@@ -52,7 +52,7 @@
 
 // Below this rate we are outside what chiaki-ng offers, so a console that refuses to start
 // gets a second try with it.
-#define APP_VERSION "1.3.7"
+#define APP_VERSION "1.3.8"
 #define UPDATE_RECHECK_MS (6 * 60 * 60 * 1000)
 #define UPDATE_TRIES 6
 #define UPDATE_RETRY_MS 20000
@@ -1917,6 +1917,9 @@ static void haptics_frame_cb(uint8_t *buf, size_t buf_size, void *user)
 static bool session_start(bool video, const Settings *s, bool safe)
 {
 	ChiakiCodec codec = s->h265 ? CHIAKI_CODEC_H265 : CHIAKI_CODEC_H264;
+	// 360p H.265 is newer here than the connection that always worked, so a refusal goes back to that
+	if(safe && s->res == RES_MIN)
+		codec = CHIAKI_CODEC_H264;
 	ChiakiConnectInfo info;
 	memset(&info, 0, sizeof(info));
 	info.ps5 = true;
@@ -2809,13 +2812,15 @@ static int hotkey_load(const char *key, int fallback)
 }
 
 // H.265 gives the same picture as H.264 in about 60% of the data, and on weak Wi-Fi less data means
-// less lost. So the 720p and 1080p presets use it wherever the graphics card decodes it, and fall
-// back to H.264 where it doesn't. 360p stays H.264, where the saving is small.
+// less lost. So every preset uses it wherever the graphics card decodes it, and falls back to
+// H.264 where it doesn't. 360p needs it for more than the saving: chiaki can only point a frame whose
+// reference was lost at another one in H.265, and in H.264 one lost frame stopped the picture until
+// the PS5 sent a whole new one (2683 of 2683 such frames in the session of 2026-11-22 01:30).
 // Balanced keeps the 6 Mbps of its H.264 version: at 3.5 Mbps the PS5 sent at most 2 Mbps, and a
 // detailed game like GTA 6 turned blurry. H.265 spends the same data on a cleaner picture instead.
 static const Preset presets_hevc[] = {
-	{ 1, 30, 500, 0 },
-	{ 1, 30, 2000, 0 },
+	{ 1, 30, 500, 1 },
+	{ 1, 30, 2000, 1 },
 	{ 3, 30, 6000, 1 },
 	{ 4, 60, 12000, 1 },
 	{ 4, 60, 50000, 1 },

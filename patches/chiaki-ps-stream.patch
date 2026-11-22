@@ -50,10 +50,10 @@ index 16bad78..ca12ad5 100644
  	bool video_queue_initialized;
  	int64_t video_queue_head_wait_start_us;
 diff --git a/lib/include/chiaki/videoreceiver.h b/lib/include/chiaki/videoreceiver.h
-index a340b5d..23875b3 100644
+index a340b5d..c410323 100644
 --- a/lib/include/chiaki/videoreceiver.h
 +++ b/lib/include/chiaki/videoreceiver.h
-@@ -34,9 +34,20 @@ typedef struct chiaki_video_receiver_t
+@@ -34,9 +34,21 @@ typedef struct chiaki_video_receiver_t
  	int32_t frames_lost;
  	int32_t frames_lost_total;
  	int32_t reference_frames[16];
@@ -70,12 +70,71 @@ index a340b5d..23875b3 100644
  	bool waiting_for_idr;
 +	uint64_t idr_requested_ms; // when the IDR frame being waited for was last asked for
 +	uint64_t corrupt_reported_ms; // when corrupt frames were last reported
++	int32_t corrupt_reported_from; // where that report began, -1 for none
 +	int32_t lost_counted_to; // last frame already counted as lost, -1 for none
  	ChiakiMutex frames_lost_mutex;
  } ChiakiVideoReceiver;
  
+diff --git a/lib/src/audioreceiver.c b/lib/src/audioreceiver.c
+index af91910..52da771 100644
+--- a/lib/src/audioreceiver.c
++++ b/lib/src/audioreceiver.c
+@@ -7,6 +7,9 @@
+ #include <string.h>
+ 
+ #define CHIAKI_AUDIO_JITTER_PREFILL 3
++// Made-up sound fades to silence within this long. An outage used to get one piece for every 10 ms
++// missed, all at once, and the real sound after it was thrown away to work off that backlog.
++#define CHIAKI_AUDIO_CONCEAL_MAX 10
+ #define CHIAKI_AUDIO_JITTER_BUFFER_SIZE 8
+ 
+ static void chiaki_audio_receiver_frame(ChiakiAudioReceiver *audio_receiver, ChiakiSeqNum16 frame_index, bool is_haptics, uint8_t *buf, size_t buf_size);
+@@ -118,8 +121,16 @@ CHIAKI_EXPORT void chiaki_audio_receiver_av_packet(ChiakiAudioReceiver *audio_re
+ 	if(packet->frame_index > (1 << 15))
+ 		audio_receiver->frame_index_startup = false;
+ 
+-	for(size_t i = 0; i < source_units_count + fec_units_count; i++)
++	if(!packet->is_haptics && !audio_receiver->playback_started && !audio_receiver->jitter_buffer_count)
++		CHIAKI_LOGI(audio_receiver->log, "Audio packets carry %u new and %u backup pieces each",
++			(unsigned int)source_units_count, (unsigned int)fec_units_count);
++
++	// A packet repeats the pieces before its own, so those go in first. With its own piece first, a
++	// missing one was made up and passed on before the copy in this very packet was looked at, and
++	// the copy was then dropped as too old: every lost packet was heard.
++	for(size_t n = 0; n < source_units_count + fec_units_count; n++)
+ 	{
++		size_t i = n < fec_units_count ? source_units_count + n : n - fec_units_count;
+ 		ChiakiSeqNum16 frame_index;
+ 		if(i < source_units_count)
+ 			frame_index = packet->frame_index + i;
+@@ -236,6 +247,9 @@ static void chiaki_audio_receiver_frame(ChiakiAudioReceiver *audio_receiver, Chi
+ 				}
+ 				if(can_conceal_loss)
+ 				{
++					ChiakiSeqNum16 oldest_index = audio_receiver->jitter_buffer[oldest].frame_index;
++					if((ChiakiSeqNum16)(oldest_index - audio_receiver->next_frame_index) > CHIAKI_AUDIO_CONCEAL_MAX)
++						audio_receiver->next_frame_index = oldest_index - CHIAKI_AUDIO_CONCEAL_MAX;
+ 					frame_cb = audio_receiver->session->audio_sink.frame_cb;
+ 					frame_cb_user = audio_receiver->session->audio_sink.user;
+ 					deliver_buf = NULL;
+diff --git a/lib/src/packetstats.c b/lib/src/packetstats.c
+index 58ef4c6..81704e7 100644
+--- a/lib/src/packetstats.c
++++ b/lib/src/packetstats.c
+@@ -68,8 +68,9 @@ CHIAKI_EXPORT void chiaki_packet_stats_get(ChiakiPacketStats *stats, bool reset,
+ 	//		(unsigned long long)stats->gen_lost);
+ 
+ 	// seq
+-	uint64_t seq_diff = stats->seq_max - stats->seq_min; // overflow on purpose if max < min
+-	uint64_t seq_lost = stats->seq_received > seq_diff ? seq_diff : seq_diff - stats->seq_received;
++	uint64_t seq_diff = (ChiakiSeqNum16)(stats->seq_max - stats->seq_min); // 16 bit, the numbers wrap every 11 minutes
++	// More received than the numbers span is a repeated or late packet, not a window where all were lost
++	uint64_t seq_lost = seq_diff > stats->seq_received ? seq_diff - stats->seq_received : 0;
+ 	*received += stats->seq_received;
+ 	*lost += seq_lost;
+ 
 diff --git a/lib/src/reorderqueue.c b/lib/src/reorderqueue.c
-index 656c10d..f295fb7 100644
+index 656c10d..15b6d55 100644
 --- a/lib/src/reorderqueue.c
 +++ b/lib/src/reorderqueue.c
 @@ -172,6 +172,18 @@ CHIAKI_EXPORT bool chiaki_reorder_queue_peek(ChiakiReorderQueue *queue, uint64_t
@@ -97,6 +156,14 @@ index 656c10d..f295fb7 100644
  CHIAKI_EXPORT void chiaki_reorder_queue_drop(ChiakiReorderQueue *queue, uint64_t index)
  {
  	if(index >= queue->count)
+@@ -184,6 +196,7 @@ CHIAKI_EXPORT void chiaki_reorder_queue_drop(ChiakiReorderQueue *queue, uint64_t
+ 
+ 	if(queue->drop_cb)
+ 		queue->drop_cb(seq_num, entry->user, queue->drop_cb_user);
++	entry->set = false; // freed by the callback, so it mustn't be pulled again (fixed in chiaki-ng 1.10.1)
+ 
+ 	// reduce count if necessary
+ 	if(index == queue->count - 1)
 diff --git a/lib/src/senkusha.c b/lib/src/senkusha.c
 index 05b4517..7133e77 100644
 --- a/lib/src/senkusha.c
@@ -290,7 +357,7 @@ index afa1a60..b859beb 100644
  	{
  		CHIAKI_LOGE(stream_connection->log, "StreamConnection failed to send controller connection");
 diff --git a/lib/src/takion.c b/lib/src/takion.c
-index 38f9f5d..ddc3a6f 100644
+index 38f9f5d..f06c294 100644
 --- a/lib/src/takion.c
 +++ b/lib/src/takion.c
 @@ -42,10 +42,19 @@
@@ -309,9 +376,9 @@ index 38f9f5d..ddc3a6f 100644
  #define TAKION_AV_VIDEO_REORDER_QUEUE_SIZE_EXP 6 // => 64 entries
  #define TAKION_AV_REORDER_TIMEOUT_US 16000 // ~1 frame at 60fps
 -#define TAKION_SEND_BUFFER_SIZE 16
-+// 16 filled up within half a second of a loss burst with corrupt frame reports, and anything sent
-+// after that, IDR requests included, was never resent when lost
-+#define TAKION_SEND_BUFFER_SIZE 64
++// 16, and later 64, filled up in a loss burst, and anything sent after that, IDR requests included,
++// was never resent when lost. chiaki-ng 1.10.1 went to 1024 for the same reason.
++#define TAKION_SEND_BUFFER_SIZE 1024
  
  #define TAKION_POSTPONE_PACKETS_SIZE 32
  
@@ -477,7 +544,7 @@ index 38f9f5d..ddc3a6f 100644
  			return err;
  	}
 diff --git a/lib/src/takionsendbuffer.c b/lib/src/takionsendbuffer.c
-index 5cee13c..3d47c2a 100644
+index 5cee13c..106d00b 100644
 --- a/lib/src/takionsendbuffer.c
 +++ b/lib/src/takionsendbuffer.c
 @@ -11,8 +11,14 @@
@@ -491,9 +558,9 @@ index 5cee13c..3d47c2a 100644
 +#define TAKION_DATA_RESEND_FAST_TRIES 25
 +#define TAKION_DATA_RESEND_SLOW_TIMEOUT_MS 1000
 +#define TAKION_DATA_RESEND_TRIES_MAX (TAKION_DATA_RESEND_FAST_TRIES + 35)
-+// 16 filled up within half a second of a loss burst with corrupt frame reports, and anything sent
-+// after that, IDR requests included, was never resent when lost
-+#define TAKION_SEND_BUFFER_SIZE 64
++// 16, and later 64, filled up in a loss burst, and anything sent after that, IDR requests included,
++// was never resent when lost. chiaki-ng 1.10.1 went to 1024 for the same reason.
++#define TAKION_SEND_BUFFER_SIZE 1024
  
  #endif
  
@@ -519,10 +586,10 @@ index 5cee13c..3d47c2a 100644
  			chiaki_takion_send_raw(send_buffer->takion, packet->buf, packet->buf_size);
  			packet->tries++;
 diff --git a/lib/src/videoreceiver.c b/lib/src/videoreceiver.c
-index ed3cc76..61b7dac 100644
+index ed3cc76..d507fec 100644
 --- a/lib/src/videoreceiver.c
 +++ b/lib/src/videoreceiver.c
-@@ -3,16 +3,36 @@
+@@ -3,16 +3,40 @@
  #include <chiaki/videoreceiver.h>
  #include "../include/chiaki/session.h"
  
@@ -535,14 +602,18 @@ index ed3cc76..61b7dac 100644
 +
 +// While waiting for an IDR frame every new frame is skipped, and each one used to send the PS5 another
 +// reliable report of the same, ever longer range: 30 a second, right when Wi-Fi had the least room.
++// The same goes without waiting for one. H.264 can't be pointed at another reference, so after one
++// lost frame none completes until a whole picture arrives, and the range grows just the same.
 +#define CORRUPT_REPORT_WAITING_MS 250
 +
 +static ChiakiErrorCode video_receiver_report_corrupt(ChiakiVideoReceiver *video_receiver, ChiakiSeqNum16 start, ChiakiSeqNum16 end)
 +{
 +	uint64_t now = chiaki_time_now_monotonic_ms();
-+	if(chiaki_video_receiver_get_waiting_for_idr(video_receiver) && now - video_receiver->corrupt_reported_ms < CORRUPT_REPORT_WAITING_MS)
++	bool same_range = video_receiver->corrupt_reported_from == (int32_t)start;
++	if((same_range || chiaki_video_receiver_get_waiting_for_idr(video_receiver)) && now - video_receiver->corrupt_reported_ms < CORRUPT_REPORT_WAITING_MS)
 +		return CHIAKI_ERR_SUCCESS;
 +	video_receiver->corrupt_reported_ms = now;
++	video_receiver->corrupt_reported_from = start;
 +	return stream_connection_send_corrupt_frame(&video_receiver->session->stream_connection, start, end);
 +}
 +
@@ -560,7 +631,7 @@ index ed3cc76..61b7dac 100644
  		return;
  	}
  	for(int i=15; i>=0; i--)
-@@ -20,11 +40,20 @@ static void add_ref_frame(ChiakiVideoReceiver *video_receiver, int32_t frame)
+@@ -20,11 +44,20 @@ static void add_ref_frame(ChiakiVideoReceiver *video_receiver, int32_t frame)
  		if(video_receiver->reference_frames[i] == -1)
  		{
  			video_receiver->reference_frames[i] = frame;
@@ -581,7 +652,7 @@ index ed3cc76..61b7dac 100644
  static bool have_ref_frame(ChiakiVideoReceiver *video_receiver, int32_t frame)
  {
  	for(int i=0; i<16; i++)
-@@ -51,9 +80,21 @@ CHIAKI_EXPORT void chiaki_video_receiver_init(ChiakiVideoReceiver *video_receive
+@@ -51,9 +84,22 @@ CHIAKI_EXPORT void chiaki_video_receiver_init(ChiakiVideoReceiver *video_receive
  	video_receiver->frames_lost = 0;
  	video_receiver->frames_lost_total = 0;
  	memset(video_receiver->reference_frames, -1, sizeof(video_receiver->reference_frames));
@@ -599,11 +670,12 @@ index ed3cc76..61b7dac 100644
  	video_receiver->waiting_for_idr = false;
 +	video_receiver->idr_requested_ms = 0;
 +	video_receiver->corrupt_reported_ms = 0;
++	video_receiver->corrupt_reported_from = -1;
 +	video_receiver->lost_counted_to = -1;
  	chiaki_mutex_init(&video_receiver->frames_lost_mutex, false);
  }
  
-@@ -113,6 +154,16 @@ CHIAKI_EXPORT void chiaki_video_receiver_stream_info(ChiakiVideoReceiver *video_
+@@ -113,6 +159,16 @@ CHIAKI_EXPORT void chiaki_video_receiver_stream_info(ChiakiVideoReceiver *video_
  
  CHIAKI_EXPORT void chiaki_video_receiver_av_packet(ChiakiVideoReceiver *video_receiver, ChiakiTakionAVPacket *packet)
  {
@@ -620,7 +692,7 @@ index ed3cc76..61b7dac 100644
  	// old frame?
  	ChiakiSeqNum16 frame_index = packet->frame_index;
  	ChiakiErrorCode err = CHIAKI_ERR_SUCCESS;
-@@ -161,10 +212,28 @@ CHIAKI_EXPORT void chiaki_video_receiver_av_packet(ChiakiVideoReceiver *video_re
+@@ -161,10 +217,28 @@ CHIAKI_EXPORT void chiaki_video_receiver_av_packet(ChiakiVideoReceiver *video_re
  		if(chiaki_seq_num_16_gt(frame_index, next_frame_expected)
  			&& !(frame_index == 1 && video_receiver->frame_index_cur < 0)) // ok for frame 1
  		{
@@ -653,7 +725,7 @@ index ed3cc76..61b7dac 100644
  		}
  
  		video_receiver->frame_index_cur = frame_index;
-@@ -188,6 +257,34 @@ CHIAKI_EXPORT void chiaki_video_receiver_av_packet(ChiakiVideoReceiver *video_re
+@@ -188,6 +262,34 @@ CHIAKI_EXPORT void chiaki_video_receiver_av_packet(ChiakiVideoReceiver *video_re
  	}
  }
  
@@ -688,7 +760,7 @@ index ed3cc76..61b7dac 100644
  static ChiakiErrorCode chiaki_video_receiver_flush_frame(ChiakiVideoReceiver *video_receiver)
  {
  	uint8_t *frame;
-@@ -200,7 +297,7 @@ static ChiakiErrorCode chiaki_video_receiver_flush_frame(ChiakiVideoReceiver *vi
+@@ -200,7 +302,7 @@ static ChiakiErrorCode chiaki_video_receiver_flush_frame(ChiakiVideoReceiver *vi
  		if (flush_result == CHIAKI_FRAME_PROCESSOR_FLUSH_RESULT_FEC_FAILED)
  		{
  			ChiakiSeqNum16 next_frame_expected = (ChiakiSeqNum16)(video_receiver->frame_index_prev_complete + 1);
@@ -697,7 +769,7 @@ index ed3cc76..61b7dac 100644
  			if(video_receiver->session->connect_info.enable_idr_on_fec_failure)
  			{
  				bool waiting_for_idr = chiaki_video_receiver_get_waiting_for_idr(video_receiver);
-@@ -211,6 +308,7 @@ static ChiakiErrorCode chiaki_video_receiver_flush_frame(ChiakiVideoReceiver *vi
+@@ -211,6 +313,7 @@ static ChiakiErrorCode chiaki_video_receiver_flush_frame(ChiakiVideoReceiver *vi
  					idr_request_sent = err == CHIAKI_ERR_SUCCESS;
  					if(err == CHIAKI_ERR_SUCCESS)
  					{
@@ -705,7 +777,7 @@ index ed3cc76..61b7dac 100644
  						chiaki_video_receiver_set_waiting_for_idr(video_receiver, true);
  						CHIAKI_LOGI(video_receiver->log, "FEC failed, waiting for IDR frame");
  					}
-@@ -222,6 +320,7 @@ static ChiakiErrorCode chiaki_video_receiver_flush_frame(ChiakiVideoReceiver *vi
+@@ -222,6 +325,7 @@ static ChiakiErrorCode chiaki_video_receiver_flush_frame(ChiakiVideoReceiver *vi
  				else
  				{
  					CHIAKI_LOGW(video_receiver->log, "Video FEC failure, already waiting for requested IDR");
@@ -713,7 +785,7 @@ index ed3cc76..61b7dac 100644
  				}
  				ChiakiEvent event = { 0 };
  				event.type = CHIAKI_EVENT_VIDEO_FEC_FAILURE;
-@@ -229,7 +328,15 @@ static ChiakiErrorCode chiaki_video_receiver_flush_frame(ChiakiVideoReceiver *vi
+@@ -229,7 +333,15 @@ static ChiakiErrorCode chiaki_video_receiver_flush_frame(ChiakiVideoReceiver *vi
  				event.video_fec_failure.idr_request_sent = idr_request_sent;
  				chiaki_session_send_event(video_receiver->session, &event);
  			}
@@ -730,7 +802,7 @@ index ed3cc76..61b7dac 100644
  		chiaki_mutex_lock(&video_receiver->frames_lost_mutex);
  		video_receiver->frames_lost += lost;
  		video_receiver->frames_lost_total += lost;
-@@ -242,6 +349,11 @@ static ChiakiErrorCode chiaki_video_receiver_flush_frame(ChiakiVideoReceiver *vi
+@@ -242,6 +354,11 @@ static ChiakiErrorCode chiaki_video_receiver_flush_frame(ChiakiVideoReceiver *vi
  
  	bool succ = flush_result != CHIAKI_FRAME_PROCESSOR_FLUSH_RESULT_FEC_FAILED;
  	bool recovered = false;
@@ -742,7 +814,7 @@ index ed3cc76..61b7dac 100644
  
  	ChiakiBitstreamSlice slice;
  	if(chiaki_bitstream_slice(&video_receiver->bitstream, frame, frame_size, &slice))
-@@ -250,21 +362,48 @@ static ChiakiErrorCode chiaki_video_receiver_flush_frame(ChiakiVideoReceiver *vi
+@@ -250,21 +367,48 @@ static ChiakiErrorCode chiaki_video_receiver_flush_frame(ChiakiVideoReceiver *vi
  		{
  			if(slice.slice_type == CHIAKI_BITSTREAM_SLICE_I)
  			{
@@ -792,7 +864,7 @@ index ed3cc76..61b7dac 100644
  			{
  				for(unsigned i=slice.reference_frame+1; i<16; i++)
  				{
-@@ -279,6 +418,8 @@ static ChiakiErrorCode chiaki_video_receiver_flush_frame(ChiakiVideoReceiver *vi
+@@ -279,6 +423,8 @@ static ChiakiErrorCode chiaki_video_receiver_flush_frame(ChiakiVideoReceiver *vi
  						break;
  					}
  				}
@@ -801,7 +873,7 @@ index ed3cc76..61b7dac 100644
  				if(!recovered)
  				{
  					succ = false;
-@@ -292,9 +433,26 @@ static ChiakiErrorCode chiaki_video_receiver_flush_frame(ChiakiVideoReceiver *vi
+@@ -292,9 +438,26 @@ static ChiakiErrorCode chiaki_video_receiver_flush_frame(ChiakiVideoReceiver *vi
  		}
  	}
  
@@ -829,7 +901,7 @@ index ed3cc76..61b7dac 100644
  		chiaki_mutex_lock(&video_receiver->frames_lost_mutex);
  		video_receiver->frames_lost = 0;
  		chiaki_mutex_unlock(&video_receiver->frames_lost_mutex);
-@@ -305,7 +463,7 @@ static ChiakiErrorCode chiaki_video_receiver_flush_frame(ChiakiVideoReceiver *vi
+@@ -305,7 +468,7 @@ static ChiakiErrorCode chiaki_video_receiver_flush_frame(ChiakiVideoReceiver *vi
  		}
  		else
  		{
