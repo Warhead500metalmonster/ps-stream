@@ -1,0 +1,84 @@
+name: Bir sorun bildir / Report a problem
+description: Ses, görüntü, bağlantı, güncelleme... / Sound, picture, connection, updates...
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Türkçe veya İngilizce yazabilirsin. / Write in Turkish or English.
+
+        **Burası herkese açık. Şifre, eşleştirme PIN'i, PSN hesap bilgisi veya `config.ini` paylaşma:** o dosyada PS5 eşleştirme anahtarların var.
+
+        **This page is public. Don't share passwords, the pairing PIN, PSN account details or `config.ini`:** that file holds your PS5 pairing keys.
+  - type: dropdown
+    id: area
+    attributes:
+      label: Sorun nerede? / What has the problem?
+      options:
+        - Ses / Sound
+        - Görüntü / Picture
+        - Bağlantı veya eşleştirme / Connection or pairing
+        - Gamepad
+        - Güncelleme veya kurulum / Update or installation
+        - Başka / Something else
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: Ne oldu? / What happened?
+      description: Ne yaptın, ne olmasını bekledin, ne oldu? Ekran görüntüsü ekleyebilirsin. / What did you do, what did you expect, and what happened instead? Screenshots are welcome.
+    validations:
+      required: true
+  - type: input
+    id: when
+    attributes:
+      label: Ne zaman oldu? / When did it happen?
+      description: Log'da yerini bulmak için gün ve saat. / The day and time, to find it in the log.
+      placeholder: "22.11.2026 19:40"
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: PS Stream sürümü / PS Stream version
+      description: "log.txt içindeki son \"PS Stream ... started\" satırında yazar. / It is on the last \"PS Stream ... started\" line of log.txt."
+      placeholder: "1.3.9"
+    validations:
+      required: true
+  - type: dropdown
+    id: network
+    attributes:
+      label: Ağ / Network
+      options:
+        - PC ve PS5 Wi-Fi'da / PC and PS5 both on Wi-Fi
+        - Sadece PC Wi-Fi'da / Only the PC on Wi-Fi
+        - Sadece PS5 Wi-Fi'da / Only the PS5 on Wi-Fi
+        - İkisi de kabloda / Both on cable
+        - Bilmiyorum / I don't know
+    validations:
+      required: true
+  - type: input
+    id: pc
+    attributes:
+      label: Ekran kartı ve Windows sürümü / Graphics card and Windows version
+      placeholder: "RTX 4070, Windows 11"
+    validations:
+      required: false
+  - type: textarea
+    id: log
+    attributes:
+      label: Log
+      description: |
+        `Win+R` tuşlarına bas, `%APPDATA%\PSStream` yaz. `log.txt` içinden sorunun olduğu dakikaları yapıştır ya da dosyayı buraya sürükle. Log'da ev ağındaki IP adresleri ve geçici oturum numaraları olabilir, istersen önce sil.
+
+        Press `Win+R` and enter `%APPDATA%\PSStream`. Paste the minutes around the problem from `log.txt`, or drag the file here. The log can hold home network IP addresses and temporary session IDs, so remove those first if you like.
+    validations:
+      required: false
+  - type: checkboxes
+    id: safe
+    attributes:
+      label: Kontrol / Check
+      options:
+        - label: Şifre, PIN, hesap bilgisi veya config.ini paylaşmadım. / I haven't shared a password, PIN, account details or config.ini.
+          required: true

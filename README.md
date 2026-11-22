@@ -79,6 +79,10 @@ When there's a newer version, the app downloads it from GitHub, checks it agains
 
 Opening the app while it updates does nothing: the update opens it when it's done. If the new version doesn't start, the old files go back and the old version keeps running. After three failed tries, the app stops installing that version by itself, and the **Update** button at the bottom lets you try again.
 
+## Report a problem
+
+[Open an issue](https://github.com/Warhead500metalmonster/ps-stream/issues/new/choose) in Turkish or English. Say when it happened, and add that part of `log.txt` if you can. Issues are public: never share `config.ini`, which holds your pairing keys, or a password, PIN or account details.
+
 ## Known limitations
 
 - Windows only.

@@ -1,0 +1,22 @@
+name: Bir fikir öner / Suggest an idea
+description: PS Stream'de olmasını istediğin şey / Something you'd like PS Stream to do
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Türkçe veya İngilizce yazabilirsin. Burası herkese açık, kişisel bilgi paylaşma.
+
+        Write in Turkish or English. This page is public, so don't share personal details.
+  - type: textarea
+    id: idea
+    attributes:
+      label: Ne olsun istiyorsun? / What would you like?
+    validations:
+      required: true
+  - type: textarea
+    id: why
+    attributes:
+      label: Ne işine yarayacak? / What would it help you with?
+    validations:
+      required: false
