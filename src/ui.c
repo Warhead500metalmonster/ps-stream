@@ -2710,52 +2710,69 @@ static DWORD WINAPI demo_main(void *arg)
 	return 0;
 }
 
-// Sound as weak Wi-Fi delivers it in video sessions: 10 ms pieces on time, then every 3 s nothing for
-// 300 to 400 ms and everything held back at once, as in the GTA 6 sessions of 2026-11-19
+// Sound as Wi-Fi delivers it, fed through the real audio path to the real sound device. Game sound
+// is a steady tone, so nothing counts as quiet. Gaps are either held back and then sent at once, as
+// weak Wi-Fi does, or lost for good. Patterns: GTA (2026-11-19 video sessions, every 3 s), START
+// (the audio only start of 2026-11-24 12:02: 171, 157 and 531 ms in the first 7 s) and LOSS.
 static DWORD WINAPI audio_gap_test_main(void *arg)
 {
 	(void)arg;
+	char pattern[16] = "GTA";
+	GetEnvironmentVariableA("PSSTREAM_TEST_GAPS", pattern, sizeof(pattern));
+	g.audio_only = GetEnvironmentVariableW(L"PSSTREAM_TEST_AUDIO_ONLY", NULL, 0) != 0;
 	g.want_audio = 1;
 	audio_settings_cb(2, 48000, NULL);
-	int16_t quiet[480 * 2] = { 0 };
-	static const int gaps[] = { 300, 350, 400, 250, 380 };
-	LONG drained = 0, dropouts = 0;
+	static int16_t tone[480 * 2];
+	static const int gta[] = { 300, 350, 400, 250, 380 };
+	LONG drained = 0;
 	double queued_sum = 0;
-	int queued_n = 0;
+	int queued_n = 0, silent_ms = 0, longest_silence = 0, silence = 0;
 	DWORD start = GetTickCount(), next = start;
-	char traffic[64] = "";
-	wifi_traffic(traffic, sizeof(traffic), start);
-	int piece = 0, held = 0;
-	while(GetTickCount() - start < 45000 && !g.quit)
+	int piece = 0, held = 0, wave = 0;
+	bool start_pattern = strcmp(pattern, "START") == 0, loss = strcmp(pattern, "LOSS") == 0;
+	int seconds = start_pattern ? 20 : 45;
+	while(GetTickCount() - start < (DWORD)seconds * 1000 && !g.quit)
 	{
-		int cycle = piece / 300;
-		int in_cycle = piece % 300;
-		int gap_pieces = gaps[cycle % 5] / 10;
-		if(in_cycle >= 300 - gap_pieces)
+		bool gap;
+		if(start_pattern)
+			gap = (piece >= 140 && piece < 157) || (piece >= 440 && piece < 456) || (piece >= 640 && piece < 693);
+		else
+			gap = piece % 300 >= 300 - gta[(piece / 300) % 5] / 10;
+		for(int i = 0; i < 480; i++, wave++)
+			tone[i * 2] = tone[i * 2 + 1] = (int16_t)(8000 * sin(wave * 2 * 3.14159265 * 440 / 48000));
+		if(gap)
 			held++;
 		else
 		{
-			for(; held > 0; held--)
-				audio_frame_cb(quiet, 480, NULL);
-			audio_frame_cb(quiet, 480, NULL);
+			for(; held > 0 && !loss; held--)
+				audio_frame_cb(tone, 480, NULL);
+			held = 0;
+			audio_frame_cb(tone, 480, NULL);
 		}
 		piece++;
 		next += 10;
 		DWORD now = GetTickCount();
 		if((LONG)(next - now) > 0)
 			Sleep(next - now);
-		if(piece % 10 == 0 && g.audio_dev)
+		if(g.audio_dev)
 		{
-			queued_sum += SDL_GetQueuedAudioSize(g.audio_dev) / 192.0;
-			queued_n++;
+			Uint32 q = SDL_GetQueuedAudioSize(g.audio_dev);
+			bool quiet = g.audio_waiting || q == 0;
+			silence = quiet ? silence + 10 : 0;
+			if(silence > longest_silence)
+				longest_silence = silence;
+			if(quiet && piece > 30)
+				silent_ms += 10;
+			if(piece % 10 == 0)
+			{
+				queued_sum += q / 192.0;
+				queued_n++;
+			}
 		}
 		drained += InterlockedExchange(&g.audio_drained, 0);
 	}
-	dropouts = g.audio_dropouts;
-	wifi_traffic(traffic, sizeof(traffic), GetTickCount());
-	CHIAKI_LOGI(&g.log, "Wi-Fi traffic during the test%s", traffic);
-	CHIAKI_LOGI(&g.log, "Audio gap test: %ld dropouts, %ld pieces of sound skipped, buffer %d ms, sound behind by %.0f ms on average",
-		dropouts, drained, g.audio_target_ms, queued_n ? queued_sum / queued_n : 0.0);
+	CHIAKI_LOGI(&g.log, "Audio test %s%s: %ld dropouts, silent %d ms in all (longest %d ms), %ld pieces of sound skipped, buffer %d ms, sound behind by %.0f ms on average",
+		pattern, g.audio_only ? " audio only" : "", (long)g.audio_dropouts, silent_ms, longest_silence, drained, g.audio_target_ms, queued_n ? queued_sum / queued_n : 0.0);
 	PostMessageW(g.hwnd, WM_CLOSE, 0, 0);
 	return 0;
 }

@@ -52,7 +52,7 @@
 
 // Below this rate we are outside what chiaki-ng offers, so a console that refuses to start
 // gets a second try with it.
-#define APP_VERSION "1.3.10"
+#define APP_VERSION "1.3.11"
 #define UPDATE_RECHECK_MS (6 * 60 * 60 * 1000)
 #define UPDATE_TRIES 6
 #define UPDATE_RETRY_MS 20000
@@ -124,7 +124,9 @@
 // so the sound doesn't stay further behind the picture than it needs to
 #define AUDIO_DRAIN_SLACK_MS 20
 #define AUDIO_DRAIN_GAP_MS 100
-#define AUDIO_DRAIN_LOUD_GAP_MS 1000
+// After a dropout play again once this much is in, like chiaki does, instead of going quiet a whole
+// buffer longer while it refills. Lost packets never come back, so the old wait was silence every time.
+#define AUDIO_RESUME_MS 50
 #define AUDIO_QUIET_PEAK 1000
 #define RECONNECT_MS 1500
 // The PS5 sends sound a hundred times a second, silence included. Nothing at all for this long means
@@ -230,7 +232,7 @@ static struct {
 	ChiakiOpusDecoder opus;
 	SDL_AudioDeviceID audio_dev;
 	uint32_t audio_channels, audio_rate;
-	bool audio_waiting, audio_trimming, audio_only;
+	bool audio_waiting, audio_trimming, audio_only, audio_refill;
 	bool hevc_hw; // presets use H.265, see presets_hevc
 	int audio_target_ms;
 	DWORD audio_last_dropout, connected_at;
@@ -396,6 +398,7 @@ static void audio_open(void)
 	}
 	CHIAKI_LOGI(&g.log, "Audio device open: %u Hz, %u channels", g.audio_rate, g.audio_channels);
 	g.audio_waiting = true;
+	g.audio_refill = false;
 	if(!g.audio_target_ms)
 		g.audio_target_ms = AUDIO_TARGET_MIN_MS;
 	g.audio_last_dropout = GetTickCount();
@@ -518,6 +521,7 @@ static void audio_frame_cb(int16_t *buf, size_t samples_count, void *user)
 		// Ran dry: refill before resuming, so jitter makes one short gap instead of constant crackle
 		SDL_PauseAudioDevice(g.audio_dev, 1);
 		g.audio_waiting = true;
+		g.audio_refill = true;
 		g.audio_last_dropout = now;
 		InterlockedIncrement(&g.audio_dropouts);
 		if(g.audio_target_ms < target_max)
@@ -541,11 +545,10 @@ static void audio_frame_cb(int16_t *buf, size_t samples_count, void *user)
 		int peak = 0;
 		for(size_t i = 0; i < count && peak < AUDIO_QUIET_PEAK; i++)
 			peak = buf[i] > peak ? buf[i] : -buf[i] > peak ? -buf[i] : peak;
-		// A piece with sound in it goes only now and then, and the next one fades in so it doesn't click
-		if(peak < AUDIO_QUIET_PEAK || now - g.audio_drained_at >= AUDIO_DRAIN_LOUD_GAP_MS)
+		// Only quiet pieces go. Leaving out ones with sound in them every second was what broke the sound
+		// up in games that never go quiet; the backlog check above still keeps the delay in bounds.
+		if(peak < AUDIO_QUIET_PEAK)
 		{
-			if(peak >= AUDIO_QUIET_PEAK)
-				g.audio_fade_pos = 0;
 			g.audio_drained_at = now;
 			InterlockedIncrement(&g.audio_drained);
 			return;
@@ -575,10 +578,12 @@ static void audio_frame_cb(int16_t *buf, size_t samples_count, void *user)
 				buf[frame * g.audio_channels + c] = (int16_t)(buf[frame * g.audio_channels + c] * g.audio_fade_pos / fade_frames);
 	}
 	SDL_QueueAudio(g.audio_dev, buf, (Uint32)(count * sizeof(int16_t)));
-	if(g.audio_waiting && SDL_GetQueuedAudioSize(g.audio_dev) >= (Uint32)target * bytes_per_ms)
+	int resume = g.audio_refill && target > AUDIO_RESUME_MS ? AUDIO_RESUME_MS : target;
+	if(g.audio_waiting && SDL_GetQueuedAudioSize(g.audio_dev) >= (Uint32)resume * bytes_per_ms)
 	{
 		SDL_PauseAudioDevice(g.audio_dev, 0);
 		g.audio_waiting = false;
+		g.audio_refill = false;
 	}
 }
 
