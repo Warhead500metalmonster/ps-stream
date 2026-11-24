@@ -52,7 +52,7 @@
 
 // Below this rate we are outside what chiaki-ng offers, so a console that refuses to start
 // gets a second try with it.
-#define APP_VERSION "1.3.11"
+#define APP_VERSION "1.3.12"
 #define UPDATE_RECHECK_MS (6 * 60 * 60 * 1000)
 #define UPDATE_TRIES 6
 #define UPDATE_RETRY_MS 20000
@@ -3448,6 +3448,31 @@ static bool move_retry(const wchar_t *from, const wchar_t *to, DWORD flags)
 	return false;
 }
 
+static bool files_same(const wchar_t *a, const wchar_t *b)
+{
+	HANDLE fa = CreateFileW(a, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE, NULL, OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, NULL);
+	HANDLE fb = CreateFileW(b, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE, NULL, OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, NULL);
+	LARGE_INTEGER sa, sb;
+	bool same = fa != INVALID_HANDLE_VALUE && fb != INVALID_HANDLE_VALUE
+		&& GetFileSizeEx(fa, &sa) && GetFileSizeEx(fb, &sb) && sa.QuadPart == sb.QuadPart;
+	static char ba[1 << 16], bb[1 << 16];
+	while(same)
+	{
+		DWORD ra = 0, rb = 0;
+		if(!ReadFile(fa, ba, sizeof(ba), &ra, NULL) || !ReadFile(fb, bb, sizeof(bb), &rb, NULL) || ra != rb || memcmp(ba, bb, ra))
+			same = false;
+		else if(!ra)
+			break;
+	}
+	if(fa != INVALID_HANDLE_VALUE)
+		CloseHandle(fa);
+	if(fb != INVALID_HANDLE_VALUE)
+		CloseHandle(fb);
+	return same;
+}
+
+// Only files that changed are swapped. Renaming every file of the app and deleting the old ones looked like
+// ransomware to Windows Defender, which removed PS Stream.exe during the 1.3.10 update on 2026-11-24.
 static bool update_swap_folder(const wchar_t *from, const wchar_t *to)
 {
 	wchar_t pattern[MAX_PATH + 8], src[MAX_PATH + 300], old[MAX_PATH + 16];
@@ -3473,6 +3498,8 @@ static bool update_swap_folder(const wchar_t *from, const wchar_t *to)
 			ok = false;
 			break;
 		}
+		if(files_same(src, m->target))
+			continue;
 		swprintf(old, MAX_PATH + 16, L"%ls" UPDATE_OLD_SUFFIX, m->target);
 		m->had_old = false;
 		m->placed = false;
