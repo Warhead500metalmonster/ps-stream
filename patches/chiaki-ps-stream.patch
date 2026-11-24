@@ -117,6 +117,40 @@ index af91910..52da771 100644
  					frame_cb = audio_receiver->session->audio_sink.frame_cb;
  					frame_cb_user = audio_receiver->session->audio_sink.user;
  					deliver_buf = NULL;
+diff --git a/lib/src/ctrl.c b/lib/src/ctrl.c
+index 6a3b762..af24fe2 100644
+--- a/lib/src/ctrl.c
++++ b/lib/src/ctrl.c
+@@ -992,7 +992,8 @@ static void ctrl_message_received_displaya(ChiakiCtrl *ctrl, uint8_t *payload, s
+ 	{
+ 		ctrl->cant_displaya = false;
+ 		CHIAKI_LOGI(ctrl->session->log, "Ctrl received message that the stream can now display.");
+-		ctrl->session->display_sink.cantdisplay_cb(ctrl->session->display_sink.user, false);
++		if(ctrl->session->display_sink.cantdisplay_cb) // an app that never set it crashed here
++			ctrl->session->display_sink.cantdisplay_cb(ctrl->session->display_sink.user, false);
+ 	}
+ }
+ 
+@@ -1002,7 +1003,8 @@ static void ctrl_message_received_displayb(ChiakiCtrl *ctrl, uint8_t *payload, s
+ 	{
+ 		if(!(payload[0] == 0x01 && payload[1] == 0xff) && !ctrl->cant_displayb)
+ 		{
+-			ctrl->session->display_sink.cantdisplay_cb(ctrl->session->display_sink.user, true);
++			if(ctrl->session->display_sink.cantdisplay_cb) // an app that never set it crashed here
++				ctrl->session->display_sink.cantdisplay_cb(ctrl->session->display_sink.user, true);
+ 			CHIAKI_LOGI(ctrl->session->log, "Ctrl received message that the stream can't display due to displaying some content that can't be streamed.");
+ 			ctrl->cant_displayb = true;
+ 		}
+@@ -1464,7 +1466,8 @@ static ChiakiErrorCode ctrl_connect(ChiakiCtrl *ctrl)
+ 		CHIAKI_LOGE(session->log, "No valid Server Type in ctrl response");
+ 
+ 	if(response.rp_prohibit)
+-		ctrl->session->display_sink.cantdisplay_cb(ctrl->session->display_sink.user, true);
++		if(ctrl->session->display_sink.cantdisplay_cb) // an app that never set it crashed here
++			ctrl->session->display_sink.cantdisplay_cb(ctrl->session->display_sink.user, true);
+ 
+ 	// if we already got more data than the header, put the rest in the buffer.
+ 	ctrl->recv_buf_size = received_size - header_size;
 diff --git a/lib/src/packetstats.c b/lib/src/packetstats.c
 index 58ef4c6..81704e7 100644
 --- a/lib/src/packetstats.c

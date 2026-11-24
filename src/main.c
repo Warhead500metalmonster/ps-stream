@@ -52,7 +52,7 @@
 
 // Below this rate we are outside what chiaki-ng offers, so a console that refuses to start
 // gets a second try with it.
-#define APP_VERSION "1.3.9"
+#define APP_VERSION "1.3.10"
 #define UPDATE_RECHECK_MS (6 * 60 * 60 * 1000)
 #define UPDATE_TRIES 6
 #define UPDATE_RETRY_MS 20000
@@ -1883,6 +1883,17 @@ static void host_set(const char *host)
 
 // A DualSense gets its vibration as a sound wave rather than rumble commands. An Xbox or other pad can
 // only rumble, so the wave's loudness on each side becomes the rumble strength, as chiaki-ng does it.
+// The PS5 blanks what it won't stream, like some cutscenes and menus, and says so. With nothing set
+// for this, chiaki called an empty pointer and the app crashed (GTA 6, 2026-11-24 01:24).
+static void cant_display_cb(void *user, bool cant_display)
+{
+	(void)user;
+	CHIAKI_LOGI(&g.log, cant_display ? "The PS5 doesn't stream what it shows now" : "The PS5 streams the picture again");
+	if(g.connected)
+		set_status(cant_display ? L"PS5 şu an gösterdiğini yayınlamıyor (korumalı sahne). Geçince görüntü geri gelir"
+			: (g.want_video ? L"Bağlandı. Görüntü açık" : L"Bağlandı. Ses açık"));
+}
+
 static void haptics_frame_cb(uint8_t *buf, size_t buf_size, void *user)
 {
 	(void)user;
@@ -1973,6 +1984,9 @@ static bool session_start(bool video, const Settings *s, bool safe)
 		profile_set(&g.session.connect_info.video_profile, RES_MIN, 30, s->ao_kbps, CHIAKI_CODEC_H264, safe);
 
 	chiaki_session_set_event_cb(&g.session, session_event_cb, NULL);
+	ChiakiCtrlDisplaySink display = { 0 };
+	display.cantdisplay_cb = cant_display_cb;
+	chiaki_session_ctrl_set_display_sink(&g.session, &display);
 	ChiakiAudioSink sink;
 	chiaki_opus_decoder_get_sink(&g.opus, &sink);
 	chiaki_session_set_audio_sink(&g.session, &sink);

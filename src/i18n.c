@@ -101,6 +101,7 @@ static const wchar_t *const english[][2] = {
 	{ L"PS5 adresi: %hs", L"PS5 address: %hs" },
 	{ L"Bağlandı. Görüntü açık", L"Connected. Video is on" },
 	{ L"Bağlandı. Ses açık", L"Connected. Audio is on" },
+	{ L"PS5 şu an gösterdiğini yayınlamıyor (korumalı sahne). Geçince görüntü geri gelir", L"Your PS5 doesn't stream what it shows now (a protected scene). The picture comes back after it" },
 	{ L"Güncelle: %hs", L"Update: %hs" },
 	{ L"Güncelleniyor...", L"Updating..." },
 	{ L"Güncelleme indiriliyor...", L"Downloading update..." },
